@@ -14,8 +14,10 @@ Requires a Rust toolchain:
 
 ```sh
 cargo install --path .                       # from a clone
-cargo install --git <repository url>         # or straight from the repository
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git ssh://git@github.com/constatza/remote-run
 ```
+
+The second form fetches through your own `git` and ssh agent, which a private repository needs. `cargo install` puts `rr` in `~/.cargo/bin`, so that directory must be on `PATH` (rustup adds it; a system-packaged Rust does not). Upgrade with the same command plus `--force`.
 
 ## Configure
 
