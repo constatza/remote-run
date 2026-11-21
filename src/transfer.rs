@@ -71,10 +71,10 @@ mod tests {
     #[test]
     fn relative_remote_paths_live_in_the_project() {
         assert_eq!(
-            remote_path(Some("projects/piaif/"), "bin/x"),
-            "projects/piaif/bin/x"
+            remote_path(Some("projects/proj/"), "bin/x"),
+            "projects/proj/bin/x"
         );
-        assert_eq!(remote_path(Some("projects/piaif"), "/abs/x"), "/abs/x");
+        assert_eq!(remote_path(Some("projects/proj"), "/abs/x"), "/abs/x");
         assert_eq!(remote_path(None, "x"), "x");
     }
 

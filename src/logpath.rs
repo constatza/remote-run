@@ -81,9 +81,9 @@ mod tests {
         JobRecord {
             id_raw: "529727".into(),
             id: id.into(),
-            name: "ustutt-stats-s31of32".into(),
-            user: "kat".into(),
-            workdir: "/home/kat/piaif".into(),
+            name: "stats-s31of32".into(),
+            user: "someone".into(),
+            workdir: "/work/someone/proj".into(),
             stdout: stdout.into(),
         }
     }
@@ -94,16 +94,20 @@ mod tests {
             (
                 "529727",
                 "/out/slurm/%x-%j.out",
-                "/out/slurm/ustutt-stats-s31of32-529727.out",
+                "/out/slurm/stats-s31of32-529727.out",
             ),
-            ("529700_31", "/out/%A_%a-%u.log", "/out/529700_31-kat.log"),
+            (
+                "529700_31",
+                "/out/%A_%a-%u.log",
+                "/out/529700_31-someone.log",
+            ),
             (
                 "529727",
                 "logs/100%%-%j",
-                "/home/kat/piaif/logs/100%-529727",
+                "/work/someone/proj/logs/100%-529727",
             ),
-            ("529727", "", "/home/kat/piaif/slurm-529727.out"),
-            ("529700_31", "", "/home/kat/piaif/slurm-529700_31.out"),
+            ("529727", "", "/work/someone/proj/slurm-529727.out"),
+            ("529700_31", "", "/work/someone/proj/slurm-529700_31.out"),
         ];
         for (id, pattern, expected) in cases {
             assert_eq!(
@@ -123,7 +127,7 @@ mod tests {
     #[test]
     fn parses_a_sacct_line() {
         assert!(parse_sacct("").is_err());
-        let job = parse_sacct("529727|529727|n|kat|/w|/o/%x-%j.out\n").unwrap();
+        let job = parse_sacct("529727|529727|n|someone|/w|/o/%x-%j.out\n").unwrap();
         assert_eq!(job.stdout, "/o/%x-%j.out");
         assert!(parse_sacct("529727|529727|n\n").is_err());
     }

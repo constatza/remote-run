@@ -285,7 +285,7 @@ mod tests {
 
     fn state(head: &str, target: Option<&str>, dirty: &[&str], jobs: Vec<Job>) -> RemoteState {
         RemoteState {
-            dir: "/home/u/piaif".into(),
+            dir: "/work/u/proj".into(),
             head: commit(head),
             target: target.map(commit),
             dirty: dirty.iter().map(|s| s.to_string()).collect(),
@@ -296,8 +296,8 @@ mod tests {
     #[test]
     fn decide_table() {
         let target = Target::Local(commit(B));
-        let here = || vec![job("7", "/home/u/piaif"), job("8_1", "/home/u/piaif/bin")];
-        let elsewhere = || vec![job("9", "/home/u/piaif-runs"), job("10", "/home/u")];
+        let here = || vec![job("7", "/work/u/proj"), job("8_1", "/work/u/proj/bin")];
+        let elsewhere = || vec![job("9", "/work/u/proj-runs"), job("10", "/work/u")];
         let ff = PullDecision::FastForward {
             from: commit(A),
             to: commit(B),
@@ -363,16 +363,16 @@ mod tests {
     #[test]
     fn parse_state_reads_every_key() {
         let text = format!(
-            "dir\t/home/u/piaif\nhead\t{A}\ntarget\t{B}\ndirty\t M a b.py\njob\t12 /home/u/my dir\n"
+            "dir\t/work/u/proj\nhead\t{A}\ntarget\t{B}\ndirty\t M a b.py\njob\t12 /work/u/my dir\n"
         );
         let expected = state(
             A,
             Some(B),
             &[" M a b.py"],
-            vec![job("12", "/home/u/my dir")],
+            vec![job("12", "/work/u/my dir")],
         );
         assert_eq!(parse_state(&text).unwrap(), expected);
-        let missing = format!("dir\t/home/u/piaif\nhead\t{A}\ntarget\t\n");
+        let missing = format!("dir\t/work/u/proj\nhead\t{A}\ntarget\t\n");
         assert_eq!(parse_state(&missing).unwrap().target, None);
         assert!(parse_state("dir\t/x\n").is_err());
     }

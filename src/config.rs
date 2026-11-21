@@ -97,7 +97,7 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(
             root.path().join("repo").join(PROJECT_FILE),
-            "dir = \"projects/piaif\"\nhost = \"b\"\n",
+            "dir = \"projects/proj\"\nhost = \"b\"\n",
         )
         .unwrap();
         let user = root.path().join("user.toml");
@@ -105,7 +105,7 @@ mod tests {
         let loaded = load(&nested, Some(&user)).unwrap();
         assert_eq!(
             loaded,
-            settings(Some("b"), Some("projects/piaif"), Some("hpc/env.sh"))
+            settings(Some("b"), Some("projects/proj"), Some("hpc/env.sh"))
         );
     }
 
