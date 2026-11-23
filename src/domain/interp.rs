@@ -17,6 +17,9 @@ impl Interpreter {
         let Some(program) = words.next() else {
             bail!("an interpreter needs a program (for example \"python -\")");
         };
+        if program.is_empty() {
+            bail!("the interpreter's program is empty ({text:?})");
+        }
         Ok(Self {
             program,
             args: words.collect(),
@@ -82,7 +85,7 @@ mod tests {
 
     #[test]
     fn nothing_to_run_a_backslash_and_an_open_quote_are_errors() {
-        for bad in ["", "   ", "a\\b", "'a", "\"a b", "a 'b"] {
+        for bad in ["", "   ", "a\\b", "'a", "\"a b", "a 'b", "''", "\"\" -"] {
             assert!(Interpreter::parse(bad).is_err(), "{bad:?}");
         }
     }

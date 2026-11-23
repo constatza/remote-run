@@ -186,6 +186,8 @@ impl Values {
 }
 
 /// A command: at least a program word, then argument words, and what to do about the checkout.
+/// A filled word is quoted, not guarded: a value that starts with `-` reaches the program as an
+/// option, so a recipe that takes a branch or a path writes `"--"` before its slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recipe {
     program: Template,

@@ -7,7 +7,7 @@ use crate::domain::outcome::Outcome;
 use crate::domain::pull::JobPolicy;
 use crate::domain::recipe::{RecipeName, RecipePull, Values};
 use crate::ports::Terminal;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 pub struct Args {
     pub name: RecipeName,
@@ -30,6 +30,13 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
             run::run(session, run_args, ports)
         }
         RecipePull::Skip => {
+            // --force lifts a pull guard; with no pull there is nothing for it to lift
+            if args.policy == JobPolicy::Override {
+                bail!(
+                    "--force has no effect on recipe {}: it does not pull",
+                    args.name
+                );
+            }
             let terminal = args.terminal;
             exec::run(session, exec::Args { terminal, cmd }, ports)
         }
@@ -80,6 +87,18 @@ mod tests {
         assert_eq!(fakes.remote.scripts(), [expected]);
         let calls = fakes.remote.calls.borrow();
         assert!(matches!(calls[0].1, RemoteCall::Stream(Terminal::Plain)));
+    }
+
+    #[test]
+    fn force_on_a_recipe_that_does_not_pull_is_refused_not_ignored() {
+        let fakes = Fakes::remote_streaming(vec![]);
+        let session = with_recipe(RecipePull::Skip);
+        let forced = Args {
+            policy: JobPolicy::Override,
+            ..args("train", &["cfg=a"], &[])
+        };
+        assert!(run(&session, forced, &fakes.ports()).is_err());
+        assert!(fakes.remote.scripts().is_empty());
     }
 
     #[test]

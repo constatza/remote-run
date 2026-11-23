@@ -26,11 +26,20 @@ fn rr_with(
     args: &[&str],
     prepare: impl FnOnce(&std::path::Path),
 ) -> (std::process::Output, tempfile::TempDir) {
+    rr_stubbed(STUB, args, prepare)
+}
+
+/// Like [`rr_with`], with `stub` as the whole of `ssh`.
+fn rr_stubbed(
+    stub: &str,
+    args: &[&str],
+    prepare: impl FnOnce(&std::path::Path),
+) -> (std::process::Output, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     fs::create_dir(&bin).unwrap();
     let ssh = bin.join("ssh");
-    fs::write(&ssh, format!("#!/bin/sh\n{STUB}\n")).unwrap();
+    fs::write(&ssh, format!("#!/bin/sh\n{stub}\n")).unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.path().join(".config/rr");
     fs::create_dir_all(&config).unwrap();
@@ -103,4 +112,42 @@ fn a_script_that_cannot_be_sent_never_reaches_ssh() {
         assert!(!out.status.success(), "{args:?}");
         assert!(!dir.path().join("sent").exists(), "{args:?}");
     }
+}
+
+/// ssh runs the remote command through the login shell; the stub does the same locally, so the
+/// script's own `exec`, `source` and redirections really run.
+const STUB_RUNNING: &str = "for last; do :; done; cd \"$HOME\" && exec bash -c \"$last\"";
+
+/// A `read` in the env file would eat the first bytes of the script if it shared stdin with the
+/// interpreter; the script must arrive whole.
+#[test]
+fn an_env_file_that_reads_stdin_does_not_eat_the_script() {
+    let body = "first line\nsecond line\n";
+    let args = [
+        "--env",
+        "eat.sh",
+        "x",
+        "-s",
+        "probe.txt",
+        "--interp",
+        "tee out.txt",
+    ];
+    let (out, dir) = rr_stubbed(STUB_RUNNING, &args, |dir| {
+        fs::write(dir.join("probe.txt"), body).unwrap();
+        fs::write(dir.join("eat.sh"), "read -r _ || true\n").unwrap();
+    });
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        body
+    );
+}
+
+#[test]
+fn an_empty_script_file_is_refused_before_ssh() {
+    let (out, dir) = rr_with(&["x", "-s", "empty.py", "--interp", "python -"], |dir| {
+        fs::write(dir.join("empty.py"), "").unwrap();
+    });
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!dir.path().join("sent").exists());
 }

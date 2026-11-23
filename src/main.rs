@@ -219,13 +219,13 @@ fn dispatch(
     match command {
         RemoteCmd::Job(command) => dispatch_job(command, session, ports),
         RemoteCmd::Q => app::q::run(session, ports),
-        RemoteCmd::Acct(args) => app::acct::run(session, args.into(), ports),
+        RemoteCmd::Acct(args) => app::acct::run(session, args.try_into()?, ports),
         RemoteCmd::Do(args) => app::recipe::run(session, args.try_into()?, ports),
         RemoteCmd::Log { job, follow, lines } => {
             app::log::run(session, app::log::Args { job, follow, lines }, ports)
         }
         RemoteCmd::Cancel { jobs } => app::cancel::run(session, app::cancel::Args { jobs }, ports),
-        RemoteCmd::X(args) => x(session, args.into(), ports),
+        RemoteCmd::X(args) => x(session, args.try_into()?, ports),
         RemoteCmd::Pull { policy } => app::pull::run(session, app::pull::Args { policy }, ports),
         RemoteCmd::Run {
             policy,
@@ -281,6 +281,10 @@ fn read_script(path: &Path) -> Result<Payload> {
     file.take(app::exec::SCRIPT_LIMIT + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("reading {}", path.display()))?;
+    // an empty file is a wrong path or a failed export, and the interpreter would exit 0 on it
+    if bytes.is_empty() {
+        bail!("{} is empty", path.display());
+    }
     if bytes.len() as u64 > app::exec::SCRIPT_LIMIT {
         bail!(
             "{} is larger than {} bytes",

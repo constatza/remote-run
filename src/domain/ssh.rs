@@ -32,6 +32,9 @@ pub enum Terminal {
     Plain,
     /// A terminal is allocated (`ssh -t`), so interactive programs work and Ctrl-C reaches them.
     Attached,
+    /// No terminal even when `~/.ssh/config` says `RequestTTY force` (`ssh -T`): for a call whose
+    /// stdin is data, which a remote tty would echo, translate and end at a control byte.
+    Refused,
 }
 
 /// Whether ssh gives up on a silent link by itself.
@@ -52,6 +55,7 @@ pub fn ssh_argv(host: &Host, script: &str, terminal: Terminal, liveness: Livenes
     }
     match terminal {
         Terminal::Attached => args.push("-t".into()),
+        Terminal::Refused => args.push("-T".into()),
         Terminal::Plain => {}
     }
     // `--` ends the options; `Host` already refuses a leading `-`, this keeps ssh from ever reading it as one
@@ -106,6 +110,12 @@ mod tests {
             .chain(["-t", "--", "cluster", "bash -c 'true'"])
             .collect();
         assert_eq!(tty.args(), expected);
+        let none = ssh_argv(&host(), "true", Terminal::Refused, Liveness::Configured);
+        let expected: Vec<&str> = OPTIONS
+            .into_iter()
+            .chain(["-T", "--", "cluster", "bash -c 'true'"])
+            .collect();
+        assert_eq!(none.args(), expected);
     }
 
     /// A streamed command must keep the user's own `ServerAlive*` and `ConnectTimeout`: a stall of

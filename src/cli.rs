@@ -281,15 +281,20 @@ pub enum XProgram {
     },
 }
 
-impl From<XArgs> for XProgram {
-    fn from(args: XArgs) -> Self {
+impl TryFrom<XArgs> for XProgram {
+    type Error = anyhow::Error;
+
+    /// clap already requires `--interp` with `--script` and a command without one; the two
+    /// mismatched pairs are refused here too, so loosening a clap rule cannot drop a script.
+    fn try_from(args: XArgs) -> anyhow::Result<Self> {
         match (args.script, args.interp) {
-            (Some(path), Some(interp)) => Self::Script { path, interp },
-            // clap requires --interp with --script and a command without one
-            (_, _) => Self::Command(app::exec::Args {
+            (Some(path), Some(interp)) => Ok(Self::Script { path, interp }),
+            (None, None) => Ok(Self::Command(app::exec::Args {
                 terminal: args.terminal,
                 cmd: args.cmd,
-            }),
+            })),
+            (Some(_), None) => anyhow::bail!("--script needs --interp"),
+            (None, Some(_)) => anyhow::bail!("--interp needs --script"),
         }
     }
 }
@@ -308,15 +313,20 @@ pub struct AcctArgs {
     columns: AcctColumns,
 }
 
-impl From<AcctArgs> for app::acct::Args {
-    /// clap refuses `--since` together with `--jobs`, so a non-empty list is the only choice then.
-    fn from(args: AcctArgs) -> Self {
-        let selection =
-            JobSet::new(args.jobs).map_or(AcctSelection::Since(args.since), AcctSelection::Jobs);
-        Self {
+impl TryFrom<AcctArgs> for app::acct::Args {
+    type Error = anyhow::Error;
+
+    /// clap refuses `--since` together with `--jobs`, so a given list is the choice then.
+    fn try_from(args: AcctArgs) -> anyhow::Result<Self> {
+        let selection = if args.jobs.is_empty() {
+            AcctSelection::Since(args.since)
+        } else {
+            AcctSelection::Jobs(JobSet::new(args.jobs)?)
+        };
+        Ok(Self {
             selection,
             columns: args.columns,
-        }
+        })
     }
 }
 
@@ -624,7 +634,7 @@ mod tests {
     #[test]
     fn x_runs_a_command_or_a_script_with_its_interpreter_never_both() {
         let program = |args: &[&str]| match command_of(args) {
-            Cmd::Remote(RemoteCmd::X(args)) => XProgram::from(args),
+            Cmd::Remote(RemoteCmd::X(args)) => XProgram::try_from(args).unwrap(),
             _ => panic!("not an x"),
         };
         match program(&["x", "-s", "p.py", "--interp", "python -u -"]) {
@@ -648,7 +658,7 @@ mod tests {
     fn acct_of(args: &[&str]) -> app::acct::Args {
         let argv: Vec<&str> = ["acct"].into_iter().chain(args.iter().copied()).collect();
         match command_of(&argv) {
-            Cmd::Remote(RemoteCmd::Acct(args)) => args.into(),
+            Cmd::Remote(RemoteCmd::Acct(args)) => args.try_into().unwrap(),
             _ => panic!("not an acct"),
         }
     }

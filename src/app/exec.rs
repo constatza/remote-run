@@ -6,7 +6,7 @@ use crate::domain::exit::RemoteExit;
 use crate::domain::interp::Interpreter;
 use crate::domain::outcome::Outcome;
 use crate::domain::place::script;
-use crate::domain::shell::{Script, quote};
+use crate::domain::shell::{Script, lit, quote};
 use crate::ports::{Echo, Payload, Teed, Terminal};
 use anyhow::Result;
 
@@ -25,12 +25,22 @@ pub struct ScriptArgs {
     pub source: Payload,
 }
 
+/// What keeps the input for the interpreter: the shell moves stdin to descriptor 3 before the env
+/// file runs, so a `read` or `cat` in it (or in a remote rc file) cannot eat the first bytes of the
+/// script, and gives the interpreter descriptor 3 back as its stdin.
+const KEEP_STDIN: &str = "exec 3<&0 0</dev/null";
+const RESTORE_STDIN: &str = " <&3";
+
 /// Run `args.source` with the interpreter in the remote home (no project directory, no pull: the
 /// script is data that comes with the call). Raw output, like [`run`].
 pub fn run_script(session: &Session, args: ScriptArgs, ports: &Ports) -> Result<Outcome> {
-    let body = Script::new().words(args.interp.words().map(quote));
-    let script = script(&session.place.at_home(), body);
-    let code = ports.remote.send(&script, &args.source)?;
+    let body = Script::new()
+        .words(args.interp.words().map(quote))
+        .lit(RESTORE_STDIN);
+    let placed = script(&session.place.at_home(), body);
+    let code = ports
+        .remote
+        .send(&Script::lines([lit(KEEP_STDIN), placed]), &args.source)?;
     Ok(Outcome::Remote(RemoteExit::new(code)))
 }
 
@@ -141,7 +151,8 @@ mod tests {
             source: Payload::new(b"print(1)\n".to_vec()),
         };
         let outcome = run_script(&session(), args, &fakes.ports()).unwrap();
-        assert_eq!(fakes.remote.scripts(), [at_home("'python' '-u' '$(id)'")]);
+        let kept = format!("{KEEP_STDIN}\n{}", at_home("'python' '-u' '$(id)' <&3"));
+        assert_eq!(fakes.remote.scripts(), [kept]);
         assert_eq!(*fakes.remote.sent.borrow(), [b"print(1)\n".to_vec()]);
         let exit = render(&outcome, Format::Text).exit;
         assert_eq!(exit, Exit::remote(5), "the remote's code, not an rr code");

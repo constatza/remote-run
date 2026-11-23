@@ -62,20 +62,25 @@ impl Exec for OsExec {
             .stdin(Stdio::piped())
             .spawn()
             .with_context(|| format!("could not start {}", argv.program()))?;
-        let stdin = child.stdin.take();
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = stop_child(&mut child);
+            return Err(anyhow!("{} has no input pipe", argv.program()));
+        };
         let bytes = input.as_bytes().to_vec();
         // written on its own thread: a child that prints before it has read everything would
-        // otherwise block on a full output pipe while `rr` blocks on a full input pipe. A write
-        // error (the child ended early, a broken pipe) is the child's business, its exit code
-        // says how it went.
-        let writer = std::thread::spawn(move || {
-            if let Some(mut stdin) = stdin {
-                let _ = stdin.write_all(&bytes);
-            }
+        // otherwise block on a full output pipe while `rr` blocks on a full input pipe. The child
+        // ending or closing its stdin early (a broken pipe) is its business, its exit code says how
+        // it went; any other write error means it ran on partial input, which is an error here.
+        let writer = std::thread::spawn(move || match stdin.write_all(&bytes) {
+            Err(err) if err.kind() != io::ErrorKind::BrokenPipe => Err(err),
+            _ => Ok(()),
         });
         let status = child.wait().context("could not wait for the child")?;
-        let _ = writer.join();
-        Ok(exit_code(status))
+        match writer.join() {
+            Ok(Ok(())) => Ok(exit_code(status)),
+            Ok(Err(err)) => Err(err).context("could not send the input to the child"),
+            Err(_) => Err(anyhow!("the thread that sends the input panicked")),
+        }
     }
 
     fn stream_filtered(&self, argv: &Argv) -> Result<i32> {
@@ -630,7 +635,7 @@ impl Remote for Ssh<'_> {
         let argv = ssh_argv(
             self.host,
             &script.to_string(),
-            Terminal::Plain,
+            Terminal::Refused,
             Liveness::Configured,
         );
         self.exec.stream_input(&argv, input)
@@ -1019,7 +1024,11 @@ mod tests {
         assert_eq!(code, 4);
         let calls = exec.calls.borrow();
         assert_eq!(calls[0].1, How::StreamInput);
-        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
+        // -T: a `RequestTTY force` in the user's config must not put the input through a tty
+        assert_eq!(
+            calls[0].0.args()[4..],
+            ["-T", "--", "cluster", "bash -c 'true'"]
+        );
         assert_eq!(*exec.inputs.borrow(), [b"print(1)\n".to_vec()]);
     }
 
