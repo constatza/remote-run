@@ -1,6 +1,6 @@
 //! `rr x`: run a command in the remote project directory.
 
-use super::{Ports, stream};
+use super::{Output, Ports, stream};
 use crate::config::Session;
 use crate::domain::outcome::Outcome;
 use crate::domain::shell::{Script, quote};
@@ -14,7 +14,7 @@ pub struct Args {
 
 pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     let body = Script::new().words(args.cmd.iter().map(|word| quote(word)));
-    stream(ports, &session.place, body, args.terminal)
+    stream(ports, &session.place, body, args.terminal, Output::Raw)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! `rr log`: show a job's log.
 
-use super::{Ports, stream_filtered};
+use super::{Output, Ports, stream};
 use crate::config::Session;
 use crate::domain::logpath::{log_path, parse_sacct};
 use crate::domain::outcome::{Outcome, log_path_note};
@@ -28,7 +28,7 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
         Follow::Follow => Terminal::Attached,
     };
     let body = tail_script(&path, args.lines, args.follow);
-    stream_filtered(ports, &home, body, terminal)
+    stream(ports, &home, body, terminal, Output::Filtered)
 }
 
 #[cfg(test)]

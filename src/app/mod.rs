@@ -30,24 +30,30 @@ pub struct Ports<'a> {
     pub notes: &'a dyn Notes,
 }
 
-/// Run `body` at `place` on the remote with the terminal attached, and report how it ended.
-fn stream(ports: &Ports, place: &Place, body: Script, terminal: Terminal) -> Result<Outcome> {
-    let code = ports.remote.stream(&script(place, body), terminal)?;
-    Ok(Outcome::Remote(RemoteExit::new(code)))
+/// How a streamed command's output reaches the user.
+#[derive(Clone, Copy)]
+enum Output {
+    /// The child's own bytes: `x` and `cancel`. The user chose that program, and a terminal session
+    /// needs its raw bytes.
+    Raw,
+    /// The remote's own text (`q`, `acct`, `log`): it comes back line by line through `sanitize`
+    /// and cannot carry a terminal control sequence.
+    Filtered,
 }
 
-/// Like [`stream`], but the output is the remote's own text (`q`, `acct`, `log`), so it comes back
-/// line by line through `sanitize` and cannot carry a terminal control sequence. `x` and `run`
-/// stay on [`stream`]: the user chose that program, and a terminal session needs its raw bytes.
-fn stream_filtered(
+/// Run `body` at `place` on the remote with the terminal attached, and report how it ended.
+fn stream(
     ports: &Ports,
     place: &Place,
     body: Script,
     terminal: Terminal,
+    output: Output,
 ) -> Result<Outcome> {
-    let code = ports
-        .remote
-        .stream_filtered(&script(place, body), terminal)?;
+    let script = script(place, body);
+    let code = match output {
+        Output::Raw => ports.remote.stream(&script, terminal),
+        Output::Filtered => ports.remote.stream_filtered(&script, terminal),
+    }?;
     Ok(Outcome::Remote(RemoteExit::new(code)))
 }
 

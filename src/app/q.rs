@@ -1,6 +1,6 @@
 //! `rr q`: your queued and running jobs.
 
-use super::{Ports, stream_filtered};
+use super::{Output, Ports, stream};
 use crate::config::Session;
 use crate::domain::outcome::Outcome;
 use crate::domain::slurm::queue_script;
@@ -8,11 +8,12 @@ use crate::ports::Terminal;
 use anyhow::Result;
 
 pub fn run(session: &Session, ports: &Ports) -> Result<Outcome> {
-    stream_filtered(
+    stream(
         ports,
         &session.place.at_home(),
         queue_script(),
         Terminal::Plain,
+        Output::Filtered,
     )
 }
 
