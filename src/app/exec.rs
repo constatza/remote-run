@@ -2,15 +2,36 @@
 
 use super::{Output, Ports, stream};
 use crate::config::Session;
+use crate::domain::exit::RemoteExit;
+use crate::domain::interp::Interpreter;
 use crate::domain::outcome::Outcome;
 use crate::domain::place::script;
 use crate::domain::shell::{Script, quote};
-use crate::ports::{Echo, Teed, Terminal};
+use crate::ports::{Echo, Payload, Teed, Terminal};
 use anyhow::Result;
 
 pub struct Args {
     pub terminal: Terminal,
     pub cmd: Vec<String>,
+}
+
+/// The largest script `rr x -s` sends: a script is read whole, so a device or a dataset named by
+/// mistake must not fill memory.
+pub const SCRIPT_LIMIT: u64 = 1 << 20;
+
+/// A script and the interpreter that reads it from stdin.
+pub struct ScriptArgs {
+    pub interp: Interpreter,
+    pub source: Payload,
+}
+
+/// Run `args.source` with the interpreter in the remote home (no project directory, no pull: the
+/// script is data that comes with the call). Raw output, like [`run`].
+pub fn run_script(session: &Session, args: ScriptArgs, ports: &Ports) -> Result<Outcome> {
+    let body = Script::new().words(args.interp.words().map(quote));
+    let script = script(&session.place.at_home(), body);
+    let code = ports.remote.send(&script, &args.source)?;
+    Ok(Outcome::Remote(RemoteExit::new(code)))
 }
 
 fn body(args: &Args) -> Script {
@@ -38,7 +59,7 @@ pub fn tee(session: &Session, args: Args, prefix: &str, echo: Echo, ports: &Port
 
 #[cfg(test)]
 mod tests {
-    use super::super::testing::{Fakes, in_project, session};
+    use super::super::testing::{Fakes, at_home, in_project, session};
     use super::*;
     use crate::domain::exit::{Exit, RrCode};
     use crate::domain::outcome::{Format, render};
@@ -110,5 +131,21 @@ mod tests {
         let exit = render(&outcome, Format::Text).exit;
         assert_eq!(exit, Exit::remote(3));
         assert_ne!(exit, Exit::Rr(RrCode::Refused));
+    }
+
+    #[test]
+    fn a_script_goes_on_stdin_to_the_quoted_interpreter_in_the_home_directory() {
+        let fakes = Fakes::remote_streaming(vec![5]);
+        let args = ScriptArgs {
+            interp: Interpreter::parse("python -u '$(id)'").unwrap(),
+            source: Payload::new(b"print(1)\n".to_vec()),
+        };
+        let outcome = run_script(&session(), args, &fakes.ports()).unwrap();
+        assert_eq!(fakes.remote.scripts(), [at_home("'python' '-u' '$(id)'")]);
+        assert_eq!(*fakes.remote.sent.borrow(), [b"print(1)\n".to_vec()]);
+        let exit = render(&outcome, Format::Text).exit;
+        assert_eq!(exit, Exit::remote(5), "the remote's code, not an rr code");
+        let calls = fakes.remote.calls.borrow();
+        assert!(matches!(calls[0].1, RemoteCall::Send));
     }
 }

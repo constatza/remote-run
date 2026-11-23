@@ -7,9 +7,9 @@
 
 mod cli;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use cli::{Cli, Cmd, FwdArgs, JobCmd, RemoteCmd, StdoutUse, format_of_args};
+use cli::{Cli, Cmd, FwdArgs, JobCmd, RemoteCmd, StdoutUse, XProgram, format_of_args};
 use remote_run::adapters::{OsExec, OsNet, Ssh, SystemClock};
 use remote_run::app::{self, Ports};
 use remote_run::config::{Environment, Session, Settings, load, resolve, utf8_var};
@@ -18,10 +18,11 @@ use remote_run::domain::outcome::{
     Format, Outcome, Rendered, render, render_error, render_error_as,
 };
 use remote_run::domain::slurm::JobSet;
-use remote_run::ports::{Echo, Notes};
+use remote_run::ports::{Echo, Notes, Payload};
 use remote_run::trust;
 use std::cell::RefCell;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -224,9 +225,7 @@ fn dispatch(
             app::log::run(session, app::log::Args { job, follow, lines }, ports)
         }
         RemoteCmd::Cancel { jobs } => app::cancel::run(session, app::cancel::Args { jobs }, ports),
-        RemoteCmd::X { terminal, cmd } => {
-            app::exec::run(session, app::exec::Args { terminal, cmd }, ports)
-        }
+        RemoteCmd::X(args) => x(session, args.into(), ports),
         RemoteCmd::Pull { policy } => app::pull::run(session, app::pull::Args { policy }, ports),
         RemoteCmd::Run {
             policy,
@@ -263,6 +262,33 @@ fn dispatch(
             app::put::run(session, args, ports)
         }
     }
+}
+
+fn x(session: &Session, program: XProgram, ports: &Ports) -> Result<Outcome> {
+    match program {
+        XProgram::Command(args) => app::exec::run(session, args, ports),
+        XProgram::Script { path, interp } => {
+            let source = read_script(&path)?;
+            app::exec::run_script(session, app::exec::ScriptArgs { interp, source }, ports)
+        }
+    }
+}
+
+/// The script's bytes, at most [`app::exec::SCRIPT_LIMIT`].
+fn read_script(path: &Path) -> Result<Payload> {
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(app::exec::SCRIPT_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() as u64 > app::exec::SCRIPT_LIMIT {
+        bail!(
+            "{} is larger than {} bytes",
+            path.display(),
+            app::exec::SCRIPT_LIMIT
+        );
+    }
+    Ok(Payload::new(bytes))
 }
 
 /// `rr fwd` is the one command that also needs the local network, clock and runtime directory.

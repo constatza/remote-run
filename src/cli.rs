@@ -6,6 +6,7 @@ use remote_run::app;
 use remote_run::app::run::After;
 use remote_run::app::wait::Limits;
 use remote_run::domain::fwd::{Browser, LoopbackPort, Transport, Ttl, Wanted};
+use remote_run::domain::interp::Interpreter;
 use remote_run::domain::outcome::Format;
 use remote_run::domain::pull::JobPolicy;
 use remote_run::domain::recipe::{Assignment, RecipeName, Values};
@@ -14,6 +15,7 @@ use remote_run::domain::transfer::parse_size;
 use remote_run::domain::wait::{DEFAULT_TIMEOUT, PollInterval};
 use remote_run::ports::{Echo, Terminal};
 use remote_run::trust::TrustAction;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -136,7 +138,7 @@ impl RemoteCmd {
             | RemoteCmd::Acct(_)
             | RemoteCmd::Do(_)
             | RemoteCmd::Log { .. }
-            | RemoteCmd::X { .. } => StdoutUse::ProgramOutput,
+            | RemoteCmd::X(_) => StdoutUse::ProgramOutput,
         }
     }
 }
@@ -205,14 +207,8 @@ pub enum RemoteCmd {
         #[arg(required = true, value_parser = JobId::parse)]
         jobs: Vec<JobId>,
     },
-    /// Run a command in the remote project directory
-    X {
-        /// allocate a terminal (interactive programs)
-        #[arg(short, long = "tty", num_args = 0, default_value = "plain", default_missing_value = "attached", value_parser = parse_terminal)]
-        terminal: Terminal,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        cmd: Vec<String>,
-    },
+    /// Run a command in the remote project directory, or a local script on the remote's home
+    X(XArgs),
     /// Fast-forward the remote checkout to the local HEAD, with guards
     Pull {
         /// fast-forward even while jobs submitted from the checkout are active
@@ -252,6 +248,50 @@ pub enum RemoteCmd {
         #[arg(long, default_value = "1G", value_parser = parse_size)]
         limit: u64,
     },
+}
+
+/// `rr x`'s arguments: a command, or a script and the interpreter that reads it.
+#[derive(clap::Args)]
+pub struct XArgs {
+    /// allocate a terminal (interactive programs)
+    #[arg(short, long = "tty", num_args = 0, default_value = "plain", default_missing_value = "attached", value_parser = parse_terminal)]
+    pub terminal: Terminal,
+    /// send this local file on stdin to --interp, which runs in your remote home, not the project
+    /// (so it takes no terminal: stdin is the script)
+    #[arg(short = 's', long, value_name = "FILE", requires = "interp", conflicts_with_all = ["cmd", "terminal"])]
+    script: Option<PathBuf>,
+    /// the program that reads the script, with its arguments (for example "python -")
+    #[arg(long, value_parser = Interpreter::parse, requires = "script")]
+    interp: Option<Interpreter>,
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        required_unless_present = "script"
+    )]
+    cmd: Vec<String>,
+}
+
+/// What `rr x` was asked to run.
+pub enum XProgram {
+    Command(app::exec::Args),
+    /// The file is read by `main`, the one edge that does file I/O for a command.
+    Script {
+        path: PathBuf,
+        interp: Interpreter,
+    },
+}
+
+impl From<XArgs> for XProgram {
+    fn from(args: XArgs) -> Self {
+        match (args.script, args.interp) {
+            (Some(path), Some(interp)) => Self::Script { path, interp },
+            // clap requires --interp with --script and a command without one
+            (_, _) => Self::Command(app::exec::Args {
+                terminal: args.terminal,
+                cmd: args.cmd,
+            }),
+        }
+    }
 }
 
 /// `rr acct`'s arguments.
@@ -529,7 +569,7 @@ mod tests {
     #[test]
     fn a_flag_without_a_value_picks_one_of_two_variants() {
         let terminal = |args: &[&str]| match command_of(args) {
-            Cmd::Remote(RemoteCmd::X { terminal, .. } | RemoteCmd::Run { terminal, .. }) => {
+            Cmd::Remote(RemoteCmd::X(XArgs { terminal, .. }) | RemoteCmd::Run { terminal, .. }) => {
                 terminal
             }
             _ => panic!("not an x or a run"),
@@ -579,6 +619,30 @@ mod tests {
             panic!("not a do");
         };
         assert!(app::recipe::Args::try_from(twice).is_err());
+    }
+
+    #[test]
+    fn x_runs_a_command_or_a_script_with_its_interpreter_never_both() {
+        let program = |args: &[&str]| match command_of(args) {
+            Cmd::Remote(RemoteCmd::X(args)) => XProgram::from(args),
+            _ => panic!("not an x"),
+        };
+        match program(&["x", "-s", "p.py", "--interp", "python -u -"]) {
+            XProgram::Script { path, interp } => {
+                assert_eq!(path, PathBuf::from("p.py"));
+                assert_eq!(interp.words().collect::<Vec<_>>(), ["python", "-u", "-"]);
+            }
+            XProgram::Command(_) => panic!("a script"),
+        }
+        match program(&["x", "-t", "--", "ls", "-l"]) {
+            XProgram::Command(args) => assert_eq!(args.cmd, ["ls", "-l"]),
+            XProgram::Script { .. } => panic!("a command"),
+        }
+        assert!(refused(&["x"]));
+        assert!(refused(&["x", "-s", "p.py"]));
+        assert!(refused(&["x", "-s", "p.py", "--interp", "python -", "ls"]));
+        assert!(refused(&["x", "-t", "-s", "p.py", "--interp", "python -"]));
+        assert!(refused(&["x", "-s", "p.py", "--interp", "'python"]));
     }
 
     fn acct_of(args: &[&str]) -> app::acct::Args {

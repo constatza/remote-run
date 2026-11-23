@@ -9,6 +9,7 @@ pub mod exit;
 pub mod fwd;
 pub mod host;
 pub mod ids;
+pub mod interp;
 pub mod json;
 pub mod local;
 pub mod logpath;

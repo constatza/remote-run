@@ -67,6 +67,7 @@ rr cancel <job>...            # scancel
 rr status <job> [-n 10]       # state, elapsed time, exit code, directory and the end of the log
 rr wait <job>... [--timeout S] [--poll S]   # wait until the jobs end
 rr x [-t] -- <cmd>...         # run a command in the remote project (-t: allocate a terminal)
+rr x -s <file> --interp "python -"   # send a local script on stdin to the interpreter, run in your remote home (no -t)
 rr do <recipe> [--set slot=value]... [-t] [--force] [-- <more words>]   # run a recipe from the config
 rr pull [--force]             # fast-forward the remote checkout to your local HEAD
 rr run [-t] [--force] [--wait] -- <cmd>...   # pull, then run; --wait then waits for the jobs it submitted
