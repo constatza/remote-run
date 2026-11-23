@@ -54,6 +54,8 @@ pub fn rsync_argv(source: &Endpoint, destination: &Endpoint, pass: Pass) -> Argv
     // -s sends the remote path as data instead of through the remote shell (older rsync versions)
     let mut args: Vec<String> = ["-azs", "--partial"].map(String::from).to_vec();
     args.push("-e".into());
+    // only the base options: a copy may be quiet for long, so the user's own ssh configuration decides
+    // when a silent link is given up (the liveness options are for polls, see `domain::ssh`)
     args.push(lit("ssh ").words(SSH_OPTIONS.map(quote)).to_string());
     match pass {
         Pass::Measure => args.extend(["--dry-run", "--stats"].map(String::from)),
