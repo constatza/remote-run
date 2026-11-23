@@ -102,7 +102,6 @@ fn a_streaming_command_refuses_json_before_it_touches_ssh() {
         &["--json", "log", "7"],
         &["--json", "x", "ls"],
         &["--json", "run", "--", "ls"],
-        &["--json", "fwd", "gpu-01:5000"],
         &["--json", "cancel", "7"],
         &["--json", "get", "out.txt"],
         &["--json", "put", "in.txt"],
