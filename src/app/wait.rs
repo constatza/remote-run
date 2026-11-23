@@ -8,7 +8,7 @@ use crate::domain::outcome::Outcome;
 use crate::domain::place::script;
 use crate::domain::slurm::{JobSet, SUBMITTED_PREFIX, WaitOutcome, states_script, submitted_jobs};
 use crate::domain::wait::{Action, PollInterval, Progress, Reading, next_action};
-use crate::ports::Echo;
+use crate::ports::{Echo, Teed};
 use anyhow::Result;
 use std::time::Duration;
 
@@ -63,6 +63,16 @@ pub fn run_then_wait(
     ports: &Ports,
 ) -> Result<Outcome> {
     let teed = exec::tee(session, command, SUBMITTED_PREFIX, echo, ports)?;
+    after_command(session, teed, limits, ports)
+}
+
+/// The second half of [`run_then_wait`]: what to do with the command that was shown and read.
+pub(super) fn after_command(
+    session: &Session,
+    teed: Teed,
+    limits: Limits,
+    ports: &Ports,
+) -> Result<Outcome> {
     if teed.code != 0 {
         return Ok(Outcome::Remote(RemoteExit::new(teed.code)));
     }

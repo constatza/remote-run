@@ -12,6 +12,7 @@ use crate::domain::outcome::{Outcome, TrustState};
 use crate::domain::pull::{PullOutcome, Reason};
 use crate::domain::sanitize::sanitize;
 use crate::domain::slurm::{JobStatus, WaitOutcome};
+use crate::domain::snapshot::Refusal;
 use crate::domain::status::{LogTail, StatusReport};
 use crate::domain::transfer::Transfer;
 use serde::Serialize;
@@ -47,6 +48,31 @@ enum Body {
     Wait(WaitBody),
     Status(StatusBody),
     Forward(ForwardBody),
+    Snapshot(SnapshotBody),
+}
+
+/// A snapshot that was not shipped.
+#[derive(Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+enum SnapshotBody {
+    Refused {
+        reason: SnapshotReason,
+        detail: String,
+    },
+}
+
+/// Why a snapshot was refused, as a name a script can match on.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SnapshotReason {
+    DirtyTree,
+    TooLarge,
+    Submodules,
+    LfsPointers,
+    UnsafeSymlinks,
+    SecretNames,
+    ArchiveMismatch,
+    SnapshotNotPrivate,
 }
 
 /// How a forward that `rr` closed ended.
@@ -180,6 +206,22 @@ fn pull(outcome: &PullOutcome) -> PullBody {
     }
 }
 
+fn snapshot(refusal: &Refusal) -> SnapshotBody {
+    SnapshotBody::Refused {
+        reason: match refusal {
+            Refusal::Dirty => SnapshotReason::DirtyTree,
+            Refusal::TooLarge { .. } => SnapshotReason::TooLarge,
+            Refusal::Submodules(_) => SnapshotReason::Submodules,
+            Refusal::LfsPointers(_) => SnapshotReason::LfsPointers,
+            Refusal::UnsafeSymlinks(_) => SnapshotReason::UnsafeSymlinks,
+            Refusal::SecretNames(_) => SnapshotReason::SecretNames,
+            Refusal::ArchiveMismatch { .. } => SnapshotReason::ArchiveMismatch,
+            Refusal::RemoteNotPrivate { .. } => SnapshotReason::SnapshotNotPrivate,
+        },
+        detail: clean(&refusal.to_string()),
+    }
+}
+
 fn wait(outcome: &WaitOutcome) -> WaitBody {
     match outcome {
         WaitOutcome::Completed(rows) => WaitBody::Completed { jobs: jobs(rows) },
@@ -242,6 +284,7 @@ fn parts(outcome: &Outcome) -> (Source, Body) {
             Closed::Interrupted => (Source::Rr, Body::Forward(ForwardBody::Interrupted)),
             Closed::SshEnded(_) => (Source::Remote, Body::Forward(ForwardBody::SshEnded)),
         },
+        Outcome::SnapshotRefused(refusal) => (Source::Rr, Body::Snapshot(snapshot(refusal))),
     }
 }
 
@@ -315,6 +358,49 @@ mod tests {
         assert_eq!(rr["source"], "rr");
         assert_eq!(rr["exit"], 3);
         assert_eq!(exit, Exit::Rr(RrCode::Refused));
+    }
+
+    #[test]
+    fn a_refused_snapshot_is_one_document_with_a_reason_a_script_can_match() {
+        use crate::domain::snapshot::{Refusal, UnsafeLink};
+        let cases = [
+            (Refusal::Dirty, "dirty_tree"),
+            (Refusal::TooLarge { total: 9, limit: 1 }, "too_large"),
+            (Refusal::Submodules(vec!["sub".into()]), "submodules"),
+            (Refusal::LfsPointers(vec!["m.bin".into()]), "lfs_pointers"),
+            (
+                Refusal::UnsafeSymlinks(vec![UnsafeLink {
+                    path: "l".into(),
+                    target: "/etc".into(),
+                }]),
+                "unsafe_symlinks",
+            ),
+            (Refusal::SecretNames(vec![".env".into()]), "secret_names"),
+            (
+                Refusal::ArchiveMismatch {
+                    expected: 3,
+                    found: 2,
+                },
+                "archive_mismatch",
+            ),
+            (
+                Refusal::RemoteNotPrivate {
+                    stderr: "bad\u{1b}[2J".into(),
+                },
+                "snapshot_not_private",
+            ),
+        ];
+        for (refusal, reason) in cases {
+            let (value, exit) = json_of(&Outcome::SnapshotRefused(refusal));
+            assert_eq!(exit, Exit::Rr(RrCode::Refused), "{reason}");
+            assert_eq!(value["source"], "rr");
+            assert_eq!(value["exit"], 3);
+            assert_eq!(value["kind"], "snapshot");
+            assert_eq!(value["result"], "refused");
+            assert_eq!(value["reason"], reason);
+            let detail = value["detail"].as_str().unwrap();
+            assert!(!detail.contains('\u{1b}'), "{detail:?}");
+        }
     }
 
     #[test]

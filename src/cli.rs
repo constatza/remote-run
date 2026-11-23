@@ -11,6 +11,9 @@ use remote_run::domain::outcome::Format;
 use remote_run::domain::pull::JobPolicy;
 use remote_run::domain::recipe::{Assignment, RecipeName, Values};
 use remote_run::domain::slurm::{AcctColumns, AcctSelection, Follow, JobId, JobSet};
+use remote_run::domain::snapshot::{
+    AllowedPath, DEFAULT_SNAPSHOT_LIMIT, DirtyPolicy, Inclusion, Mode, Policy, SubmodulePolicy,
+};
 use remote_run::domain::transfer::parse_size;
 use remote_run::domain::wait::{DEFAULT_TIMEOUT, PollInterval};
 use remote_run::ports::{Echo, Terminal};
@@ -104,6 +107,68 @@ impl RunWait {
                 },
                 echo,
             },
+        }
+    }
+}
+
+/// How `rr run` gets code to the remote host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ModeName {
+    /// fast-forward the remote checkout to HEAD, with its guards
+    Checkout,
+    /// ship the working tree (tracked files and their changes) and run in that copy
+    Snapshot,
+}
+
+/// `--mode` and the flags that only a snapshot has. They are options, not defaulted, so that giving
+/// one with `--mode checkout` is refused instead of being ignored.
+#[derive(Args, Clone, Debug)]
+pub struct ModeFlags {
+    /// how the code gets to the remote host
+    #[arg(long, value_enum, default_value = "checkout")]
+    mode: ModeName,
+    /// snapshot: also ship files that git does not track (names that look like secrets are still
+    /// refused unless named with --allow-path)
+    #[arg(long = "include-untracked", num_args = 0, default_missing_value = "with-untracked", value_parser = parse_inclusion)]
+    inclusion: Option<Inclusion>,
+    /// snapshot: ship this untracked file although its name looks like a secret, relative to the
+    /// repository root; repeat it for several
+    #[arg(long = "allow-path", value_name = "PATH", value_parser = AllowedPath::parse)]
+    allowed: Vec<AllowedPath>,
+    /// snapshot: ship submodules and git-lfs pointer files as the nothing they are
+    #[arg(long = "allow-submodules", num_args = 0, default_missing_value = "allow", value_parser = parse_submodules)]
+    submodules: Option<SubmodulePolicy>,
+    /// snapshot: refuse a tree with more file content than this (K, M, G); default 256M
+    #[arg(long = "snapshot-limit", value_name = "SIZE", value_parser = parse_size)]
+    limit: Option<u64>,
+    /// snapshot: refuse a working tree that differs from HEAD
+    #[arg(long = "require-clean", num_args = 0, default_missing_value = "refuse", value_parser = parse_dirty)]
+    dirty: Option<DirtyPolicy>,
+}
+
+impl TryFrom<ModeFlags> for Mode {
+    type Error = anyhow::Error;
+
+    /// A snapshot flag with `--mode checkout` is refused: the flag would otherwise do nothing.
+    fn try_from(flags: ModeFlags) -> anyhow::Result<Self> {
+        let given = flags.inclusion.is_some()
+            || !flags.allowed.is_empty()
+            || flags.submodules.is_some()
+            || flags.limit.is_some()
+            || flags.dirty.is_some();
+        match flags.mode {
+            ModeName::Checkout if given => anyhow::bail!(
+                "--include-untracked, --allow-path, --allow-submodules, --snapshot-limit and \
+                 --require-clean need --mode snapshot"
+            ),
+            ModeName::Checkout => Ok(Mode::Checkout),
+            ModeName::Snapshot => Ok(Mode::Snapshot(Policy {
+                inclusion: flags.inclusion.unwrap_or(Inclusion::TrackedOnly),
+                allowed: flags.allowed,
+                submodules: flags.submodules.unwrap_or(SubmodulePolicy::Refuse),
+                limit: flags.limit.unwrap_or(DEFAULT_SNAPSHOT_LIMIT),
+                dirty: flags.dirty.unwrap_or(DirtyPolicy::Allow),
+            })),
         }
     }
 }
@@ -224,6 +289,8 @@ pub enum RemoteCmd {
         terminal: Terminal,
         #[command(flatten)]
         wait: RunWait,
+        #[command(flatten)]
+        mode: ModeFlags,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
@@ -435,6 +502,34 @@ fn parse_follow(text: &str) -> Result<Follow, String> {
     )
 }
 
+/// `--include-untracked` is `with-untracked`; absent it is not given at all.
+fn parse_inclusion(text: &str) -> Result<Inclusion, String> {
+    flag(
+        "--include-untracked",
+        text,
+        ("tracked-only", Inclusion::TrackedOnly),
+        ("with-untracked", Inclusion::WithUntracked),
+    )
+}
+
+fn parse_submodules(text: &str) -> Result<SubmodulePolicy, String> {
+    flag(
+        "--allow-submodules",
+        text,
+        ("refuse", SubmodulePolicy::Refuse),
+        ("allow", SubmodulePolicy::Allow),
+    )
+}
+
+fn parse_dirty(text: &str) -> Result<DirtyPolicy, String> {
+    flag(
+        "--require-clean",
+        text,
+        ("allow", DirtyPolicy::Allow),
+        ("refuse", DirtyPolicy::Refuse),
+    )
+}
+
 /// `--wait` is `wait`; absent it is `return`.
 fn parse_completion(text: &str) -> Result<Completion, String> {
     flag(
@@ -574,6 +669,114 @@ mod tests {
             .into_iter()
             .chain(args.iter().copied());
         Cli::try_parse_from(argv).unwrap().command
+    }
+
+    fn mode_of(args: &[&str]) -> anyhow::Result<Mode> {
+        match command_of(args) {
+            Cmd::Remote(RemoteCmd::Run { mode, .. }) => mode.try_into(),
+            _ => panic!("not a run"),
+        }
+    }
+
+    #[test]
+    fn run_ships_a_snapshot_only_when_asked_and_its_flags_need_it() {
+        assert_eq!(mode_of(&["run", "--", "ls"]).unwrap(), Mode::Checkout);
+        assert_eq!(
+            mode_of(&["run", "--mode", "checkout", "--", "ls"]).unwrap(),
+            Mode::Checkout
+        );
+        let Mode::Snapshot(policy) = mode_of(&["run", "--mode", "snapshot", "--", "ls"]).unwrap()
+        else {
+            panic!("not a snapshot");
+        };
+        assert_eq!(
+            policy,
+            Policy {
+                inclusion: Inclusion::TrackedOnly,
+                allowed: vec![],
+                submodules: SubmodulePolicy::Refuse,
+                limit: DEFAULT_SNAPSHOT_LIMIT,
+                dirty: DirtyPolicy::Allow,
+            }
+        );
+        let all = [
+            "run",
+            "--mode=snapshot",
+            "--include-untracked",
+            "--allow-path",
+            "config/app.pem",
+            "--allow-path=.env.example",
+            "--allow-submodules",
+            "--snapshot-limit",
+            "2M",
+            "--require-clean",
+            "--",
+            "ls",
+        ];
+        let Mode::Snapshot(policy) = mode_of(&all).unwrap() else {
+            panic!("not a snapshot");
+        };
+        assert_eq!(policy.inclusion, Inclusion::WithUntracked);
+        assert_eq!(policy.allowed.len(), 2);
+        assert_eq!(policy.submodules, SubmodulePolicy::Allow);
+        assert_eq!(policy.limit, 2 << 20);
+        assert_eq!(policy.dirty, DirtyPolicy::Refuse);
+    }
+
+    #[test]
+    fn a_snapshot_flag_without_the_snapshot_mode_is_refused_not_ignored() {
+        for flag in [
+            &["--include-untracked"][..],
+            &["--allow-path", "a"],
+            &["--allow-submodules"],
+            &["--snapshot-limit", "1M"],
+            &["--require-clean"],
+        ] {
+            for mode in [&[][..], &["--mode", "checkout"]] {
+                let mut args = vec!["run"];
+                args.extend(mode);
+                args.extend(flag);
+                args.extend(["--", "ls"]);
+                let err = mode_of(&args).unwrap_err().to_string();
+                assert!(err.contains("need --mode snapshot"), "{args:?}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn bad_snapshot_values_are_refused_by_the_parser() {
+        assert!(refused(&["run", "--mode", "copy", "--", "ls"]));
+        assert!(refused(&[
+            "run",
+            "--mode",
+            "snapshot",
+            "--include-untracked=no",
+            "--",
+            "ls"
+        ]));
+        assert!(refused(&[
+            "run",
+            "--mode",
+            "snapshot",
+            "--snapshot-limit",
+            "lots",
+            "--",
+            "ls"
+        ]));
+        for path in ["/etc/x", "../x", "a/../b", "", "dir/"] {
+            assert!(
+                refused(&[
+                    "run",
+                    "--mode",
+                    "snapshot",
+                    "--allow-path",
+                    path,
+                    "--",
+                    "ls"
+                ]),
+                "{path:?}"
+            );
+        }
     }
 
     #[test]

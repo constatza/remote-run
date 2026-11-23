@@ -232,9 +232,11 @@ fn dispatch(
             policy,
             terminal,
             wait,
+            mode,
             cmd,
         } => {
-            let args = app::run::Args::new(policy, terminal, cmd, wait.after(echo));
+            let args = app::run::Args::new(policy, terminal, cmd, wait.after(echo))
+                .with_mode(mode.try_into()?);
             app::run::run(session, args, ports)
         }
         RemoteCmd::Fwd(args) => fwd(session, args, ports, env),

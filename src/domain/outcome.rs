@@ -8,6 +8,7 @@ use crate::domain::json;
 use crate::domain::pull::{Next, PullOutcome, next};
 use crate::domain::sanitize::{error_line, sanitize};
 use crate::domain::slurm::{JobStatus, WaitOutcome};
+use crate::domain::snapshot::Refusal;
 use crate::domain::status::{LogTail, StatusReport};
 use crate::domain::transfer::Transfer;
 use std::path::PathBuf;
@@ -29,6 +30,8 @@ pub enum Outcome {
     Status(StatusReport),
     /// A forward that `rr` closed (`rr fwd`): its time to live ran out, or `rr` was interrupted.
     Forwarded(Closed),
+    /// A snapshot guard said no, so nothing was run (`rr run --mode snapshot`).
+    SnapshotRefused(Refusal),
 }
 
 /// What `rr trust` did with a project file.
@@ -130,6 +133,11 @@ fn render_text(outcome: &Outcome) -> Rendered {
         Outcome::Forwarded(Closed::Expired) => Rendered::exiting(Exit::Success),
         Outcome::Forwarded(Closed::Interrupted) => Rendered::exiting(Exit::Rr(RrCode::Interrupted)),
         Outcome::Forwarded(Closed::SshEnded(code)) => Rendered::exiting(code.exit()),
+        Outcome::SnapshotRefused(refusal) => Rendered {
+            exit: Exit::Rr(RrCode::Refused),
+            stdout: String::new(),
+            stderr: lines(&[format!("rr: refused: {}", sanitize(&refusal.to_string()))]),
+        },
     }
 }
 
@@ -273,6 +281,28 @@ mod tests {
 
     fn pulled(outcome: PullOutcome) -> Rendered {
         text(&Outcome::Pulled(outcome))
+    }
+
+    #[test]
+    fn a_refused_snapshot_is_an_rr_refusal_and_its_text_is_sanitized() {
+        let refused = text(&Outcome::SnapshotRefused(Refusal::SecretNames(vec![
+            ".env".into(),
+            "k\u{1b}]0;x\u{7}ey.pem".into(),
+        ])));
+        assert_eq!(refused.exit, Exit::Rr(RrCode::Refused));
+        assert_eq!(refused.stdout, "");
+        assert!(
+            refused
+                .stderr
+                .starts_with("rr: refused: untracked files with secret")
+        );
+        assert!(refused.stderr.contains(".env"));
+        assert!(!refused.stderr.contains('\u{1b}') && !refused.stderr.contains('\u{7}'));
+        assert_eq!(refused.stderr.lines().count(), 1);
+        let remote = text(&Outcome::SnapshotRefused(Refusal::RemoteNotPrivate {
+            stderr: "\u{1b}[2Jnot yours\n".into(),
+        }));
+        assert!(remote.stderr.contains("?[2Jnot yours"), "{}", remote.stderr);
     }
 
     #[test]

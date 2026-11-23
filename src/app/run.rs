@@ -1,12 +1,13 @@
 //! `rr run`: `pull`, then run a command in the remote project directory.
 
 use super::wait::{Limits, run_then_wait};
-use super::{Ports, exec, pull};
+use super::{Ports, exec, pull, snapshot};
 use crate::config::Session;
 use crate::domain::outcome::{Outcome, pull_report};
 use crate::domain::pull::{JobPolicy, Next, next};
+use crate::domain::snapshot::Mode;
 use crate::ports::{Echo, Terminal};
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 /// What happens once the command has ended.
 #[derive(Clone, Copy, Debug)]
@@ -24,22 +25,49 @@ pub struct Args {
     pub terminal: Terminal,
     pub cmd: Vec<String>,
     pub after: After,
+    /// How the code gets to the remote host. Checkout unless asked for a snapshot.
+    pub mode: Mode,
 }
 
 impl Args {
+    /// A run in the remote checkout, as `rr run` always was.
     pub fn new(policy: JobPolicy, terminal: Terminal, cmd: Vec<String>, after: After) -> Self {
         Self {
             policy,
             terminal,
             cmd,
             after,
+            mode: Mode::Checkout,
+        }
+    }
+
+    #[must_use]
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
+        self
+    }
+}
+
+pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
+    match &args.mode {
+        Mode::Checkout => run_in_checkout(session, args, ports),
+        Mode::Snapshot(policy) => {
+            // --force lifts a pull guard; a snapshot does not pull, so there is nothing for it to lift
+            if args.policy == JobPolicy::Override {
+                bail!("--force has no effect with --mode snapshot: it does not pull");
+            }
+            let command = exec::Args {
+                terminal: args.terminal,
+                cmd: args.cmd,
+            };
+            snapshot::run(session, policy, command, args.after, ports)
         }
     }
 }
 
 /// The command runs only when the pull reached the target: [`next`] is a closed match, so a
 /// refusal or a stale environment can never fall through to running code.
-pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
+fn run_in_checkout(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     let pulled = pull::to_local_head(session, args.policy, ports)?;
     match next(&pulled) {
         Next::Stop(_) => Ok(Outcome::Pulled(pulled)),
@@ -93,6 +121,7 @@ mod tests {
             terminal: Terminal::Plain,
             cmd: vec!["python".into(), "train.py".into()],
             after: After::Return,
+            mode: Mode::Checkout,
         }
     }
 
@@ -209,6 +238,34 @@ mod tests {
                 .any(|script| script.contains("sacct"));
             assert!(!waited, "{name}");
         }
+    }
+
+    #[test]
+    fn the_checkout_mode_is_the_default_and_force_is_refused_with_a_snapshot() {
+        use crate::domain::snapshot::{DirtyPolicy, Inclusion, Policy, SubmodulePolicy};
+        let plain = Args::new(
+            JobPolicy::Respect,
+            Terminal::Plain,
+            vec!["ls".into()],
+            After::Return,
+        );
+        assert_eq!(plain.mode, Mode::Checkout);
+        let policy = Policy {
+            inclusion: Inclusion::TrackedOnly,
+            allowed: vec![],
+            submodules: SubmodulePolicy::Refuse,
+            limit: 1,
+            dirty: DirtyPolicy::Allow,
+        };
+        let forced = Args {
+            policy: JobPolicy::Override,
+            ..args()
+        }
+        .with_mode(Mode::Snapshot(policy));
+        let fakes = fakes(vec![], vec![]);
+        let err = run(&session(), forced, &fakes.ports()).unwrap_err();
+        assert!(err.to_string().contains("--force"), "{err}");
+        assert!(fakes.exec.calls.borrow().is_empty());
     }
 
     #[test]
