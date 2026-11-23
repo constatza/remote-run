@@ -441,6 +441,24 @@ mod shell {
         );
         }
 
+        /// A `stat` that reports owner 4242 for any path ending in `suffix` (a real directory of
+        /// another user needs root to make) and is the real one otherwise.
+        fn stat_owned_by_another(&self, suffix: &str) {
+            let real = Command::new("sh")
+                .args(["-c", "command -v stat"])
+                .output()
+                .unwrap()
+                .stdout;
+            let real = String::from_utf8(real).unwrap();
+            self.stub(
+                "stat",
+                &format!(
+                    "for a in \"$@\"; do case \"$a\" in *{suffix})\n  case \"$2\" in '%u') echo 4242; exit 0 ;; '%u %a') echo '4242 700'; exit 0 ;; esac ;; esac; done\nexec {} \"$@\"",
+                    real.trim()
+                ),
+            );
+        }
+
         fn make_root(&self) {
             std::fs::create_dir_all(self.root()).unwrap();
             std::fs::set_permissions(self.root(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -817,6 +835,77 @@ mod shell {
         let trashed = host.snap(&format!(".trash-{A}"));
         assert!(trashed.join("src/pkg/mod.py").is_file());
         assert!(host.snap(B).join("src/pkg/mod.py").is_file());
+    }
+
+    #[test]
+    fn a_removal_step_that_fails_is_reported_as_failed_and_leaves_the_entry_set_aside() {
+        for program in ["chmod", "rm"] {
+            let host = Host::new();
+            host.snapshot(A, 3 * DAY);
+            host.stub(program, "exit 1");
+            let done = cleaned(&host.gc("2h", 0));
+            assert_eq!(done.failed, [A], "{program}");
+            assert!(done.removed.is_empty() && done.kept.is_empty(), "{program}");
+            assert_eq!(host.left(), [format!(".trash-{A}")], "{program}");
+        }
+    }
+
+    #[test]
+    fn a_real_directory_of_another_user_is_never_touched() {
+        for suffix in [A, ".tmp-THEIRS12"] {
+            let host = Host::new();
+            host.snapshot(A, 3 * DAY);
+            let leftover = host.snap(".tmp-THEIRS12");
+            std::fs::create_dir_all(&leftover).unwrap();
+            host.age(&leftover, 3 * DAY);
+            host.stat_owned_by_another(suffix);
+            let done = cleaned(&host.gc("2h", 0));
+            assert!(
+                done.kept.contains(&(suffix.to_string(), Why::NotYours)),
+                "{suffix}: {:?}",
+                done.kept
+            );
+            assert!(!done.removed.iter().any(|gone| gone == suffix), "{suffix}");
+            assert!(host.snap(suffix).is_dir(), "{suffix}");
+        }
+    }
+
+    #[test]
+    fn a_leftover_staging_directory_a_job_runs_in_is_kept() {
+        let host = Host::new();
+        host.make_root();
+        let dir = host.snap(".tmp-BUSY1234");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        host.freeze(&dir, 3 * DAY);
+        host.queue(&[format!("6 {}/src", dir.display())]);
+        let done = cleaned(&host.gc("2h", 0));
+        assert_eq!(done.kept, [(".tmp-BUSY1234".to_string(), Why::InUse)]);
+        assert!(done.removed.is_empty());
+        assert_eq!(host.left(), [".tmp-BUSY1234"]);
+    }
+
+    /// `mv -T` onto an empty directory replaces it, so an empty young `.trash-<id>` does not stop
+    /// the snapshot from being set aside and removed.
+    #[test]
+    fn an_empty_trash_directory_is_replaced_by_the_snapshot_set_aside() {
+        let host = Host::new();
+        host.snapshot(A, 3 * DAY);
+        let empty = host.snap(&format!(".trash-{A}"));
+        std::fs::create_dir_all(&empty).unwrap();
+        host.freeze(&empty, 60);
+        let done = cleaned(&host.gc("2h", 0));
+        assert_eq!(done.removed, [A]);
+        assert!(done.failed.is_empty());
+        assert!(host.left().is_empty(), "{:?}", host.left());
+    }
+
+    #[test]
+    fn a_root_of_another_user_is_refused_and_nothing_is_deleted() {
+        let host = Host::new();
+        host.snapshot(A, 3 * DAY);
+        host.stat_owned_by_another(ROOT);
+        assert_eq!(refused(&host.gc("2h", 0)), GcRefusal::RootNotSafe);
+        assert_eq!(host.left(), [A]);
     }
 
     #[test]
