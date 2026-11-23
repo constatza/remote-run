@@ -213,17 +213,29 @@ fn parts(outcome: &Outcome) -> (Source, Body) {
     }
 }
 
-/// `outcome` as one line of JSON, with `exit` as the process will exit.
-pub fn document(outcome: &Outcome, exit: Exit) -> String {
+/// `outcome` as one line of JSON, with `exit` as the process will exit. A serialization error is
+/// returned, never replaced by a stand-in document: a script reading stdout must be able to tell a
+/// result from a failure to write one.
+pub fn document(outcome: &Outcome, exit: Exit) -> serde_json::Result<String> {
     let (source, body) = parts(outcome);
     let document = Document {
         source,
         exit: exit.code(),
         body,
     };
-    // a derived `Serialize` over strings and numbers has no way to fail; the fallback only keeps
-    // the function total
-    serde_json::to_string(&document).unwrap_or_else(|_| String::from("{}"))
+    serde_json::to_string(&document)
+}
+
+/// The document for an error `rr` itself ended with, as one line. Built from a `Value`, whose text
+/// form cannot fail, because this is what is written when writing the result failed.
+pub fn error_document(exit: Exit, message: &str) -> String {
+    serde_json::json!({
+        "source": "rr",
+        "exit": exit.code(),
+        "kind": "error",
+        "message": clean(message),
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -355,13 +367,15 @@ mod tests {
             over,
             json!({"source": "rr", "exit": 3, "kind": "copy", "result": "over_limit", "total": 5, "limit": 4})
         );
-        let report = TrustReport {
+        let report = |state| TrustReport {
             path: PathBuf::from("/p/.rr.toml"),
             digest: digest(b"x"),
             text: "host = \"h\"\n".into(),
-            state: TrustState::Recorded,
+            state,
         };
-        let (trust, _) = json_of(&Outcome::Trust(report));
+        let (shown, _) = json_of(&Outcome::Trust(report(TrustState::Shown)));
+        assert_eq!(shown["state"], "shown");
+        let (trust, _) = json_of(&Outcome::Trust(report(TrustState::Recorded)));
         assert_eq!(trust["state"], "recorded");
         assert_eq!(trust["sha256"], digest(b"x").to_string());
         assert_eq!(trust["text"], "host = \"h\"\n");

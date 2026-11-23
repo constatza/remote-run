@@ -24,7 +24,7 @@ fn main() -> ExitCode {
     let format = cli.format;
     let rendered = match environment().and_then(|env| run(cli, &env)) {
         Ok(outcome) => render(&outcome, format),
-        Err(err) => render_error(&err),
+        Err(err) => render_error(&err, format),
     };
     print!("{}", rendered.stdout);
     eprint!("{}", rendered.stderr);

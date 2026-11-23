@@ -82,10 +82,13 @@ pub fn render(outcome: &Outcome, format: Format) -> Rendered {
         Format::Text => render_text(outcome),
         Format::Json => {
             let exit = render_text(outcome).exit;
-            Rendered {
-                exit,
-                stdout: format!("{}\n", json::document(outcome, exit)),
-                stderr: String::new(),
+            match json::document(outcome, exit) {
+                Ok(document) => Rendered {
+                    exit,
+                    stdout: format!("{document}\n"),
+                    stderr: String::new(),
+                },
+                Err(err) => render_error(&anyhow::Error::new(err), Format::Json),
             }
         }
     }
@@ -187,13 +190,22 @@ fn render_trust(report: &TrustReport) -> Rendered {
     }
 }
 
-/// The failure line `main` prints when a command returned an error: every message may embed
-/// remote or file text, so it passes through [`sanitize`] whole.
-pub fn render_error(err: &anyhow::Error) -> Rendered {
-    Rendered {
-        exit: Exit::Rr(RrCode::Failure),
-        stdout: String::new(),
-        stderr: lines(&[error_line(err)]),
+/// What `main` prints when a command returned an error: every message may embed remote or file
+/// text, so it passes through [`sanitize`] whole. In text, one line on stderr; in JSON, one error
+/// document on stdout (and nothing on stderr), so a script that reads stdout always gets a document.
+pub fn render_error(err: &anyhow::Error, format: Format) -> Rendered {
+    let exit = Exit::Rr(RrCode::Failure);
+    match format {
+        Format::Text => Rendered {
+            exit,
+            stdout: String::new(),
+            stderr: lines(&[error_line(err)]),
+        },
+        Format::Json => Rendered {
+            exit,
+            stdout: format!("{}\n", json::error_document(exit, &format!("{err:#}"))),
+            stderr: String::new(),
+        },
     }
 }
 
@@ -373,10 +385,31 @@ mod tests {
     #[test]
     fn an_error_is_one_sanitized_line_and_a_failure() {
         let err = anyhow::anyhow!("remote said \u{1b}[2J").context("sacct failed");
-        let rendered = render_error(&err);
+        let rendered = render_error(&err, Format::Text);
         assert_eq!(rendered.exit, Exit::Rr(RrCode::Failure));
         assert_eq!(rendered.stderr, "rr: sacct failed: remote said ?[2J\n");
         assert_eq!(rendered.stdout, "");
+    }
+
+    /// A script that reads stdout under `--json` always gets one document, error or not.
+    #[test]
+    fn under_json_an_error_is_one_sanitized_document_on_stdout() {
+        let err = anyhow::anyhow!("remote said \u{1b}[2J").context("sacct failed");
+        let rendered = render_error(&err, Format::Json);
+        assert_eq!(rendered.exit, Exit::Rr(RrCode::Failure));
+        assert_eq!(rendered.stderr, "");
+        assert!(rendered.stdout.ends_with('\n'));
+        assert_eq!(rendered.stdout.lines().count(), 1);
+        let value: serde_json::Value = serde_json::from_str(&rendered.stdout).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "source": "rr",
+                "exit": 1,
+                "kind": "error",
+                "message": "sacct failed: remote said ?[2J",
+            })
+        );
     }
 
     #[test]
