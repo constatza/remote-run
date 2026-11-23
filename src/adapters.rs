@@ -7,7 +7,7 @@ use crate::domain::host::Host;
 use crate::domain::shell::Script;
 use crate::domain::ssh::{Liveness, Terminal, ssh_argv};
 use crate::ports::{
-    Child as PortChild, Clock, Echo, Ended, Exec, Instant, Net, Remote, Teed, tee_lines,
+    Child as PortChild, Clock, Echo, Ended, Exec, Instant, Net, Ownership, Remote, Teed, tee_lines,
     write_sanitized,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -377,14 +377,18 @@ impl Net for OsNet {
     }
 
     #[cfg(target_os = "linux")]
-    fn held_by(&self, port: LoopbackPort, pid: u32) -> bool {
-        // fail closed: an unreadable table or a process we may not inspect is "not held"
-        holds_listener(port, pid).unwrap_or(false)
+    fn held_by(&self, port: LoopbackPort, pid: u32) -> Ownership {
+        // an unreadable table or a process we may not inspect is unknown, never held
+        match holds_listener(port, pid) {
+            Ok(true) => Ownership::Held,
+            Ok(false) => Ownership::Foreign,
+            Err(err) => Ownership::Unknown(format!("{err:#}")),
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn held_by(&self, _: LoopbackPort, _: u32) -> bool {
-        false
+    fn held_by(&self, _: LoopbackPort, _: u32) -> Ownership {
+        Ownership::Unknown("only Linux can tell whose a listener is".into())
     }
 
     fn accepts(&self, endpoint: &Endpoint) -> bool {
@@ -1296,16 +1300,21 @@ mod tests {
     fn a_loopback_listener_is_held_by_its_own_process_only() {
         let listener = TcpListener::bind((LOOPBACK_ADDR, 0)).unwrap();
         let port = LoopbackPort::from_u16(listener.local_addr().unwrap().port()).unwrap();
-        assert!(OsNet.held_by(port, std::process::id()));
+        assert_eq!(OsNet.held_by(port, std::process::id()), Ownership::Held);
         let child = OsExec.spawn(&sh("exec sleep 30")).unwrap();
-        assert!(
-            !OsNet.held_by(port, child.pid()),
+        assert_eq!(
+            OsNet.held_by(port, child.pid()),
+            Ownership::Foreign,
             "a child of ours is not the holder"
         );
-        assert!(!OsNet.held_by(port, 0), "no such process");
-        drop(listener);
         assert!(
-            !OsNet.held_by(port, std::process::id()),
+            matches!(OsNet.held_by(port, 0), Ownership::Unknown(_)),
+            "no such process: its fds cannot be read"
+        );
+        drop(listener);
+        assert_eq!(
+            OsNet.held_by(port, std::process::id()),
+            Ownership::Foreign,
             "nothing listens any more"
         );
     }

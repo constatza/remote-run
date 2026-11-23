@@ -19,7 +19,7 @@
 
 use crate::domain::fwd::{Endpoint, ForwardTarget, argv};
 use crate::domain::host::Host;
-use crate::ports::{Child, Clock, Deadline, Ended, Exec, Net};
+use crate::ports::{Child, Clock, Deadline, Ended, Exec, Net, Ownership};
 use anyhow::{Result, bail};
 use std::time::Duration;
 
@@ -119,6 +119,33 @@ pub enum Started {
     Interrupted,
 }
 
+/// What a look at the endpoint of a starting forward showed.
+#[derive(PartialEq, Eq)]
+enum Probe {
+    /// Nothing accepts yet.
+    Silent,
+    /// The port answers, and the listener is ssh's.
+    SshListens,
+    /// The port answers, and the listener is another process's: the race the owner check closes.
+    Foreign,
+    /// The port answers, but whose listener it is could not be established; the text says why.
+    Unproven(String),
+}
+
+impl Probe {
+    /// What to add to the timeout error: the reason ssh was not found listening, if the port
+    /// answered at all.
+    fn why(&self) -> String {
+        match self {
+            Self::Silent | Self::SshListens => String::new(),
+            Self::Foreign => ": the port answers, but its listener is not ssh's".into(),
+            Self::Unproven(why) => {
+                format!(": the port answers, but could not prove its listener is ssh's ({why})")
+            }
+        }
+    }
+}
+
 /// Whether ssh is still running at a look.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Look {
@@ -164,37 +191,37 @@ impl StartingForward {
             if self.look()? == Look::Interrupted {
                 return Ok(Look::Interrupted);
             }
-            if self.is_ssh_listening(net) {
+            let probe = self.probe(net);
+            if probe == Probe::SshListens {
                 clock.sleep(SETTLE);
                 return self.look();
             }
             if give_up.expired(clock.now()) {
-                // a port that answers without being ssh's is the race this check closes
-                let foreign = if net.accepts(&self.endpoint) {
-                    ": the port answers, but its listener is not ssh's"
-                } else {
-                    ""
-                };
                 bail!(
-                    "ssh did not open the forward within {}s{foreign}",
-                    START_LIMIT.as_secs()
+                    "ssh did not open the forward within {}s{}",
+                    START_LIMIT.as_secs(),
+                    probe.why()
                 );
             }
             clock.sleep(POLL);
         }
     }
 
-    /// Whether the endpoint accepts and, for a TCP port, the listener is ssh's own: a connect
-    /// succeeds against any listener, including one that took the port between `rr` choosing it
-    /// and ssh binding it, so only a listener held by ssh's pid counts. A socket path was absent
-    /// before ssh started and lies in the private runtime directory, so it needs no owner.
-    fn is_ssh_listening(&self, net: &dyn Net) -> bool {
+    /// What the endpoint shows now. A connect succeeds against any listener, including one that
+    /// took the port between `rr` choosing it and ssh binding it, so for a TCP port only a
+    /// listener held by ssh's pid counts. A socket path was absent before ssh started and lies in
+    /// the private runtime directory, so it needs no owner.
+    fn probe(&self, net: &dyn Net) -> Probe {
         if !net.accepts(&self.endpoint) {
-            return false;
+            return Probe::Silent;
         }
         match &self.endpoint {
-            Endpoint::Tcp(port) => net.held_by(*port, self.child.pid()),
-            Endpoint::Unix(_) => true,
+            Endpoint::Tcp(port) => match net.held_by(*port, self.child.pid()) {
+                Ownership::Held => Probe::SshListens,
+                Ownership::Foreign => Probe::Foreign,
+                Ownership::Unknown(why) => Probe::Unproven(why),
+            },
+            Endpoint::Unix(_) => Probe::SshListens,
         }
     }
 

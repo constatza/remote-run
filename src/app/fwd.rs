@@ -385,6 +385,20 @@ mod tests {
         assert!(notes(&w).is_empty());
     }
 
+    /// A listener whose owner cannot be read is neither announced nor called foreign.
+    #[test]
+    fn an_unreadable_socket_table_is_said_not_called_a_foreign_listener() {
+        let mut w = world(vec![None], vec![true]);
+        w.net.unreadable = Some("cannot read /proc/net/tcp".into());
+        let err = go(&w, &session(), args("n:1"), None).unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("could not prove"), "{shown}");
+        assert!(shown.contains("cannot read /proc/net/tcp"), "{shown}");
+        assert!(!shown.contains("is not ssh's"), "{shown}");
+        assert!(notes(&w).is_empty(), "no URL");
+        assert_eq!(w.killed.get(), 1, "ssh is stopped");
+    }
+
     /// A socket in the private runtime directory has no port to take: it is checked as before.
     #[test]
     fn a_socket_forward_needs_no_port_owner() {
