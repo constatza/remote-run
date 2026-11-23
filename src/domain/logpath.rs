@@ -1,9 +1,7 @@
 //! The log file of a job: `sacct` stores `--output` unexpanded (`%x-%j.out`), so it is expanded here.
 
+use crate::domain::slurm::SACCT_SEPARATOR;
 use anyhow::{Result, bail};
-
-/// The `sacct -P` fields [`parse_sacct`] reads, in this order.
-pub const SACCT_FIELDS: &str = "JobIDRaw,JobID,JobName,User,WorkDir,StdOut";
 
 /// One job's record from `sacct`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,12 +15,25 @@ pub struct JobRecord {
     pub stdout: String,
 }
 
-/// Parse the first line of `sacct -n -X -P -o` [`SACCT_FIELDS`] (pure).
+/// Parse the one line of `sacct -n -X -P -o` [`crate::domain::slurm::SACCT_FIELDS`] (pure). Several
+/// lines mean the id named more than one job (the parent id of an array): that is an error naming
+/// them, because picking the first would show some other task's log.
 pub fn parse_sacct(text: &str) -> Result<JobRecord> {
-    let Some(line) = text.lines().find(|line| !line.trim().is_empty()) else {
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(line) = lines.next() else {
         bail!("sacct knows no such job");
     };
-    let fields: Vec<&str> = line.splitn(6, '|').collect();
+    if lines.next().is_some() {
+        let ids: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split(SACCT_SEPARATOR).nth(1))
+            .collect();
+        bail!(
+            "that id names several jobs ({}): pick one, such as an array task `<id>_<n>`",
+            ids.join(", ")
+        );
+    }
+    let fields: Vec<&str> = line.splitn(6, SACCT_SEPARATOR).collect();
     let [id_raw, id, name, user, workdir, stdout] = fields[..] else {
         bail!("unexpected sacct line: {line:?}");
     };
@@ -67,10 +78,15 @@ pub fn log_path(job: &JobRecord) -> Result<String> {
         }
     }
     if out.starts_with('/') {
-        Ok(out)
-    } else {
-        Ok(format!("{}/{out}", job.workdir.trim_end_matches('/')))
+        return Ok(out);
     }
+    if job.workdir.is_empty() {
+        bail!(
+            "job {} has no working directory in sacct and a relative log path {out:?}",
+            job.id
+        );
+    }
+    Ok(format!("{}/{out}", job.workdir.trim_end_matches('/')))
 }
 
 #[cfg(test)]
@@ -127,8 +143,42 @@ mod tests {
     #[test]
     fn parses_a_sacct_line() {
         assert!(parse_sacct("").is_err());
-        let job = parse_sacct("529727|529727|n|someone|/w|/o/%x-%j.out\n").unwrap();
+        let line = ["529727", "529727", "n", "someone", "/w", "/o/%x-%j.out"].join("\u{1f}");
+        let job = parse_sacct(&format!("{line}\n")).unwrap();
         assert_eq!(job.stdout, "/o/%x-%j.out");
-        assert!(parse_sacct("529727|529727|n\n").is_err());
+        assert!(parse_sacct("529727\u{1f}529727\u{1f}n\n").is_err());
+    }
+
+    fn line(id: &str) -> String {
+        [id, id, "n", "someone", "/w", "/o/out"].join("\u{1f}")
+    }
+
+    #[test]
+    fn an_id_that_names_several_jobs_is_an_error_naming_them() {
+        let text = format!("{}\n{}\n\n{}\n", line("9_1"), line("9_2"), line("9_3"));
+        let err = parse_sacct(&text).unwrap_err().to_string();
+        assert!(err.contains("9_1, 9_2, 9_3"), "{err}");
+        assert!(parse_sacct(&format!("{}\n\n", line("9_1"))).is_ok());
+    }
+
+    #[test]
+    fn a_relative_log_path_needs_a_working_directory() {
+        let mut job = record("1", "logs/%j.out");
+        job.workdir = String::new();
+        let err = log_path(&job).unwrap_err().to_string();
+        assert!(err.contains("no working directory"), "{err}");
+        job.stdout = String::new();
+        assert!(log_path(&job).is_err(), "the default name is relative too");
+        job.stdout = "/abs/%j.out".into();
+        assert_eq!(log_path(&job).unwrap(), "/abs/529727.out");
+    }
+
+    #[test]
+    fn a_job_name_with_a_pipe_does_not_shift_the_fields() {
+        let line = ["1", "1", "a|b|c", "someone", "/w", "/o/out"].join("\u{1f}");
+        let job = parse_sacct(&line).unwrap();
+        assert_eq!(job.name, "a|b|c");
+        assert_eq!(job.workdir, "/w");
+        assert_eq!(job.stdout, "/o/out");
     }
 }
