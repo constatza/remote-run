@@ -64,28 +64,23 @@ const USED_OF: &str = r#"used_of() { if [ -f "$1/.rr-used" ] && [ ! -L "$1/.rr-u
 /// The name an entry is set aside under; a leftover that is already `.trash-…` keeps its name.
 const TRASH_OF: &str = r#"trash_of() { case "$1" in .trash-*) printf '%s' "$1" ;; *) printf '.trash-%s' "$1" ;; esac; }"#;
 
-/// The snapshot name a job's directory would carry for an entry: a snapshot set aside by a run
-/// that never finished (`.trash-<id>`) is still the directory its jobs were submitted from.
-const HOME_OF: &str = r#"home_of() {
-  case "$1" in
-    .trash-*) if is_id "${1#.trash-}"; then printf '%s' "${1#.trash-}"; return 0; fi ;;
-  esac
-  printf '%s' "$1"
-}"#;
-
 /// Puts an entry back under its own name; nothing to do for one that was never renamed.
 const RESTORE: &str = r#"restore() { t=$(trash_of "$1"); [ "$t" = "$1" ] || mv -T -- "$rootreal/$t" "$rootreal/$1"; }"#;
 
-/// Whether an active job runs from the entry or from inside it. The test is the shell form of
+/// Whether an active job runs from the entry or from inside it. A snapshot has two names, `<id>`
+/// and `.trash-<id>` (set aside, perhaps by a run that never finished), and a job submitted from
+/// either one counts for both, whichever name the entry has now. The test is the shell form of
 /// `inside` (equal, or below with a `/` between), applied to paths `realpath -m` already
-/// normalised; a heredoc and not a pipe, so no `SIGPIPE` can turn "found" into "not found".
+/// normalised. It is a `case` on `$queue` with newlines around it and does no I/O: a
+/// here-document or a pipe can fail to start (bash 4.4 writes a here-document to a temporary
+/// file), and a loop that then does not run would read as "not in use".
 const IN_USE: &str = r#"in_use() {
-  dir="$rootreal/$(home_of "$1")"
-  while IFS= read -r workdir; do
-    case "$workdir" in "$dir"|"$dir"/*) return 0 ;; esac
-  done <<EOF
-$queue
-EOF
+  base=$1
+  case "$1" in .trash-*) if is_id "${1#.trash-}"; then base=${1#.trash-}; fi ;; esac
+  if is_id "$base"; then set -- "$rootreal/$base" "$rootreal/.trash-$base"; else set -- "$rootreal/$1"; fi
+  for dir in "$@"; do
+    case "$nl$queue$nl" in *"$nl$dir$nl"*|*"$nl$dir/"*) return 0 ;; esac
+  done
   return 1
 }"#;
 
@@ -126,12 +121,12 @@ fn head(age: Age) -> Script {
         lit("homereal=$(realpath -- \"$HOME\") || refuse root"),
         lit("[ \"$rootreal\" != \"$homereal\" ] || refuse root"),
         lit("uid=$(id -u)"),
+        lit("nl=\"\n\""),
         lit(IS_ID).word(number(ID_LENGTH)).lit(" ]; }"),
         lit(PLAIN_NAME),
         lit(MINE),
         lit(USED_OF),
         lit(TRASH_OF),
-        lit(HOME_OF),
         lit(RESTORE),
         read_queue(),
         lit(IN_USE),
@@ -481,7 +476,18 @@ mod shell {
             self.run_with_home(age, keep, self.home.path().to_str().unwrap())
         }
 
+        /// The clean-up in a shell that may not write a file (`ulimit -f 0`) and whose `TMPDIR`
+        /// does not exist, as when a here-document cannot be written.
+        fn gc_without_temp_files(&self, age: &str, keep: u32) -> Captured {
+            let home = self.home.path().to_str().unwrap();
+            self.run_in("ulimit -f 0; export TMPDIR=/nonexistent\n", age, keep, home)
+        }
+
         fn run_with_home(&self, age: &str, keep: u32, home: &str) -> Captured {
+            self.run_in("", age, keep, home)
+        }
+
+        fn run_in(&self, prefix: &str, age: &str, keep: u32, home: &str) -> Captured {
             let place = Place {
                 env: None,
                 dir: Some(RemoteDir::parse(self.project().to_str().unwrap()).unwrap()),
@@ -496,7 +502,8 @@ mod shell {
                 self.stubs.path().display(),
                 std::env::var("PATH").unwrap()
             );
-            let argv = Argv::new("/bin/bash", vec!["-c".into(), body.to_string()])
+            let body = format!("{prefix}{body}");
+            let argv = Argv::new("/bin/bash", vec!["-c".into(), body])
                 .with_env(EnvVar::parse("PATH", &path).unwrap())
                 .with_env(EnvVar::parse("HOME", home).unwrap());
             OsExec.capture(&argv, Stdin::Null).unwrap()
@@ -874,6 +881,49 @@ mod shell {
         assert_eq!(done.removed, [format!(".trash-{B}")]);
         assert_eq!(done.kept, [(format!(".trash-{A}"), Why::InUse)]);
         assert_eq!(host.left(), [format!(".trash-{A}")]);
+    }
+
+    /// A leftover `.trash-<id>` is the same directory as `<id>` to a job, whichever of the two
+    /// paths the job was submitted from, and an entry under its plain name is protected by a job in
+    /// its trash path too.
+    #[test]
+    fn a_job_counts_for_both_names_of_a_snapshot() {
+        for entry in [A.to_string(), format!(".trash-{A}")] {
+            for job_dir in [A.to_string(), format!(".trash-{A}")] {
+                let host = Host::new();
+                host.make_root();
+                let dir = host.snap(&entry);
+                std::fs::create_dir_all(dir.join("src")).unwrap();
+                host.freeze(&dir, 3 * DAY);
+                host.queue(&[format!("4 {}/src", host.snap(&job_dir).display())]);
+                let done = cleaned(&host.gc("2h", 0));
+                assert_eq!(
+                    done.kept,
+                    [(entry.clone(), Why::InUse)],
+                    "{entry} {job_dir}"
+                );
+                assert!(done.removed.is_empty());
+                assert_eq!(host.left(), std::slice::from_ref(&entry));
+            }
+        }
+    }
+
+    /// The in-use test reads no file and starts no process of its own, so nothing that can fail
+    /// to start can make it answer "not in use"; the same run with no room for a temporary file
+    /// still keeps the snapshot.
+    #[test]
+    fn the_in_use_test_does_no_io() {
+        assert!(!IN_USE.contains("<<"), "no here-document");
+        assert!(
+            !IN_USE.contains(" | ") && !IN_USE.contains("$("),
+            "no pipe or substitution"
+        );
+        let host = Host::new();
+        host.snapshot(A, 3 * DAY);
+        host.queue(&[format!("4 {}/src", host.snap(A).display())]);
+        let blocked = host.gc_without_temp_files("2h", 0);
+        assert_eq!(cleaned(&blocked).kept, [(A.to_string(), Why::InUse)]);
+        assert!(host.snap(A).exists());
     }
 
     #[test]
