@@ -3,13 +3,13 @@
 //! the forward at its deadline, and an interrupt or the death of `rr` ends ssh.
 
 use super::Ports;
-use super::tunnel::{End, ListeningForward, StartingForward};
+use super::tunnel::{End, ListeningForward, Started, StartingForward};
 use crate::config::Session;
 use crate::domain::exit::RemoteExit;
-use crate::domain::fwd::{Browser, Endpoint, OpenUrl, Plan, SocketPath, Transport, Ttl, Wanted};
-use crate::domain::fwd::{LoopbackPort, argv};
+use crate::domain::fwd::{Browser, Endpoint, Listener, LoopbackPort, OpenUrl, Plan, SocketPath};
+use crate::domain::fwd::{Transport, Ttl, Wanted};
 use crate::domain::outcome::Outcome;
-use crate::ports::{Clock, Deadline, Net};
+use crate::ports::{Deadline, Net};
 use anyhow::{Context, Result, bail};
 
 pub struct Args {
@@ -20,28 +20,67 @@ pub struct Args {
     pub browser: Browser,
 }
 
-/// The local machine as `fwd` sees it, besides the process ports: its network and files, its
-/// clock, and the private directory (`XDG_RUNTIME_DIR`) a socket may live in.
+/// The local machine as `fwd` sees it, besides the process ports: its network and files, and the
+/// private directory (`XDG_RUNTIME_DIR`) a socket may live in.
 pub struct Machine<'a> {
     pub net: &'a dyn Net,
-    pub clock: &'a dyn Clock,
     pub runtime_dir: Option<&'a str>,
 }
 
+/// The code of a forward that `rr` closed on an interrupt: 128 plus SIGINT, as a shell reports
+/// Ctrl-C.
+const INTERRUPTED_EXIT: i32 = 130;
+
 pub fn run(session: &Session, args: Args, ports: &Ports, machine: &Machine) -> Result<Outcome> {
-    let plan = session.forwards.plan(args.wanted, args.local)?;
-    let endpoint = endpoint(&plan, args.transport, args.browser, machine)?;
-    let ssh = argv(&session.host, &endpoint, &plan.target);
-    let starting = StartingForward::start(ports.exec, &ssh, endpoint)?;
-    let listening = starting.wait_listening(machine.net, machine.clock)?;
-    announce(&listening, &plan, (args.ttl, args.browser), ports)?;
-    let until = Deadline::after(machine.clock.now(), args.ttl.duration());
-    let code = match listening.hold(until, machine.clock)? {
+    let plan = session
+        .forwards
+        .plan(args.wanted, args.local, args.transport, args.browser)?;
+    let endpoint = endpoint(&plan, machine)?;
+    let served = serve(session, &plan, &endpoint, args.ttl, (ports, machine));
+    // ssh is reaped by now however `served` ended. The path was free before ssh started (a taken
+    // one is refused above), so a file there is ssh's: a SIGKILLed ssh leaves it behind and the
+    // next `rr fwd` of this name would be refused. (Two `rr fwd` of the same name at once is not
+    // supported: the one that fails to bind would remove the other's socket.)
+    if let Endpoint::Unix(path) = &endpoint
+        && let Err(err) = machine.net.remove_socket(path)
+    {
+        ports.notes.note(&format!("rr: {err:#}"));
+    }
+    served
+}
+
+fn serve(
+    session: &Session,
+    plan: &Plan,
+    endpoint: &Endpoint,
+    ttl: Ttl,
+    (ports, machine): (&Ports, &Machine),
+) -> Result<Outcome> {
+    let starting =
+        StartingForward::start(ports.exec, &session.host, &plan.target, endpoint.clone())?;
+    let listening = match starting.wait_listening(machine.net, ports.clock)? {
+        Started::Listening(listening) => listening,
+        Started::Interrupted => return closed(End::Interrupted, ports),
+    };
+    announce(&listening, plan, ttl, ports);
+    let until = Deadline::after(ports.clock.now(), ttl.duration());
+    closed(listening.hold(until, ports.clock)?, ports)
+}
+
+/// What the forward's end means for the exit code. ssh ending by itself with 0 is a lost forward,
+/// not a success: nothing asked it to stop.
+fn closed(end: End, ports: &Ports) -> Result<Outcome> {
+    let code = match end {
         End::Expired => {
             ports.notes.note("rr: time to live reached, forward closed");
             0
         }
-        End::Ssh(code) => {
+        End::Interrupted => {
+            ports.notes.note("rr: interrupted, forward closed");
+            INTERRUPTED_EXIT
+        }
+        End::Exited(0) => bail!("ssh ended by itself before the time to live: the forward is gone"),
+        End::Exited(code) => {
             ports
                 .notes
                 .note(&format!("rr: ssh ended ({code}), forward closed"));
@@ -52,16 +91,10 @@ pub fn run(session: &Session, args: Args, ports: &Ports, machine: &Machine) -> R
 }
 
 /// The local end to listen on, checked free before ssh is started.
-fn endpoint(
-    plan: &Plan,
-    transport: Transport,
-    browser: Browser,
-    machine: &Machine,
-) -> Result<Endpoint> {
-    match (transport, browser) {
-        (Transport::Tcp, _) => machine.net.free_port(plan.local).map(Endpoint::Tcp),
-        (Transport::Socket, Browser::Open) => bail!("--open needs a TCP forward; drop --socket"),
-        (Transport::Socket, Browser::Leave) => {
+fn endpoint(plan: &Plan, machine: &Machine) -> Result<Endpoint> {
+    match plan.listener {
+        Listener::Tcp { local, .. } => machine.net.free_port(local).map(Endpoint::Tcp),
+        Listener::Socket => {
             let dir = machine
                 .runtime_dir
                 .context("--socket needs a private directory: set XDG_RUNTIME_DIR")?;
@@ -74,19 +107,21 @@ fn endpoint(
 
 /// Tell the user where the forward is, and open the browser if asked. Everything printed is built
 /// from validated values, so none of it needs `sanitize`.
-fn announce(
-    listening: &ListeningForward,
-    plan: &Plan,
-    (ttl, browser): (Ttl, Browser),
-    ports: &Ports,
-) -> Result<()> {
+fn announce(listening: &ListeningForward, plan: &Plan, ttl: Ttl, ports: &Ports) {
     let target = &plan.target;
     match listening.endpoint() {
         Endpoint::Tcp(port) => {
-            let url = OpenUrl::of_forward(*port)?;
-            ports.notes.note(&format!("rr: {} -> {target} (closes in {ttl})", url.as_str()));
-            if browser == Browser::Open && !matches!(ports.exec.stream(&url.opener()), Ok(0)) {
-                ports.notes.note("rr: could not open a browser; open the URL yourself");
+            let url = OpenUrl::of_forward(*port);
+            ports
+                .notes
+                .note(&format!("rr: {} -> {target} (closes in {ttl})", url.as_str()));
+            // launched and left: waiting for the browser would hide the ttl and an ssh exit
+            if plan.browser() == Browser::Open
+                && let Err(err) = ports.exec.launch(&url.opener())
+            {
+                ports.notes.note(&format!(
+                    "rr: could not open a browser ({err:#}); open the URL yourself"
+                ));
             }
         }
         Endpoint::Unix(path) => ports.notes.note(&format!(
@@ -95,7 +130,6 @@ fn announce(
             path.as_str()
         )),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -105,28 +139,33 @@ mod tests {
     use crate::domain::exit::Exit;
     use crate::domain::fwd::{ForwardName, ForwardSpec, ForwardTarget};
     use crate::domain::outcome::{Format, render};
-    use crate::ports::Child;
-    use crate::ports::fake::{FakeChild, FakeClock, FakeExec, FakeNet, How, KILLED_EXIT};
+    use crate::ports::Ended;
+    use crate::ports::fake::{FakeChild, FakeExec, FakeNet, How};
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::Duration;
 
+    const RUNTIME: &str = "/run/user/1";
+    const SOCKET: &str = "/run/user/1/rr-5000.sock";
+
     struct World {
         fakes: Fakes,
         net: FakeNet,
-        clock: FakeClock,
         killed: Rc<Cell<u32>>,
     }
 
     /// A world whose ssh child answers `waits`, and whose port answers `accepts`.
     fn world(waits: Vec<Option<i32>>, accepts: Vec<bool>) -> World {
         let (child, killed) = FakeChild::new(waits);
+        world_of(child, killed, accepts)
+    }
+
+    fn world_of(child: FakeChild, killed: Rc<Cell<u32>>, accepts: Vec<bool>) -> World {
         let mut fakes = Fakes::remote_streaming(vec![]);
-        fakes.exec = FakeExec::new(vec![], vec![0]).with_children(vec![child]);
+        fakes.exec = FakeExec::new(vec![], vec![]).with_children(vec![child]);
         World {
             fakes,
             net: FakeNet::new(Some(5051), accepts),
-            clock: FakeClock::default(),
             killed,
         }
     }
@@ -141,10 +180,16 @@ mod tests {
         }
     }
 
+    fn socket_args() -> Args {
+        Args {
+            transport: Transport::Socket,
+            ..args("n:5000")
+        }
+    }
+
     fn go(world: &World, session: &Session, args: Args, runtime: Option<&str>) -> Result<Outcome> {
         let machine = Machine {
             net: &world.net,
-            clock: &world.clock,
             runtime_dir: runtime,
         };
         run(session, args, &world.fakes.ports(), &machine)
@@ -159,7 +204,11 @@ mod tests {
     }
 
     fn slept(world: &World) -> Duration {
-        world.clock.slept.borrow().iter().sum()
+        world.fakes.clock.slept.borrow().iter().sum()
+    }
+
+    fn removed(world: &World) -> Vec<String> {
+        world.net.removed.borrow().clone()
     }
 
     #[test]
@@ -196,7 +245,10 @@ mod tests {
             ]
         );
         assert_eq!(w.killed.get(), 1, "the ttl kills ssh");
-        assert!(slept(&w) >= Duration::from_secs(30 * 60));
+        // the ttl counts from the announcement, not from the start: the two polls and the settle
+        // before it (under a second) are the only slack
+        let ttl = Duration::from_secs(30 * 60);
+        assert!(slept(&w) >= ttl && slept(&w) < ttl + Duration::from_secs(2));
         assert_eq!(exit(&outcome), Exit::Success);
     }
 
@@ -220,6 +272,28 @@ mod tests {
         assert_eq!(w.killed.get(), 0);
         let last = notes(&w).pop().unwrap();
         assert_eq!(last, "rr: ssh ended (255), forward closed");
+    }
+
+    #[test]
+    fn an_ssh_that_ends_by_itself_with_zero_is_a_lost_forward() {
+        let w = world(vec![None, None, None, Some(0)], vec![true]);
+        let err = go(&w, &session(), args("n:1"), None).unwrap_err();
+        assert!(err.to_string().contains("the forward is gone"), "{err}");
+    }
+
+    #[test]
+    fn an_interrupt_closes_the_forward_with_130_not_an_ssh_code() {
+        let (child, killed) = FakeChild::scripted(vec![None, None, None, Some(Ended::Interrupted)]);
+        let w = world_of(child, killed, vec![true]);
+        let outcome = go(&w, &session(), args("n:1"), None).unwrap();
+        assert_eq!(exit(&outcome), Exit::remote(130));
+        assert_eq!(notes(&w).pop().unwrap(), "rr: interrupted, forward closed");
+        // an interrupt before the forward listens is an interrupt too, and prints no URL
+        let (child, killed) = FakeChild::scripted(vec![Some(Ended::Interrupted)]);
+        let w = world_of(child, killed, vec![false]);
+        let outcome = go(&w, &session(), args("n:1"), None).unwrap();
+        assert_eq!(exit(&outcome), Exit::remote(130));
+        assert_eq!(notes(&w), ["rr: interrupted, forward closed"]);
     }
 
     #[test]
@@ -250,6 +324,16 @@ mod tests {
         assert!(err.to_string().contains("did not open"), "{err}");
         assert_eq!(w.killed.get(), 1, "a failed start leaves no ssh behind");
         assert!(notes(&w).is_empty());
+    }
+
+    #[test]
+    fn a_kill_that_fails_after_a_failed_start_is_part_of_the_error() {
+        let (child, killed) = FakeChild::new(vec![None]);
+        let w = world_of(child.with_failing_kill(), killed, vec![false]);
+        let err = go(&w, &session(), args("n:1"), None).unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("did not open"), "{shown}");
+        assert!(shown.contains("could not be stopped"), "{shown}");
     }
 
     fn with_forward(local: Option<u16>) -> Session {
@@ -285,32 +369,67 @@ mod tests {
     }
 
     #[test]
-    fn a_socket_forward_listens_in_the_runtime_directory_and_never_over_a_stale_file() {
-        let socket = || Args {
-            transport: Transport::Socket,
-            ..args("n:5000")
-        };
+    fn a_socket_forward_listens_in_the_runtime_directory() {
         let w = world(vec![None], vec![true]);
-        go(&w, &session(), socket(), Some("/run/user/1")).unwrap();
-        let spec = "/run/user/1/rr-5000.sock:n:5000".to_string();
+        go(&w, &session(), socket_args(), Some(RUNTIME)).unwrap();
+        let spec = format!("{SOCKET}:n:5000");
         assert!(w.fakes.exec.words()[0].contains(&spec));
-        assert!(notes(&w)[0].starts_with("rr: socket /run/user/1/rr-5000.sock -> n:5000"));
-
-        let mut w = world(vec![None], vec![true]);
-        w.net.socket_taken = true;
-        assert!(go(&w, &session(), socket(), Some("/run/user/1")).is_err());
-        let err = go(&w, &session(), socket(), None).unwrap_err();
-        assert!(err.to_string().contains("XDG_RUNTIME_DIR"), "{err}");
-        let browser = Args {
-            browser: Browser::Open,
-            ..socket()
-        };
-        assert!(go(&w, &session(), browser, Some("/run/user/1")).is_err());
-        assert!(w.fakes.exec.calls.borrow().is_empty(), "nothing started");
+        assert!(notes(&w)[0].starts_with(&format!("rr: socket {SOCKET} -> n:5000")));
     }
 
     #[test]
-    fn open_launches_the_browser_with_the_url_as_one_argument() {
+    fn a_socket_forward_that_cannot_start_starts_nothing_and_removes_nothing() {
+        let mut w = world(vec![None], vec![true]);
+        w.net.socket_taken = true;
+        assert!(go(&w, &session(), socket_args(), Some(RUNTIME)).is_err());
+        let err = go(&w, &session(), socket_args(), None).unwrap_err();
+        assert!(err.to_string().contains("XDG_RUNTIME_DIR"), "{err}");
+        let browser = Args {
+            browser: Browser::Open,
+            ..socket_args()
+        };
+        assert!(go(&w, &session(), browser, Some(RUNTIME)).is_err());
+        let configured = Args {
+            transport: Transport::Socket,
+            ..args("mlflow")
+        };
+        assert!(go(&w, &with_forward(Some(6000)), configured, Some(RUNTIME)).is_err());
+        assert!(w.fakes.exec.calls.borrow().is_empty(), "nothing started");
+        assert!(
+            removed(&w).is_empty(),
+            "a file that was there before is not ours"
+        );
+    }
+
+    /// ssh is gone however the forward ends, and then its socket file is too: a SIGKILLed ssh
+    /// cannot unlink it, and the next `rr fwd` of the name would be refused.
+    #[test]
+    fn the_socket_file_is_removed_when_the_forward_ends_however_it_ends() {
+        let ended = |waits: Vec<Option<i32>>, accepts: Vec<bool>| {
+            let w = world(waits, accepts);
+            let _ = go(&w, &session(), socket_args(), Some(RUNTIME));
+            removed(&w)
+        };
+        let path = vec![SOCKET.to_string()];
+        assert_eq!(ended(vec![None], vec![true]), path, "time to live reached");
+        assert_eq!(ended(vec![None, Some(255)], vec![true]), path, "ssh ended");
+        assert_eq!(ended(vec![None], vec![false]), path, "ssh never listened");
+        assert_eq!(
+            ended(vec![Some(255)], vec![false]),
+            path,
+            "ssh failed to start"
+        );
+    }
+
+    #[test]
+    fn a_tcp_forward_removes_no_file() {
+        let w = world(vec![None], vec![true]);
+        go(&w, &session(), args("n:1"), None).unwrap();
+        assert!(removed(&w).is_empty());
+    }
+
+    #[test]
+    fn open_launches_the_browser_detached_with_the_url_as_one_argument() {
         let open = || Args {
             browser: Browser::Open,
             ..args("n:1")
@@ -318,20 +437,19 @@ mod tests {
         let w = world(vec![None], vec![true]);
         go(&w, &session(), open(), None).unwrap();
         let calls = w.fakes.exec.calls.borrow();
-        assert_eq!(calls[1].1, How::Stream);
+        assert_eq!(calls[1].1, How::Launch);
         assert_eq!(calls[1].0.args(), ["http://127.0.0.1:5051/"]);
         drop(calls);
         let mut w = world(vec![None], vec![true]);
         let (child, _) = FakeChild::new(vec![None]);
-        w.fakes.exec = FakeExec::new(vec![], vec![1]).with_children(vec![child]);
+        w.fakes.exec = FakeExec::new(vec![], vec![])
+            .with_children(vec![child])
+            .with_failing_launch();
         go(&w, &session(), open(), None).unwrap();
-        assert!(notes(&w).iter().any(|n| n.contains("could not open")));
-    }
-
-    #[test]
-    fn a_killed_fake_child_reads_as_ended() {
-        let (mut child, _) = FakeChild::new(vec![None]);
-        child.kill().unwrap();
-        assert_eq!(child.try_wait().unwrap(), Some(KILLED_EXIT));
+        let note = &notes(&w)[1];
+        assert!(
+            note.starts_with("rr: could not open a browser (could not start"),
+            "{note}"
+        );
     }
 }

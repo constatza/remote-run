@@ -262,14 +262,14 @@ pub struct FwdArgs {
     /// local port (default: a free one)
     #[arg(long, value_parser = LoopbackPort::parse)]
     pub local: Option<LoopbackPort>,
-    /// listen on a Unix socket in $XDG_RUNTIME_DIR that only you can open, not on TCP
-    #[arg(long = "socket", num_args = 0, default_value = "tcp", default_missing_value = "socket", value_parser = parse_transport, conflicts_with = "local")]
+    /// listen on a Unix socket in $XDG_RUNTIME_DIR (private to you), not on TCP
+    #[arg(long = "socket", num_args = 0, default_value = "tcp", default_missing_value = "socket", value_parser = parse_transport, conflicts_with_all = ["local", "browser"])]
     pub transport: Transport,
     /// open the URL in your browser once it works
     #[arg(long = "open", num_args = 0, default_value = "leave", default_missing_value = "open", value_parser = parse_browser)]
     pub browser: Browser,
     /// close the forward after this long (90s, 30m, 8h, up to 7d)
-    #[arg(long, default_value = "8h", value_parser = Ttl::parse)]
+    #[arg(long, default_value_t = Ttl::DEFAULT, value_parser = Ttl::parse)]
     pub ttl: Ttl,
 }
 
@@ -516,6 +516,7 @@ mod tests {
             &["fwd", "h:1", "--ttl", "0s"],
             &["fwd", "h:1", "--ttl", "9d"],
             &["fwd", "h:1", "--socket", "--local", "5051"],
+            &["fwd", "h:1", "--socket", "--open"],
             &["fwd", "h:1", "--open=yes"],
             &["fwd"],
         ] {

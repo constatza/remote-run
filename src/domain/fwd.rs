@@ -10,7 +10,6 @@ use core::time::Duration;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU16;
-use url::Url;
 
 /// The one address a forward listens on. A wildcard bind would put an unauthenticated service on
 /// the network, so the argv builder spells it out and nothing can change it.
@@ -174,36 +173,76 @@ impl FromIterator<(ForwardName, ForwardSpec)> for ForwardTable {
     }
 }
 
+/// The local end one `rr fwd` listens on. A Unix socket has no port to choose and no browser to
+/// open, so those cannot be combined with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listener {
+    /// A TCP port on loopback: `local` when insisted on, else a free one.
+    Tcp {
+        local: Option<LoopbackPort>,
+        browser: Browser,
+    },
+    /// A Unix socket in the runtime directory.
+    Socket,
+}
+
 /// What one `rr fwd` will forward, once the table has been consulted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     /// Names the socket file. A forward given as `host:port` is named by its remote port.
     pub name: ForwardName,
     pub target: ForwardTarget,
-    pub local: Option<LoopbackPort>,
+    pub listener: Listener,
+}
+
+impl Plan {
+    /// Whether to open the browser once the forward listens: only a TCP forward has a URL.
+    pub fn browser(&self) -> Browser {
+        match self.listener {
+            Listener::Tcp { browser, .. } => browser,
+            Listener::Socket => Browser::Leave,
+        }
+    }
 }
 
 impl ForwardTable {
-    /// The plan for `wanted`; `local` from the command line wins over the table's.
-    pub fn plan(&self, wanted: Wanted, local: Option<LoopbackPort>) -> Result<Plan> {
-        match wanted {
-            Wanted::Target(target) => Ok(Plan {
-                name: ForwardName::parse(&target.port.to_string())?,
-                target,
-                local,
-            }),
+    /// The plan for `wanted`; `local` from the command line wins over the table's. A socket takes
+    /// neither a local port (from the command line or the table) nor `--open`.
+    pub fn plan(
+        &self,
+        wanted: Wanted,
+        local: Option<LoopbackPort>,
+        transport: Transport,
+        browser: Browser,
+    ) -> Result<Plan> {
+        let (name, target, configured) = match wanted {
+            Wanted::Target(target) => (ForwardName::parse(&target.port.to_string())?, target, None),
             Wanted::Named(name) => {
                 let Some(spec) = self.0.get(&name) else {
                     let known: Vec<&str> = self.0.keys().map(ForwardName::as_str).collect();
                     bail!("no forward named {name} in the config (configured: {known:?})");
                 };
-                Ok(Plan {
-                    target: spec.target.clone(),
-                    local: local.or(spec.local),
-                    name,
-                })
+                (name, spec.target.clone(), spec.local)
             }
-        }
+        };
+        let local = local.or(configured);
+        let listener = match (transport, local, browser) {
+            (Transport::Tcp, local, browser) => Listener::Tcp { local, browser },
+            (Transport::Socket, None, Browser::Leave) => Listener::Socket,
+            (Transport::Socket, Some(_), _) => {
+                bail!(
+                    "--socket has no TCP port: drop --local, or the local port of {name} in the config"
+                )
+            }
+            (Transport::Socket, None, Browser::Open) => {
+                bail!("--open needs a TCP forward; drop --socket")
+            }
+        };
+        Ok(Plan {
+            name,
+            target,
+            listener,
+        })
     }
 }
 
@@ -212,7 +251,7 @@ impl ForwardTable {
 pub enum Transport {
     /// A TCP port on loopback: what a browser can use.
     Tcp,
-    /// A Unix socket only the user can open: for command-line clients.
+    /// A Unix socket in the private runtime directory: for command-line clients.
     Socket,
 }
 
@@ -233,14 +272,14 @@ impl Ttl {
     /// `90s`, `30m`, `8h` or `2d`.
     pub fn parse(text: &str) -> Result<Self> {
         let bad = || format!("not a time to live: {text:?} (use 90s, 30m, 8h or 2d, at most 7d)");
-        let (digits, unit) = text.split_at(text.len().saturating_sub(1));
-        let seconds: u64 = match unit {
-            "s" => 1,
-            "m" => 60,
-            "h" => 3600,
-            "d" => 86_400,
-            _ => bail!(bad()),
-        };
+        let (digits, seconds) = [("s", 1_u64), ("m", 60), ("h", 3600), ("d", 86_400)]
+            .into_iter()
+            .find_map(|(unit, seconds)| Some((text.strip_suffix(unit)?, seconds)))
+            .with_context(bad)?;
+        // digits only: `u64::from_str` would also take a leading `+`
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            bail!(bad());
+        }
         let count: u64 = digits.parse().with_context(bad)?;
         let ttl = Duration::from_secs(count.saturating_mul(seconds));
         if ttl.is_zero() || ttl > MAX_TTL {
@@ -272,7 +311,8 @@ impl fmt::Display for Ttl {
 pub struct SocketPath(String);
 
 impl SocketPath {
-    /// `rr-<name>.sock` in `dir`, which should be a private directory (the runtime directory).
+    /// `rr-<name>.sock` in `dir`. The socket is private only if `dir` is: `rr` relies on `dir` being
+    /// the runtime directory (`XDG_RUNTIME_DIR`, which the system makes private) and does not check.
     pub fn new(dir: &str, name: &ForwardName) -> Result<Self> {
         let path = format!("{}/rr-{}.sock", dir.trim_end_matches('/'), name.as_str());
         let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-');
@@ -297,7 +337,7 @@ impl SocketPath {
 pub enum Endpoint {
     /// `127.0.0.1:<port>`: what a browser can use.
     Tcp(LoopbackPort),
-    /// A Unix socket, readable only by its owner: for command-line clients.
+    /// A Unix socket, in the private runtime directory: for command-line clients.
     Unix(SocketPath),
 }
 
@@ -326,37 +366,21 @@ pub fn argv(host: &Host, endpoint: &Endpoint, target: &ForwardTarget) -> Argv {
     Argv::new("ssh", args)
 }
 
-/// A URL that `--open` may hand to a browser: `http`, on the loopback host, at the forward's own
-/// port, without user information. A prefix test would pass `http://127.0.0.1:5051@evil.example/`,
-/// so the text is parsed and its parts compared.
+/// The URL `--open` hands to a browser: `http`, on the loopback host, at the forward's own port,
+/// without user information. It can only be made from a [`LoopbackPort`], so those parts hold by
+/// construction and no text is parsed: no input path reaches a URL, so a parser has nothing to
+/// check. A user-supplied URL would need one back, with its scheme, host, port and login compared.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenUrl(Url);
+pub struct OpenUrl(String);
 
 impl OpenUrl {
-    pub fn parse(text: &str, port: LoopbackPort) -> Result<Self> {
-        let url = Url::parse(text).with_context(|| format!("not a URL: {text:?}"))?;
-        let host_ok = matches!(
-            url.host(),
-            Some(url::Host::Ipv4(ip)) if ip.is_loopback()
-        ) || matches!(url.host(), Some(url::Host::Domain("localhost")));
-        let ok = url.scheme() == "http"
-            && host_ok
-            && url.port() == Some(port.get())
-            && url.username().is_empty()
-            && url.password().is_none();
-        if !ok {
-            bail!("refusing to open {text:?}: not http on localhost port {port} without a login");
-        }
-        Ok(Self(url))
-    }
-
     /// The URL of the service behind a TCP forward at `port`.
-    pub fn of_forward(port: LoopbackPort) -> Result<Self> {
-        Self::parse(&format!("http://{LOOPBACK}:{port}/"), port)
+    pub fn of_forward(port: LoopbackPort) -> Self {
+        Self(format!("http://{LOOPBACK}:{port}/"))
     }
 
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.0
     }
 
     /// The program that opens it in the user's browser; the URL is one argument, never shell text.
@@ -468,7 +492,11 @@ mod tests {
             "8H",
             "8d1h",
             "8d ",
+            "+5m",
             "8d",
+            "8é",
+            "é",
+            "8\u{661}h",
             "169h",
             "99999999999999999999h",
         ] {
@@ -498,6 +526,19 @@ mod tests {
         }
         let long = format!("/{}", "d".repeat(100));
         assert!(SocketPath::new(&long, &name).is_err());
+    }
+
+    /// `sun_path` is 108 bytes with its NUL: 107 bind, 108 do not.
+    #[test]
+    fn a_socket_path_of_107_bytes_is_the_longest() {
+        let name = ForwardName::parse("m").unwrap();
+        // "/rr-m.sock" is 10 bytes
+        let dir = |len: usize| format!("/{}", "d".repeat(len - 1));
+        assert_eq!(
+            SocketPath::new(&dir(97), &name).unwrap().as_str().len(),
+            107
+        );
+        assert!(SocketPath::new(&dir(98), &name).is_err());
     }
 
     fn argv_of(endpoint: &Endpoint) -> Vec<String> {
@@ -539,40 +580,67 @@ mod tests {
     }
 
     #[test]
-    fn only_a_plain_http_loopback_url_at_the_forwards_port_may_be_opened() {
-        let p = port(5051);
-        for text in [
-            "http://127.0.0.1:5051/",
-            "http://localhost:5051/x?y=1",
-            "http://127.0.0.2:5051/",
-        ] {
-            assert!(OpenUrl::parse(text, p).is_ok(), "{text}");
-        }
-        for text in [
-            "http://127.0.0.1:5051@evil.example/",
-            "http://user:pw@127.0.0.1:5051/",
-            "http://user@127.0.0.1:5051/",
-            "https://127.0.0.1:5051/",
-            "file:///etc/passwd",
-            "javascript:alert(1)",
-            "http://127.0.0.1:5052/",
-            "http://127.0.0.1/",
-            "http://127.0.0.1:80/",
-            "http://evil.example:5051/",
-            "http://127.0.0.1.evil.example:5051/",
-            "http://localhost.evil.example:5051/",
-            "http://[::1]:5051/",
-            "http://0.0.0.0:5051/",
-            "-x",
-            "",
-        ] {
-            assert!(OpenUrl::parse(text, p).is_err(), "{text}");
+    fn the_url_is_plain_http_on_loopback_at_the_forwards_port() {
+        assert_eq!(
+            OpenUrl::of_forward(port(5051)).as_str(),
+            "http://127.0.0.1:5051/"
+        );
+        assert_eq!(OpenUrl::of_forward(port(1)).as_str(), "http://127.0.0.1:1/");
+    }
+
+    fn table(local: Option<u16>) -> ForwardTable {
+        let spec = ForwardSpec {
+            target: ForwardTarget::parse("gpu-01:5000").unwrap(),
+            local: local.map(port),
+        };
+        [(ForwardName::parse("mlflow").unwrap(), spec)]
+            .into_iter()
+            .collect()
+    }
+
+    fn plan_of(
+        table: &ForwardTable,
+        (wanted, local): (&str, Option<u16>),
+        (transport, browser): (Transport, Browser),
+    ) -> Result<Plan> {
+        table.plan(
+            Wanted::parse(wanted).unwrap(),
+            local.map(port),
+            transport,
+            browser,
+        )
+    }
+
+    #[test]
+    fn a_socket_has_no_port_and_no_browser() {
+        let tcp = (Transport::Tcp, Browser::Open);
+        let socket = (Transport::Socket, Browser::Leave);
+        let t = table(None);
+        let plan = plan_of(&t, ("mlflow", Some(7000)), tcp).unwrap();
+        let (local, browser) = (Some(port(7000)), Browser::Open);
+        assert_eq!(plan.listener, Listener::Tcp { local, browser });
+        assert_eq!(
+            plan_of(&t, ("mlflow", None), socket).unwrap().listener,
+            Listener::Socket
+        );
+        assert_eq!(
+            plan_of(&t, ("h:1", None), socket).unwrap().name.as_str(),
+            "1"
+        );
+        let refused = [
+            plan_of(&t, ("mlflow", Some(7000)), socket),
+            plan_of(&t, ("mlflow", None), (Transport::Socket, Browser::Open)),
+            // a local port in the config is a port too
+            plan_of(&table(Some(6000)), ("mlflow", None), socket),
+        ];
+        for result in refused {
+            assert!(result.is_err());
         }
     }
 
     #[test]
     fn the_opener_gets_the_url_as_one_argument() {
-        let url = OpenUrl::of_forward(port(5051)).unwrap();
+        let url = OpenUrl::of_forward(port(5051));
         let opener = url.opener();
         assert_eq!(opener.args(), ["http://127.0.0.1:5051/"]);
         assert!(["xdg-open", "open", "explorer"].contains(&opener.program()));

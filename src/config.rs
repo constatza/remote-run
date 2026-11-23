@@ -277,7 +277,7 @@ pub fn load(
 #[allow(clippy::disallowed_methods)] // tests build real files
 mod tests {
     use super::*;
-    use crate::domain::fwd::Wanted;
+    use crate::domain::fwd::{Browser, Listener, Transport, Wanted};
     use std::fs;
 
     fn settings(host: Option<&str>, dir: Option<&str>, env: Option<&str>) -> Settings {
@@ -356,22 +356,33 @@ mod tests {
     fn forwards_are_validated_when_resolved_and_merge_by_name() {
         let ok = forwards("[forward.mlflow]\ntarget = \"gpu-01:5000\"\nlocal = 5051\n");
         let table = resolve(ok.clone()).unwrap().forwards;
-        let plan = table.plan(Wanted::parse("mlflow").unwrap(), None).unwrap();
+        let wanted = Wanted::parse("mlflow").unwrap();
+        let plan = table
+            .plan(wanted, None, Transport::Tcp, Browser::Leave)
+            .unwrap();
         assert_eq!(plan.target.to_string(), "gpu-01:5000");
-        assert_eq!(plan.local.map(LoopbackPort::get), Some(5051));
+        let local = LoopbackPort::from_u16(5051).ok();
+        assert_eq!(
+            plan.listener,
+            Listener::Tcp {
+                local,
+                browser: Browser::Leave
+            }
+        );
+        // each of these is well-formed TOML that only `resolve` can refuse
         for bad in [
             "[forward.mlflow]\ntarget = \"-oProxyCommand=x:1\"\n",
             "[forward.mlflow]\ntarget = \"host\"\n",
             "[forward.mlflow]\ntarget = \"h:1\"\nlocal = 0\n",
             "[forward.\"../x\"]\ntarget = \"h:1\"\n",
-            "[forward.a]\ntarget = \"h:1\"\nbind = \"0.0.0.0\"\n",
         ] {
             let parsed: Result<Settings, _> = toml::from_str(&format!("host = \"h\"\n{bad}"));
-            assert!(
-                parsed.map_or(true, |settings| resolve(settings).is_err()),
-                "{bad}"
-            );
+            assert!(parsed.is_ok(), "{bad} must reach resolve");
+            assert!(resolve(parsed.unwrap()).is_err(), "{bad}");
         }
+        // a bind address has no field, so the file does not even parse
+        let bind = "host = \"h\"\n[forward.a]\ntarget = \"h:1\"\nbind = \"0.0.0.0\"\n";
+        assert!(toml::from_str::<Settings>(bind).is_err());
         let project = forwards("[forward.mlflow]\ntarget = \"other:1\"\n");
         let merged = project.over(ok);
         assert_eq!(merged.forward["mlflow"].target, "other:1");
@@ -395,6 +406,35 @@ mod tests {
         let store = trusting(root.path());
         let both = load(root.path(), Some(&user), || Ok(store)).unwrap();
         assert_eq!(both.forward.len(), 2);
+    }
+
+    /// Forwards merge by name, so an unreviewed project file must not get to replace the user's own
+    /// `mlflow`: it is refused before its text is parsed (a syntax error in it is never reported).
+    #[test]
+    fn an_untrusted_project_forward_never_replaces_the_users_and_is_not_parsed() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("user.toml");
+        fs::write(
+            &user,
+            "host = \"h\"\n[forward.mlflow]\ntarget = \"mine:1\"\n",
+        )
+        .unwrap();
+        for text in [
+            "[forward.mlflow]\ntarget = \"evil:1\"\n",
+            "[forward.mlflow\ntarget = evil:1 \"\n",
+        ] {
+            fs::write(root.path().join(PROJECT_FILE), text).unwrap();
+            let err = load(root.path(), Some(&user), || Ok(TrustStore::default())).unwrap_err();
+            let shown = format!("{err:#}");
+            assert!(shown.contains("not trusted"), "{shown}");
+            assert!(
+                !shown.contains("evil") && !shown.contains("TOML"),
+                "{shown}"
+            );
+        }
+        fs::remove_file(root.path().join(PROJECT_FILE)).unwrap();
+        let loaded = load(root.path(), Some(&user), || Ok(TrustStore::default())).unwrap();
+        assert_eq!(loaded.forward["mlflow"].target, "mine:1");
     }
 
     #[test]

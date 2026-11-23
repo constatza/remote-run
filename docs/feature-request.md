@@ -87,7 +87,7 @@ open   = "http://127.0.0.1:{port}/"  # optional URL for --open
 - Runs `ssh -N -o ExitOnForwardFailure=yes -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L 127.0.0.1:<port>:<remote> <host>` in the foreground. `ControlMaster=no` and `ControlPath=none` stop an existing ControlPersist master from adopting the forward and outliving the command.
 - Waits until the local port accepts a connection, prints the URL, runs `xdg-open` (or the platform equivalent) with `--open`, then blocks until Ctrl-C, ssh exit or `--idle`.
 - Binds `127.0.0.1` only. Never a wildcard address.
-- No pid file: the foreground process is the state, so nothing stale remains. An optional idle timeout can wait for a later version; shortcut: no idle timeout in the first version, add it when a forgotten tunnel causes trouble.
+- No pid file: the foreground process is the state, so nothing stale remains.
 
 ### Size and tests
 
