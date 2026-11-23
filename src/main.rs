@@ -20,6 +20,7 @@ use remote_run::domain::outcome::{
 use remote_run::domain::slurm::JobSet;
 use remote_run::ports::{Echo, Notes};
 use remote_run::trust;
+use std::cell::RefCell;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -29,12 +30,14 @@ fn main() -> ExitCode {
         Err(err) => return usage_error(err),
     };
     let format = cli.format;
-    let rendered = match environment().and_then(|env| run(cli, &env)) {
+    let notes = NoteWriter::new(io::stderr());
+    let rendered = match environment().and_then(|env| run(cli, &env, &notes)) {
         Ok(outcome) => render(&outcome, format),
         Err(err) => render_error(&err, format),
     };
     emit(
         &rendered,
+        notes.take_failure(),
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     )
@@ -52,6 +55,7 @@ fn usage_error(err: clap::Error) -> ExitCode {
     let rendered = render_error_as(&message, format, RrCode::Usage);
     emit(
         &rendered,
+        None,
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     )
@@ -61,21 +65,27 @@ fn usage_error(err: clap::Error) -> ExitCode {
 /// reader says it has enough, not a failure to report, and `print!` would panic on it. Both
 /// streams are always attempted: a closed stdout must not hide the notes on stderr. Any other
 /// write error is told on stderr whatever the exit code, and turns a success into a failure: the
-/// result was not delivered.
-fn emit(rendered: &Rendered, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+/// result was not delivered. `lost_note` is a failure of the notes written while the command ran
+/// (a forward's URL, a warning about a socket left in place): it is told the same way.
+fn emit(
+    rendered: &Rendered,
+    lost_note: Option<io::Error>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let wrote = [
         write_all(out, &rendered.stdout),
         write_all(err, &rendered.stderr),
     ];
-    let failure = wrote
+    let failure = lost_note
         .into_iter()
-        .filter_map(Result::err)
+        .chain(wrote.into_iter().filter_map(Result::err))
         .find(|failure| failure.kind() != io::ErrorKind::BrokenPipe);
     let Some(failure) = failure else {
         return ExitCode::from(rendered.exit.code());
     };
     // stderr may be what failed; there is nowhere left to say so then
-    let _ = writeln!(err, "rr: could not write the result: {failure}");
+    let _ = writeln!(err, "rr: could not write output: {failure}");
     match rendered.exit {
         Exit::Success => ExitCode::from(RrCode::Failure.code()),
         other => ExitCode::from(other.code()),
@@ -87,13 +97,37 @@ fn write_all(sink: &mut dyn Write, text: &str) -> io::Result<()> {
     sink.flush()
 }
 
-/// Prints each note at once, so it precedes the output of a command that runs after it.
-struct StderrNotes;
+/// Writes each note at once, so it precedes the output of a command that runs after it. A closed
+/// pipe (`2>&1 | head`) is how a reader says it has enough, and `eprintln!` would panic on it, so
+/// it is ignored; any other failure is kept for [`emit`], because a lost `rr fwd` URL or "ssh may
+/// still be running" warning must not pass unnoticed.
+struct NoteWriter<W: Write> {
+    sink: RefCell<W>,
+    failure: RefCell<Option<io::Error>>,
+}
 
-impl Notes for StderrNotes {
+impl<W: Write> NoteWriter<W> {
+    fn new(sink: W) -> Self {
+        Self {
+            sink: RefCell::new(sink),
+            failure: RefCell::new(None),
+        }
+    }
+
+    /// The first failure that was not a closed pipe.
+    fn take_failure(&self) -> Option<io::Error> {
+        self.failure.take()
+    }
+}
+
+impl<W: Write> Notes for NoteWriter<W> {
     fn note(&self, line: &str) {
-        // `eprintln!` panics when stderr is closed (`2>&1 | head`); a lost note is not worth that
-        let _ = writeln!(io::stderr().lock(), "{line}");
+        let wrote = writeln!(self.sink.borrow_mut(), "{line}");
+        if let Err(err) = wrote
+            && err.kind() != io::ErrorKind::BrokenPipe
+        {
+            self.failure.borrow_mut().get_or_insert(err);
+        }
     }
 }
 
@@ -133,7 +167,7 @@ fn refuse_json_for(command: &RemoteCmd, format: Format) -> Result<()> {
     }
 }
 
-fn run(cli: Cli, env: &Environment) -> Result<Outcome> {
+fn run(cli: Cli, env: &Environment, notes: &dyn Notes) -> Result<Outcome> {
     let (format, echo) = (cli.format, cli.echo());
     let command = match cli.command {
         Cmd::Trust { action } => return app::trust::run(env, action),
@@ -153,7 +187,7 @@ fn run(cli: Cli, env: &Environment) -> Result<Outcome> {
     let ports = Ports {
         exec: &exec,
         remote: &ssh,
-        notes: &StderrNotes,
+        notes,
         clock: &clock,
     };
     dispatch(command, &session, &ports, env, echo)
@@ -267,7 +301,7 @@ mod tests {
         let closed = || Failing(io::ErrorKind::BrokenPipe);
         let mut err = Vec::new();
         for exit in [Exit::Success, Exit::Rr(RrCode::Refused), Exit::remote(7)] {
-            let code = emit(&rendered(exit), &mut closed(), &mut err);
+            let code = emit(&rendered(exit), None, &mut closed(), &mut err);
             assert_eq!(code, ExitCode::from(exit.code()), "{exit:?}");
         }
         let shown = String::from_utf8(err).unwrap();
@@ -281,12 +315,17 @@ mod tests {
     fn a_write_that_failed_for_another_reason_is_no_success() {
         let mut err = Vec::new();
         let full = Failing(io::ErrorKind::StorageFull);
-        let code = emit(&rendered(Exit::Success), &mut { full }, &mut err);
+        let code = emit(&rendered(Exit::Success), None, &mut { full }, &mut err);
         assert_eq!(code, ExitCode::from(RrCode::Failure.code()));
         assert!(String::from_utf8(err).unwrap().contains("could not write"));
         // a result that already says failure keeps its own code
         let full = Failing(io::ErrorKind::StorageFull);
-        let code = emit(&rendered(Exit::remote(7)), &mut { full }, &mut Vec::new());
+        let code = emit(
+            &rendered(Exit::remote(7)),
+            None,
+            &mut { full },
+            &mut Vec::new(),
+        );
         assert_eq!(code, ExitCode::from(7));
     }
 
@@ -296,7 +335,7 @@ mod tests {
         for exit in [Exit::Success, Exit::remote(7)] {
             let mut err = Vec::new();
             let full = Failing(io::ErrorKind::StorageFull);
-            let _ = emit(&rendered(exit), &mut { full }, &mut err);
+            let _ = emit(&rendered(exit), None, &mut { full }, &mut err);
             let shown = String::from_utf8(err).unwrap();
             assert!(shown.starts_with("rr: note\n"), "{shown}");
             assert!(shown.contains("could not write"), "{shown}");
@@ -305,22 +344,62 @@ mod tests {
         let mut err = Vec::new();
         let _ = emit(
             &rendered(Exit::Success),
+            None,
             &mut Failing(io::ErrorKind::BrokenPipe),
             &mut err,
         );
         assert_eq!(err, b"rr: note\n");
         let code = emit(
             &rendered(Exit::Success),
+            None,
             &mut Vec::new(),
             &mut Failing(io::ErrorKind::StorageFull),
         );
         assert_eq!(code, ExitCode::from(RrCode::Failure.code()));
     }
 
+    /// A closed stdout must not hide a stderr that failed for a real reason.
+    #[test]
+    fn a_closed_stdout_does_not_hide_a_failing_stderr() {
+        let code = emit(
+            &rendered(Exit::Success),
+            None,
+            &mut Failing(io::ErrorKind::BrokenPipe),
+            &mut Failing(io::ErrorKind::StorageFull),
+        );
+        assert_eq!(code, ExitCode::from(RrCode::Failure.code()));
+    }
+
+    #[test]
+    fn a_note_that_could_not_be_written_is_told_and_fails_a_success() {
+        let notes = NoteWriter::new(Failing(io::ErrorKind::StorageFull));
+        notes.note("http://127.0.0.1:8080");
+        let lost = notes.take_failure();
+        assert!(lost.is_some(), "the lost note is kept");
+        let mut err = Vec::new();
+        let code = emit(&rendered(Exit::Success), lost, &mut Vec::new(), &mut err);
+        assert_eq!(code, ExitCode::from(RrCode::Failure.code()));
+        assert!(String::from_utf8(err).unwrap().contains("could not write"));
+    }
+
+    #[test]
+    fn a_note_to_a_closed_pipe_is_not_a_failure() {
+        let notes = NoteWriter::new(Failing(io::ErrorKind::BrokenPipe));
+        notes.note("closed");
+        assert!(notes.take_failure().is_none());
+    }
+
+    #[test]
+    fn a_note_is_written_when_the_sink_works() {
+        let notes = NoteWriter::new(Vec::new());
+        notes.note("one");
+        assert_eq!(notes.sink.into_inner(), b"one\n");
+    }
+
     #[test]
     fn what_is_rendered_is_written_in_order_to_its_streams() {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = emit(&rendered(Exit::Success), &mut out, &mut err);
+        let code = emit(&rendered(Exit::Success), None, &mut out, &mut err);
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!((out, err), (b"{}\n".to_vec(), b"rr: note\n".to_vec()));
     }

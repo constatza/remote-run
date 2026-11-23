@@ -19,7 +19,7 @@
 
 use crate::domain::fwd::{Endpoint, ForwardTarget, argv};
 use crate::domain::host::Host;
-use crate::ports::{Child, Clock, Deadline, Ended, Exec, Net};
+use crate::ports::{Child, Clock, Deadline, Ended, Exec, Net, Ownership};
 use anyhow::{Result, bail};
 use std::time::Duration;
 
@@ -81,11 +81,11 @@ fn stop_after(child: &mut dyn Child, err: &anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Kill `child`, then report `end`; a kill that fails is [`NotStopped`].
-fn stop_for(child: &mut dyn Child, end: End) -> Result<End> {
+/// Kill `child`, then report `then`; a kill that fails is [`NotStopped`].
+fn stop_then<T>(child: &mut dyn Child, then: T) -> Result<T> {
     child
         .kill()
-        .map(|()| end)
+        .map(|()| then)
         .map_err(|kill| anyhow::Error::new(NotStopped::new(&kill)))
 }
 
@@ -119,6 +119,33 @@ pub enum Started {
     Interrupted,
 }
 
+/// What a look at the endpoint of a starting forward showed.
+#[derive(PartialEq, Eq)]
+enum Probe {
+    /// Nothing accepts yet.
+    Silent,
+    /// The port answers, and the listener is ssh's.
+    SshListens,
+    /// The port answers, and the listener is another process's: the race the owner check closes.
+    Foreign,
+    /// The port answers, but whose listener it is could not be established; the text says why.
+    Unproven(String),
+}
+
+impl Probe {
+    /// What to add to the timeout error: the reason ssh was not found listening, if the port
+    /// answered at all.
+    fn why(&self) -> String {
+        match self {
+            Self::Silent | Self::SshListens => String::new(),
+            Self::Foreign => ": the port answers, but its listener is not ssh's".into(),
+            Self::Unproven(why) => {
+                format!(": the port answers, but could not prove its listener is ssh's ({why})")
+            }
+        }
+    }
+}
+
 /// Whether ssh is still running at a look.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Look {
@@ -141,7 +168,8 @@ impl StartingForward {
         Ok(Self { child, endpoint })
     }
 
-    /// Wait until `endpoint` accepts and ssh is still alive after [`SETTLE`]. On any failure ssh
+    /// Wait until `endpoint` accepts and ssh is still alive after [`SETTLE`] and, for a TCP
+    /// endpoint, its listener is held by ssh's pid. On any failure ssh
     /// is killed first, so an error never leaves a tunnel behind; a kill that fails is part of the
     /// error returned.
     pub fn wait_listening(mut self, net: &dyn Net, clock: &dyn Clock) -> Result<Started> {
@@ -152,9 +180,7 @@ impl StartingForward {
             })),
             // an interrupt has ended ssh through the child's own handler, but only a kill that
             // succeeds here says it is gone
-            Ok(Look::Interrupted) => {
-                stop_for(&mut *self.child, End::Interrupted).map(|_| Started::Interrupted)
-            }
+            Ok(Look::Interrupted) => stop_then(&mut *self.child, Started::Interrupted),
             Err(err) => Err(stop_after(&mut *self.child, &err)),
         }
     }
@@ -165,37 +191,37 @@ impl StartingForward {
             if self.look()? == Look::Interrupted {
                 return Ok(Look::Interrupted);
             }
-            if self.is_ssh_listening(net) {
+            let probe = self.probe(net);
+            if probe == Probe::SshListens {
                 clock.sleep(SETTLE);
                 return self.look();
             }
             if give_up.expired(clock.now()) {
-                // a port that answers without being ssh's is the race this check closes
-                let foreign = if net.accepts(&self.endpoint) {
-                    ": the port answers, but its listener is not ssh's"
-                } else {
-                    ""
-                };
                 bail!(
-                    "ssh did not open the forward within {}s{foreign}",
-                    START_LIMIT.as_secs()
+                    "ssh did not open the forward within {}s{}",
+                    START_LIMIT.as_secs(),
+                    probe.why()
                 );
             }
             clock.sleep(POLL);
         }
     }
 
-    /// Whether the endpoint accepts and, for a TCP port, the listener is ssh's own: a connect
-    /// succeeds against any listener, including one that took the port between `rr` choosing it
-    /// and ssh binding it, so only a listener held by ssh's pid counts. A socket path was absent
-    /// before ssh started and lies in the private runtime directory, so it needs no owner.
-    fn is_ssh_listening(&self, net: &dyn Net) -> bool {
+    /// What the endpoint shows now. A connect succeeds against any listener, including one that
+    /// took the port between `rr` choosing it and ssh binding it, so for a TCP port only a
+    /// listener held by ssh's pid counts. A socket path was absent before ssh started and lies in
+    /// the private runtime directory, so it needs no owner.
+    fn probe(&self, net: &dyn Net) -> Probe {
         if !net.accepts(&self.endpoint) {
-            return false;
+            return Probe::Silent;
         }
         match &self.endpoint {
-            Endpoint::Tcp(port) => net.held_by(*port, self.child.pid()),
-            Endpoint::Unix(_) => true,
+            Endpoint::Tcp(port) => match net.held_by(*port, self.child.pid()) {
+                Ownership::Held => Probe::SshListens,
+                Ownership::Foreign => Probe::Foreign,
+                Ownership::Unknown(why) => Probe::Unproven(why),
+            },
+            Endpoint::Unix(_) => Probe::SshListens,
         }
     }
 
@@ -223,13 +249,13 @@ impl ListeningForward {
             match self.child.try_wait() {
                 Ok(Some(Ended::Exited(code))) => return Ok(End::Exited(code)),
                 Ok(Some(Ended::Interrupted)) => {
-                    return stop_for(&mut *self.child, End::Interrupted);
+                    return stop_then(&mut *self.child, End::Interrupted);
                 }
                 Ok(None) => {}
                 Err(err) => return Err(stop_after(&mut *self.child, &err)),
             }
             if until.expired(clock.now()) {
-                return stop_for(&mut *self.child, End::Expired);
+                return stop_then(&mut *self.child, End::Expired);
             }
             clock.sleep(POLL);
         }

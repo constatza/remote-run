@@ -129,6 +129,7 @@ fn render_text(outcome: &Outcome) -> Rendered {
         },
         Outcome::Forwarded(Closed::Expired) => Rendered::exiting(Exit::Success),
         Outcome::Forwarded(Closed::Interrupted) => Rendered::exiting(Exit::Rr(RrCode::Interrupted)),
+        Outcome::Forwarded(Closed::SshEnded(code)) => Rendered::exiting(code.exit()),
     }
 }
 
@@ -485,6 +486,9 @@ mod tests {
         let interrupted = text(&Outcome::Forwarded(Closed::Interrupted));
         assert_eq!(interrupted.exit, Exit::Rr(RrCode::Interrupted));
         assert_ne!(interrupted.exit, Exit::remote(130));
+        let lost = text(&Outcome::Forwarded(Closed::SshEnded(RemoteExit::new(255))));
+        assert_eq!(lost.exit, Exit::remote(255));
+        assert_eq!((lost.stdout, lost.stderr), (String::new(), String::new()));
         assert_eq!(interrupted.exit.code(), 130);
         // the notes port already said why; nothing is written twice
         assert_eq!(

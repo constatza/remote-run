@@ -75,7 +75,9 @@ impl std::error::Error for TeeError {
 
 /// Copy `reader` to `writer` unchanged, a line at a time (flushed, like [`write_sanitized`]), and
 /// return the lines that start with `prefix`. A line longer than [`MAX_LINE_BYTES`] is read in
-/// pieces, so its later pieces are not seen as line starts.
+/// pieces, so its later pieces are not seen as line starts. When the writer fails the reader is
+/// still read to its end and matched, without echoing, so a job id printed after the failure is
+/// not lost; the first write error is returned then, with every matched line.
 pub fn tee_lines(
     reader: impl Read,
     writer: &mut impl Write,
@@ -95,6 +97,7 @@ fn tee_into(
     matched: &mut Vec<String>,
 ) -> io::Result<()> {
     let mut reader = io::BufReader::new(reader);
+    let mut write_failed: Option<io::Error> = None;
     let mut line = Vec::new();
     let mut at_line_start = true;
     loop {
@@ -104,7 +107,7 @@ fn tee_into(
             .read_until(b'\n', &mut line)?
             == 0
         {
-            return Ok(());
+            return write_failed.map_or(Ok(()), Err);
         }
         // recorded before the echo: a failing write on the matching line itself must still hand
         // back its job id
@@ -112,8 +115,11 @@ fn tee_into(
             let text = String::from_utf8_lossy(&line);
             matched.push(text.trim_end_matches(['\r', '\n']).to_string());
         }
-        writer.write_all(&line)?;
-        writer.flush()?;
+        if write_failed.is_none()
+            && let Err(source) = writer.write_all(&line).and_then(|()| writer.flush())
+        {
+            write_failed = Some(source);
+        }
         at_line_start = line.ends_with(b"\n");
     }
 }
@@ -165,6 +171,18 @@ pub trait Child {
     fn kill(&mut self) -> Result<()>;
 }
 
+/// Whose a TCP listener on the forwarded port is, as far as `rr` could establish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ownership {
+    /// The process asked about holds the listening socket.
+    Held,
+    /// The tables were read, and another process holds it (or none does).
+    Foreign,
+    /// The tables could not be read or the system cannot tell; the text says why. Not a proof of
+    /// either: a caller that announces only on [`Ownership::Held`] fails closed.
+    Unknown(String),
+}
+
 /// The local network and the files a forward needs.
 pub trait Net {
     /// A TCP port on loopback that nothing listens on: `want` when given (an error if taken),
@@ -181,10 +199,10 @@ pub trait Net {
     /// Whether a connection to `endpoint` is accepted right now. Any listener answers, so for a TCP
     /// port this alone does not say whose it is: see [`Net::held_by`].
     fn accepts(&self, endpoint: &Endpoint) -> bool;
-    /// Whether the process `pid` holds the listening socket on `127.0.0.1:port`. `false` when that
-    /// cannot be established (another process listens, the socket table is unreadable, or the
-    /// system cannot tell), so a caller that announces only on `true` fails closed.
-    fn held_by(&self, port: LoopbackPort, pid: u32) -> bool;
+    /// Whether the process `pid` holds the listening socket on `127.0.0.1:port`. A read error is
+    /// [`Ownership::Unknown`] with its cause, never [`Ownership::Held`], so a caller that
+    /// announces only on `Held` fails closed and can still say why.
+    fn held_by(&self, port: LoopbackPort, pid: u32) -> Ownership;
 }
 
 /// Runs scripts on the remote host; a trait so tests can record what would be sent. It takes a
@@ -545,6 +563,8 @@ pub mod fake {
         pub socket_taken: bool,
         /// The pid that holds the listener on the port (`None`: some other process does).
         pub holder: Option<u32>,
+        /// When set, the socket tables cannot be read and `held_by` says why.
+        pub unreadable: Option<String>,
         /// The `(port, pid)` pairs `held_by` was asked about.
         pub asked: RefCell<Vec<(u16, u32)>>,
         /// The socket paths `remove_socket` was asked to remove.
@@ -558,6 +578,7 @@ pub mod fake {
                 accepts: RefCell::new(accepts.into()),
                 socket_taken: false,
                 holder: Some(FAKE_CHILD_PID),
+                unreadable: None,
                 asked: RefCell::default(),
                 removed: RefCell::default(),
             }
@@ -585,9 +606,13 @@ pub mod fake {
             Ok(())
         }
 
-        fn held_by(&self, port: LoopbackPort, pid: u32) -> bool {
+        fn held_by(&self, port: LoopbackPort, pid: u32) -> Ownership {
             self.asked.borrow_mut().push((port.get(), pid));
-            self.holder == Some(pid)
+            match (&self.unreadable, self.holder == Some(pid)) {
+                (Some(why), _) => Ownership::Unknown(why.clone()),
+                (None, true) => Ownership::Held,
+                (None, false) => Ownership::Foreign,
+            }
         }
 
         fn accepts(&self, _: &Endpoint) -> bool {
@@ -850,10 +875,14 @@ pub mod fake {
                 Ok(())
             }
         }
-        let raw = b"Submitted batch job 9\nnoise\n";
+        let raw = b"Submitted batch job 9\nnoise\nSubmitted batch job 10\n";
         let err =
             tee_lines(&raw[..], &mut FailsOnSecondWrite(0), "Submitted batch job ").unwrap_err();
-        assert_eq!(err.matched, ["Submitted batch job 9"]);
+        assert_eq!(
+            err.matched,
+            ["Submitted batch job 9", "Submitted batch job 10"],
+            "a job id after the failed write is still recorded"
+        );
         assert_eq!(err.to_string(), "closed");
     }
 

@@ -7,8 +7,8 @@ use crate::config::Session;
 use crate::domain::outcome::Outcome;
 use crate::domain::place::{Place, script};
 use crate::domain::pull::{
-    JobPolicy, PullDecision, PullOutcome, Reason, STALE_EXIT, STATE_CHANGED_EXIT, Target,
-    UV_MISSING_EXIT, apply_script, decide, parse_state, state_script, verify_script,
+    JobPolicy, PullDecision, PullOutcome, STALE_EXIT, STATE_CHANGED_EXIT, Target, UV_MISSING_EXIT,
+    apply_script, decide, merge_refusal, parse_state, state_script, verify_script,
 };
 use crate::ports::Remote;
 use anyhow::{Result, bail};
@@ -53,7 +53,7 @@ fn sync(
     let stderr = applied.stderr.trim().to_string();
     match (applied.code, permit) {
         (STALE_EXIT, _) => Ok(PullOutcome::Stale { stderr }),
-        (STATE_CHANGED_EXIT, Some(_)) => Ok(PullOutcome::Refused(Reason::StateChanged { stderr })),
+        (STATE_CHANGED_EXIT, Some(_)) => Ok(PullOutcome::Refused(merge_refusal(&stderr))),
         (UV_MISSING_EXIT, _) => bail!(
             "cannot check the remote environment: uv is not on the remote PATH (set `env` to a \
              file that puts it there):\n{stderr}"
@@ -73,7 +73,7 @@ mod tests {
     use super::*;
     use crate::domain::exit::RrCode;
     use crate::domain::ids::Commit;
-    use crate::domain::pull::{Next, next};
+    use crate::domain::pull::{Next, QUEUE_UNREADABLE_MARKER, Reason, next};
     use crate::ports::fake::{Reply, output};
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -230,6 +230,24 @@ mod tests {
         assert_eq!(
             outcome,
             PullOutcome::Refused(Reason::StateChanged { stderr: said })
+        );
+        assert_eq!(next(&outcome), Next::Stop(RrCode::Refused));
+    }
+
+    /// A merge script that could not read the queue says so: its own refusal, still not a merge.
+    #[test]
+    fn an_unreadable_queue_at_merge_time_is_its_own_refusal() {
+        let said = format!("squeue: down\n{QUEUE_UNREADABLE_MARKER}\n");
+        let stub = Stub::new(vec![
+            (0, &report(A, B, ""), ""),
+            (STATE_CHANGED_EXIT, "", &said),
+        ]);
+        let outcome = stub.pull(JobPolicy::Respect).unwrap();
+        assert_eq!(
+            outcome,
+            PullOutcome::Refused(Reason::QueueUnreadable {
+                stderr: "squeue: down".into()
+            })
         );
         assert_eq!(next(&outcome), Next::Stop(RrCode::Refused));
     }

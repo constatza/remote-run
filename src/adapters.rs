@@ -7,7 +7,7 @@ use crate::domain::host::Host;
 use crate::domain::shell::Script;
 use crate::domain::ssh::{Liveness, Terminal, ssh_argv};
 use crate::ports::{
-    Child as PortChild, Clock, Echo, Ended, Exec, Instant, Net, Remote, Teed, tee_lines,
+    Child as PortChild, Clock, Echo, Ended, Exec, Instant, Net, Ownership, Remote, Teed, tee_lines,
     write_sanitized,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -90,8 +90,9 @@ impl Exec for OsExec {
 
 /// [`Exec::stream_tee`] with the echo writer given. When the copy fails the child is stopped like
 /// any other (SIGTERM, then SIGKILL after [`STOP_GRACE`]), so an `ssh -t` leaves the local terminal
-/// as it found it, and the lines that matched before the failure go into the error: they may be the
-/// job ids of work that is already running on the cluster.
+/// as it found it. A failing echo does not stop the reading (see [`tee_lines`]), so the child's
+/// output is read to its end first; the lines that matched go into the error: they may be the job
+/// ids of work that is already running on the cluster.
 fn stream_tee_to(argv: &Argv, prefix: &str, echo: &mut impl Write) -> Result<Teed> {
     let mut child = command(argv)
         .stdin(Stdio::inherit())
@@ -103,25 +104,21 @@ fn stream_tee_to(argv: &Argv, prefix: &str, echo: &mut impl Write) -> Result<Tee
         let _ = child.wait();
         return Err(anyhow!("{} has no output pipe", argv.program()));
     };
-    let copied = tee_lines(output, echo, prefix);
-    // a child that is still writing into a pipe nobody reads would never end
-    let stopped = match copied {
-        Ok(_) => Ok(()),
-        Err(_) => stop_child(&mut child),
-    };
-    let status = child.wait().context("could not wait for the child")?;
-    match copied {
+    match tee_lines(output, echo, prefix) {
         Ok(matched) => {
-            stopped?;
+            let status = child.wait().context("could not wait for the child")?;
             Ok(Teed {
                 code: exit_code(status),
                 matched,
             })
         }
         Err(failed) => {
+            // stopping reaps the child, so there is no wait here: one on a child that could not
+            // be stopped would block, and its error would hide the matched ids
+            let stopped = stop_child(&mut child);
             let seen = failed.matched.join("; ");
             let err = anyhow::Error::new(failed.source).context(format!(
-                "could not copy the output (lines matched before it: [{seen}])"
+                "could not copy the output (lines matched: [{seen}])"
             ));
             Err(match stopped {
                 Ok(()) => err,
@@ -380,14 +377,18 @@ impl Net for OsNet {
     }
 
     #[cfg(target_os = "linux")]
-    fn held_by(&self, port: LoopbackPort, pid: u32) -> bool {
-        // fail closed: an unreadable table or a process we may not inspect is "not held"
-        holds_listener(port, pid).unwrap_or(false)
+    fn held_by(&self, port: LoopbackPort, pid: u32) -> Ownership {
+        // an unreadable table or a process we may not inspect is unknown, never held
+        match holds_listener(port, pid) {
+            Ok(true) => Ownership::Held,
+            Ok(false) => Ownership::Foreign,
+            Err(err) => Ownership::Unknown(format!("{err:#}")),
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn held_by(&self, _: LoopbackPort, _: u32) -> bool {
-        false
+    fn held_by(&self, _: LoopbackPort, _: u32) -> Ownership {
+        Ownership::Unknown("only Linux can tell whose a listener is".into())
     }
 
     fn accepts(&self, endpoint: &Endpoint) -> bool {
@@ -1233,7 +1234,8 @@ mod tests {
                 Ok(())
             }
         }
-        let script = "echo 'Submitted batch job 9'; echo noise; exec sleep 30";
+        // stdout is closed before the sleep, so the reading ends while the child still runs
+        let script = "echo 'Submitted batch job 9'; echo noise; echo 'Submitted batch job 10'; exec sleep 30 >&-";
         let started = WallClock::now();
         let err = within(move || {
             stream_tee_to(
@@ -1245,6 +1247,10 @@ mod tests {
         });
         let shown = format!("{err:#}");
         assert!(shown.contains("Submitted batch job 9"), "{shown}");
+        assert!(
+            shown.contains("Submitted batch job 10"),
+            "an id after the failed echo is kept: {shown}"
+        );
         assert!(shown.contains("closed"), "{shown}");
         assert!(started.elapsed() < Duration::from_secs(20), "child stopped");
     }
@@ -1262,7 +1268,7 @@ mod tests {
                 Ok(())
             }
         }
-        let script = "echo 'Submitted batch job 9'; exec sleep 30";
+        let script = "echo 'Submitted batch job 9'; exec sleep 30 >&-";
         let err = within(move || {
             stream_tee_to(&sh(script), "Submitted batch job ", &mut AlwaysFails).unwrap_err()
         });
@@ -1294,16 +1300,21 @@ mod tests {
     fn a_loopback_listener_is_held_by_its_own_process_only() {
         let listener = TcpListener::bind((LOOPBACK_ADDR, 0)).unwrap();
         let port = LoopbackPort::from_u16(listener.local_addr().unwrap().port()).unwrap();
-        assert!(OsNet.held_by(port, std::process::id()));
+        assert_eq!(OsNet.held_by(port, std::process::id()), Ownership::Held);
         let child = OsExec.spawn(&sh("exec sleep 30")).unwrap();
-        assert!(
-            !OsNet.held_by(port, child.pid()),
+        assert_eq!(
+            OsNet.held_by(port, child.pid()),
+            Ownership::Foreign,
             "a child of ours is not the holder"
         );
-        assert!(!OsNet.held_by(port, 0), "no such process");
-        drop(listener);
         assert!(
-            !OsNet.held_by(port, std::process::id()),
+            matches!(OsNet.held_by(port, 0), Ownership::Unknown(_)),
+            "no such process: its fds cannot be read"
+        );
+        drop(listener);
+        assert_eq!(
+            OsNet.held_by(port, std::process::id()),
+            Ownership::Foreign,
             "nothing listens any more"
         );
     }

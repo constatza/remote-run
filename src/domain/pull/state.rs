@@ -112,12 +112,14 @@ fn jobs_script() -> Script {
     )
 }
 
-/// Shell that succeeds only when no active job was submitted from the current checkout: the
-/// [`job_loop`] prints a line for every job inside `$checkout` (the same test as [`inside`]), one
-/// that cannot be placed, and every line it cannot read, and the check passes on no output. Each
-/// printed line starts with `job`, so an empty id or line cannot print nothing. A failing
-/// `squeue` or `pwd` fails the chain, which is a refusal and never "no jobs".
-pub(super) fn no_job_inside_script() -> Script {
+/// Shell that sets `$blocked` to a line for every active job inside the current checkout, one
+/// that cannot be placed, and every line it cannot read; the caller passes on an empty `$blocked`
+/// only. The test for "inside" is an equivalent shell form of [`inside`], not the same code: the
+/// behaviour tests of the merge script pin the two together, and only the `squeue` and `realpath`
+/// loop is shared through [`job_loop`]. Each printed line starts with `job`, so an empty id or
+/// line cannot print nothing. A failing `squeue`, `realpath` or `pwd` fails this command, which
+/// is a refusal and never "no jobs".
+pub(super) fn read_blocking_jobs_script() -> Script {
     let inside =
         lit(r#"case "$resolved" in "$checkout"|"${checkout%/}"/*) echo "job $id" ;; esac"#);
     lit("checkout=$(pwd -P) && blocked=$(")
@@ -126,7 +128,7 @@ pub(super) fn no_job_inside_script() -> Script {
             lit(r#"echo "job $id""#),
             lit("echo 'job line with no directory'"),
         ))
-        .lit(r#") && [ -z "$blocked" ]"#)
+        .lit(")")
 }
 
 /// The `origin/*` branches that contain the resolved `$target`, one `onorigin` field each; prints
