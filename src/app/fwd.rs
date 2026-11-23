@@ -3,7 +3,7 @@
 //! the forward at its deadline, and an interrupt or the death of `rr` ends ssh.
 
 use super::Ports;
-use super::tunnel::{End, ListeningForward, Started, StartingForward};
+use super::tunnel::{End, ListeningForward, NotStopped, Started, StartingForward};
 use crate::config::Session;
 use crate::domain::exit::RemoteExit;
 use crate::domain::fwd::{
@@ -35,16 +35,40 @@ pub fn run(session: &Session, args: Args, ports: &Ports, machine: &Machine) -> R
         .plan(args.wanted, args.local, args.transport, args.browser)?;
     let endpoint = endpoint(&plan, machine)?;
     let served = serve(session, &plan, &endpoint, args.ttl, (ports, machine));
-    // ssh is reaped by now however `served` ended. The path was free before ssh started (a taken
-    // one is refused above), so a file there is ssh's: a SIGKILLed ssh leaves it behind and the
-    // next `rr fwd` of this name would be refused. (Two `rr fwd` of the same name at once is not
-    // supported: the one that fails to bind would remove the other's socket.)
-    if let Endpoint::Unix(path) = &endpoint
-        && let Err(err) = machine.net.remove_socket(path)
-    {
-        ports.notes.note(&format!("rr: {err:#}"));
+    // The path was free before ssh started (a taken one is refused above), so a file there is
+    // ssh's: a SIGKILLed ssh leaves it behind and the next `rr fwd` of this name would be
+    // refused. A socket file is removed only once ssh is known to be gone: one that could not be
+    // stopped may still own it. (Two `rr fwd` of the same name at once is not supported: the one
+    // that fails to bind would remove the other's socket.)
+    if let Endpoint::Unix(path) = &endpoint {
+        match ssh_after(&served) {
+            SshAfter::Gone => {
+                if let Err(err) = machine.net.remove_socket(path) {
+                    ports.notes.note(&format!("rr: {err:#}"));
+                }
+            }
+            SshAfter::MayRun => ports.notes.note(&format!(
+                "rr: ssh could not be stopped, so {} is left in place",
+                path.as_str()
+            )),
+        }
     }
     served
+}
+
+/// Whether ssh is known to have ended once `serve` has returned.
+enum SshAfter {
+    /// Ended and reaped, however `serve` ended (the handle also ends it when dropped).
+    Gone,
+    /// Stopping it failed.
+    MayRun,
+}
+
+fn ssh_after(served: &Result<Outcome>) -> SshAfter {
+    match served {
+        Err(err) if err.downcast_ref::<NotStopped>().is_some() => SshAfter::MayRun,
+        Ok(_) | Err(_) => SshAfter::Gone,
+    }
 }
 
 fn serve(
@@ -419,6 +443,29 @@ mod tests {
             path,
             "ssh failed to start"
         );
+    }
+
+    /// ssh that could not be stopped may still own its socket: the file stays, and the user is
+    /// told. Both places a stop can fail are covered: a failed start and the end of the ttl.
+    #[test]
+    fn a_socket_file_stays_when_ssh_could_not_be_stopped() {
+        let stuck = |waits: Vec<Option<i32>>, accepts: Vec<bool>| {
+            let (child, killed) = FakeChild::new(waits);
+            let w = world_of(child.with_failing_kill(), killed, accepts);
+            let err = go(&w, &session(), socket_args(), Some(RUNTIME)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("could not be stopped"),
+                "{err:#}"
+            );
+            assert!(removed(&w).is_empty(), "the socket may be ssh's still");
+            assert!(
+                notes(&w).pop().unwrap().contains("left in place"),
+                "{:?}",
+                notes(&w)
+            );
+        };
+        stuck(vec![None], vec![false]); // never listened
+        stuck(vec![None], vec![true]); // ttl reached
     }
 
     #[test]
