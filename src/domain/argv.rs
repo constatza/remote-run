@@ -3,12 +3,49 @@
 use crate::domain::sanitize::sanitize;
 use anyhow::{Result, bail};
 
+/// One environment variable for a child: a name that is a plain identifier and a value without a
+/// NUL, so a value cannot cut the variable short or smuggle in a second one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvVar {
+    name: String,
+    value: String,
+}
+
+impl EnvVar {
+    pub fn parse(name: &str, value: &str) -> Result<Self> {
+        let mut chars = name.chars();
+        let first_ok = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        if !first_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            bail!("not an environment variable name: {name:?}");
+        }
+        if value.contains('\0') {
+            bail!("the value of {name} has a NUL");
+        }
+        Ok(Self {
+            name: name.to_string(),
+            value: value.to_string(),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
 /// A program and its arguments. The program is a required field, so there is no empty argv and
-/// no `argv[0]` to index.
+/// no `argv[0]` to index. The child inherits `rr`'s environment, plus the variables given with
+/// [`Argv::with_env`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Argv {
     program: String,
     args: Vec<String>,
+    envs: Vec<EnvVar>,
 }
 
 impl Argv {
@@ -16,7 +53,19 @@ impl Argv {
         Self {
             program: program.into(),
             args,
+            envs: Vec::new(),
         }
+    }
+
+    /// The same command with `var` set in the child's environment.
+    #[must_use]
+    pub fn with_env(mut self, var: EnvVar) -> Self {
+        self.envs.push(var);
+        self
+    }
+
+    pub fn envs(&self) -> &[EnvVar] {
+        &self.envs
     }
 
     pub fn program(&self) -> &str {
@@ -52,6 +101,14 @@ impl Payload {
     }
 }
 
+/// What a command printed, byte for byte on stdout (an archive is not text), and how it ended.
+#[derive(Clone, Debug)]
+pub struct CapturedBytes {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+}
+
 /// What a command printed and how it ended.
 #[derive(Clone, Debug)]
 pub struct Captured {
@@ -85,6 +142,20 @@ mod tests {
             stdout: stdout.into(),
             stderr: stderr.into(),
         }
+    }
+
+    #[test]
+    fn an_environment_variable_has_a_plain_name_and_a_value_without_nul() {
+        assert!(EnvVar::parse("GIT_INDEX_FILE", "/tmp/a b/index").is_ok());
+        assert!(EnvVar::parse("_x1", "").is_ok());
+        for name in ["", "1A", "A=B", "A B", "A\0", "a-b", "A\n"] {
+            assert!(EnvVar::parse(name, "v").is_err(), "{name:?}");
+        }
+        assert!(EnvVar::parse("A", "v\0w").is_err());
+        let argv = Argv::new("git", vec![]).with_env(EnvVar::parse("A", "1").unwrap());
+        assert_eq!(argv.envs()[0].name(), "A");
+        assert_eq!(argv.envs()[0].value(), "1");
+        assert_ne!(argv, Argv::new("git", vec![]));
     }
 
     #[test]
