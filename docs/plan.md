@@ -22,21 +22,21 @@ Commits `91c06e7` to `8a09db1`, then the A6 commits. The tree passes `cargo fmt 
 | Phase | State | Remaining |
 |---|---|---|
 | R0 stopgap fixes and tests | done | none |
-| R architecture refactor (R1-R10) | done | none; `Clock` exists but nothing uses it yet |
+| R architecture refactor (R1-R10) | done | none; `Clock` is used by `app::wait` |
 | A1 option injection | done | none |
 | A2 untrusted project file | done | owner and mode checks were dropped on purpose (the digest pin covers them); stopping the `.rr.toml` search at `$HOME` is optional |
 | A3 terminal text | done | `q`, `acct`, `log` and `cancel` stream through `stream_filtered` (line-wise `sanitize`, 64 KiB line cap, a line-ending `\r\n` kept as `\r\n` because `ssh -t` leaves the local tty raw); `x` and `run` stay raw. Needs a check on the real host: output of `rr log -f` over `ssh -t`. Open: a bare `\r` (a progress bar) shows as `?`, not as an updating line |
 | A4 job ids | done | `--wait` stdout parsing comes with Phase B |
-| A5 README and `about` wording | done | reword again when `submit` / `watch` exist (Phase B) |
+| A5 README and `about` wording | done | none; `about` and the README name `wait` and `status`, and `rr` still has no `submit` or `watch` command |
 | A6 pull guards | partly | done: fail-closed state parsing, `realpath -m` workdirs, an unresolvable workdir blocks, uv missing is exit 127 and a mismatch is 75; the state script runs `git fetch -q --prune origin` so a branch deleted upstream stops counting; an empty `dir` is an error; the merge script re-asserts `HEAD == from` and a clean tree and exits 76 (`Reason::StateChanged { stderr }`, a refusal that shows the remote's sanitized stderr); `git branch -r --contains` must be non-empty or the target is `NotOnOrigin`; the POSIX-login-shell note is in the README (the script still goes as `bash -c '<script>'`, not on stdin). Open: the merge script does not re-check the job guard, so a job submitted between the state read and the merge is not seen. Not done: confirming on a real host that the stand-in-tested `git branch -r --contains <sha> --list 'origin/*'` and `realpath -m` behave the same on the cluster's git and coreutils |
-| B `wait`, `--json`, `status` | not started | all |
+| B `wait`, `--json`, `status` | done (fake-tested only) | needs the real host: `rr wait` with a killed ssh must exit 6, `sacct -X -j` on an array parent and on a just-submitted id, `rr run --wait` with a real `sbatch` line, `ssh -t` with a piped stdout (`rr run -t --wait`). Not done: `--json` for `q` and `acct` (they stream the cluster's text), `rr status` restart count (no `sacct` field known for it), progress lines while waiting |
 | C `fwd` | not started | all |
 | D snapshots | not started | step 0 probe on the real host first |
 | E recipes and smaller items | not started | all |
 
 Decisions made while implementing, which override the text below where they differ:
 
-- `Exit` is `Success | Rr(RrCode) | Remote(NonZeroU8)`; `RrCode` is `Failure` (1) or `Refused` (3). A remote command's own code is always `Remote`.
+- `Exit` is `Success | Rr(RrCode) | Remote(NonZeroU8)`; `RrCode` is `Failure` (1), `Refused` (3), `Timeout` (4), `JobFailed` (5) or `Unknown` (6). A remote command's own code is always `Remote`.
 - Commands that stream a child's output (`run`, `log`) print their preface lines through the `Notes` port. Everything else is an `Outcome` rendered once by `render`.
 - `uv sync --frozen --check` runs without `-q`, so a mismatch can show uv's stderr. A missing `uv` is an error (exit 1), not a refusal.
 - `rev-parse HEAD` failing for any reason other than "not a git repository" is an error; only that case falls back to `origin/HEAD`, with a warning.
@@ -65,7 +65,7 @@ Independent small commits, no restructuring:
 
 ## Phase R: architecture review and refactor (before any feature)
 
-Status: R1 to R10 implemented. Layout: `src/domain/` (pure), `ports.rs`, `app/` (one file per command), `adapters.rs`, `config.rs` and `trust.rs` (file edges), `main.rs`/`cli.rs`. Commands that stream a child's output say what they did first through `ports::Notes`, because that text must precede the output; everything else is an `Outcome` rendered by `domain::outcome::render`. `Clock` exists with a fake and `SystemClock`; `wait` is not built.
+Status: R1 to R10 implemented. Layout: `src/domain/` (pure), `ports.rs`, `app/` (one file per command), `adapters.rs`, `config.rs` and `trust.rs` (file edges), `main.rs`/`cli.rs`. Commands that stream a child's output say what they did first through `ports::Notes`, because that text must precede the output; everything else is an `Outcome` rendered by `domain::outcome::render`. `Clock` has a fake and `SystemClock`, and `app::wait` uses it.
 
 ### What is already good (keep)
 
@@ -193,7 +193,7 @@ A1 and the stopgap form of A2 ship in R0 in the current code. Phase A is what re
 
 ## Phase B: item 2, `wait`, `--json`, `status`
 
-Status: not started.
+Status: done. Where the code differs from the text below: `wait` stops at the first job that ended in any state but COMPLETED (a job depending on it may stay pending for ever); five polls in a row that cannot tell the states end as exit 6; `JobState` is `Active | Finished | Unknown(raw)`, and `JobSet` makes an empty wait unrepresentable; the pure code is in `domain/wait.rs`, the loop in `app/wait.rs`, the JSON in `domain/json.rs` (rendered only by `render`); `Exec::stream_tee` and `Remote::stream_tee` show a command's stdout unchanged and return only the lines that start with `Submitted batch job `.
 
 Design points that differ from the document, with reasons:
 
