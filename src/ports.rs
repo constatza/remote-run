@@ -157,6 +157,9 @@ pub trait Net {
 pub trait Remote {
     /// Run `script`, collecting its output.
     fn capture(&self, script: &Script) -> Result<Captured>;
+    /// Like [`Remote::capture`], for a short read that must come back (`rr wait` and `rr status`):
+    /// a silent link ends the call instead of blocking it for ever.
+    fn poll(&self, script: &Script) -> Result<Captured>;
     /// Run `script` with the local terminal attached; `terminal` says whether the remote side gets
     /// one too.
     fn stream(&self, script: &Script, terminal: Terminal) -> Result<i32>;
@@ -263,6 +266,7 @@ pub mod fake {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum RemoteCall {
         Capture,
+        Poll,
         Stream(Terminal),
         StreamFiltered(Terminal),
         StreamTee(Terminal, Echo),
@@ -326,6 +330,17 @@ pub mod fake {
                 .borrow_mut()
                 .pop_front()
                 .expect("an unexpected remote capture"))
+        }
+
+        fn poll(&self, script: &Script) -> Result<Captured> {
+            self.calls
+                .borrow_mut()
+                .push((script.to_string(), RemoteCall::Poll));
+            Ok(self
+                .captures
+                .borrow_mut()
+                .pop_front()
+                .expect("an unexpected remote poll"))
         }
 
         fn stream(&self, script: &Script, terminal: Terminal) -> Result<i32> {

@@ -22,7 +22,7 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     let home = session.place.at_home();
     let record = ports
         .remote
-        .capture(&script(&home, status_script(&args.job)))?;
+        .poll(&script(&home, status_script(&args.job)))?;
     let status = parse_status(&record.into_stdout("sacct")?)?;
     // a job that has not started has no log yet: that is a state of the job, not a failure
     let log = match log_path(&status.record) {
@@ -31,7 +31,7 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
         },
         Ok(path) => {
             let tail = tail_script(&path, args.lines, Follow::Once);
-            let shown = ports.remote.capture(&script(&home, tail))?;
+            let shown = ports.remote.poll(&script(&home, tail))?;
             match shown.code {
                 0 => LogTail::Lines {
                     path,

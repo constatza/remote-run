@@ -180,7 +180,7 @@ mod tests {
         let capture = RemoteCall::Capture;
         assert_eq!(
             how,
-            [capture, capture, tee, capture],
+            [capture, capture, tee, RemoteCall::Poll],
             "state, merge, command, sacct"
         );
         assert!(matches!(outcome, Outcome::Waited(_)));

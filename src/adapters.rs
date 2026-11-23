@@ -5,7 +5,7 @@ use crate::domain::argv::{Argv, Captured, Stdin};
 use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath};
 use crate::domain::host::Host;
 use crate::domain::shell::Script;
-use crate::domain::ssh::{Terminal, ssh_argv};
+use crate::domain::ssh::{Liveness, Terminal, ssh_argv};
 use crate::ports::{
     Child as PortChild, Clock, Echo, Ended, Exec, Instant, Net, Remote, Teed, tee_lines,
     write_sanitized,
@@ -441,18 +441,43 @@ impl<'a> Ssh<'a> {
 
 impl Remote for Ssh<'_> {
     fn capture(&self, script: &Script) -> Result<Captured> {
-        let argv = ssh_argv(self.host, &script.to_string(), Terminal::Plain);
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            Terminal::Plain,
+            Liveness::Configured,
+        );
+        self.exec.capture(&argv, Stdin::Null)
+    }
+
+    fn poll(&self, script: &Script) -> Result<Captured> {
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            Terminal::Plain,
+            Liveness::Bounded,
+        );
         self.exec.capture(&argv, Stdin::Null)
     }
 
     fn stream(&self, script: &Script, terminal: Terminal) -> Result<i32> {
-        self.exec
-            .stream(&ssh_argv(self.host, &script.to_string(), terminal))
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            terminal,
+            Liveness::Configured,
+        );
+        self.exec.stream(&argv)
     }
 
     fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32> {
-        self.exec
-            .stream_filtered(&ssh_argv(self.host, &script.to_string(), terminal))
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            terminal,
+            Liveness::Configured,
+        );
+        self.exec.stream_filtered(&argv)
     }
 
     fn stream_tee(
@@ -462,7 +487,12 @@ impl Remote for Ssh<'_> {
         prefix: &str,
         echo: Echo,
     ) -> Result<Teed> {
-        let argv = ssh_argv(self.host, &script.to_string(), terminal);
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            terminal,
+            Liveness::Configured,
+        );
         self.exec.stream_tee(&argv, prefix, echo)
     }
 }
@@ -787,9 +817,9 @@ mod tests {
         assert_eq!(attached.unwrap(), 9);
         let calls = exec.calls.borrow();
         assert_eq!(calls[0].1, How::StreamFiltered);
-        assert_eq!(calls[0].0.args()[10..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
         assert_eq!(
-            calls[1].0.args()[10..],
+            calls[1].0.args()[4..],
             ["-t", "--", "cluster", "bash -c 'true'"]
         );
     }
@@ -802,8 +832,23 @@ mod tests {
         let calls = exec.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0.program(), "ssh");
-        assert_eq!(calls[0].0.args()[10..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
         assert_eq!(calls[0].1, How::Capture(Stdin::Null));
+    }
+
+    /// Only the poll is bounded: the user's own ssh configuration decides for everything else.
+    #[test]
+    fn a_poll_carries_the_liveness_options_and_a_capture_does_not() {
+        let exec = FakeExec::new(vec![output(0, "", ""), output(0, "", "")], vec![]);
+        let cluster = host();
+        let ssh = Ssh::new(&cluster, &exec);
+        ssh.capture(&lit("true")).unwrap();
+        ssh.poll(&lit("true")).unwrap();
+        let calls = exec.calls.borrow();
+        let has = |call: usize, option: &str| calls[call].0.args().iter().any(|a| a == option);
+        assert!(!has(0, "ServerAliveInterval=15") && !has(0, "ConnectTimeout=10"));
+        assert!(has(1, "ServerAliveInterval=15") && has(1, "ConnectTimeout=10"));
+        assert_eq!(calls[1].1, How::Capture(Stdin::Null));
     }
 
     #[test]
@@ -815,10 +860,10 @@ mod tests {
         assert_eq!(ssh.stream(&lit("true"), Terminal::Attached).unwrap(), 9);
         let calls = exec.calls.borrow();
         assert_eq!(calls[0].1, How::Stream);
-        assert_eq!(calls[0].0.args()[10..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
         assert_eq!(calls[1].1, How::Stream);
         assert_eq!(
-            calls[1].0.args()[10..],
+            calls[1].0.args()[4..],
             ["-t", "--", "cluster", "bash -c 'true'"]
         );
     }

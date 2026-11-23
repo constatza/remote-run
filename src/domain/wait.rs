@@ -466,6 +466,11 @@ mod tests {
             "{why}"
         );
         assert!(matches!(read(0, "garbage\n", ""), Reading::Unreadable(_)));
+        // `timeout 60 sacct` that hit its limit: a stalled slurmdbd, not a failed job
+        let Reading::Unreadable(why) = read(124, "", "") else {
+            panic!("a timed-out sacct is unreadable");
+        };
+        assert!(why.contains("124"), "{why}");
         // a call that never reached the remote is an error, not a poll to retry
         let wont_start = Reading::from_capture(Err(anyhow::anyhow!("could not start ssh")));
         assert!(wont_start.is_err());

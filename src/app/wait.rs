@@ -29,7 +29,7 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     let start = ports.clock.now();
     let mut unreadable_polls = 0;
     loop {
-        let reading = Reading::from_capture(ports.remote.capture(&poll))?;
+        let reading = Reading::from_capture(ports.remote.poll(&poll))?;
         let elapsed = ports.clock.now().since(start);
         let progress = Progress {
             elapsed,
@@ -124,11 +124,9 @@ mod tests {
         let done = reply("7", "COMPLETED");
         let fakes = Fakes::new(vec![], vec![], vec![(0, &done, "")], vec![]);
         run(&session(), args(HOUR), &fakes.ports()).unwrap();
-        let expected = at_home(r#"sacct -n -X -P --delimiter=$'\x1f' -j '7' -o JobID,State"#);
-        assert_eq!(
-            *fakes.remote.calls.borrow(),
-            [(expected, RemoteCall::Capture)]
-        );
+        let expected =
+            at_home(r#"timeout 60 sacct -n -X -P --delimiter=$'\x1f' -j '7' -o JobID,State"#);
+        assert_eq!(*fakes.remote.calls.borrow(), [(expected, RemoteCall::Poll)]);
     }
 
     #[test]
