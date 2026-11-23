@@ -1,15 +1,18 @@
 //! Build the snapshot's tree locally and gather what the guards need to know about it. The user's
-//! index, branch, stash and refs are not touched: the tree is made in a temporary index, and
-//! `git write-tree` only stores objects, which nothing refers to.
+//! index, branch, stash, refs and object directory are not touched: the tree is made in a
+//! temporary index and its objects are stored in a scratch object directory (the repository's own
+//! objects are only an alternate to read from), so a tree the guards refuse leaves nothing behind
+//! once the [`Workspace`] is dropped.
 
 use crate::domain::argv::{Argv, Stdin};
 use crate::domain::ids::Commit;
 use crate::domain::sanitize::sanitize;
 use crate::domain::snapshot::{
-    BuiltTree, Entry, EntryKind, Facts, Inclusion, Link, Policy, Repo, TreeId, lfs_pointer_paths,
-    may_be_lfs_pointer, parse_ls_tree, parse_names, parse_not_in_head, toplevel,
+    BuiltTree, Entry, EntryKind, Facts, Inclusion, Link, ObjectStore, Policy, Repo, TreeId,
+    lfs_pointer_paths, may_be_lfs_pointer, parse_head, parse_ls_tree, parse_names,
+    parse_not_in_head, parse_unmerged, toplevel,
 };
-use crate::ports::{Exec, Scratch};
+use crate::ports::{Exec, Scratch, Workspace};
 use anyhow::{Result, bail};
 
 /// What git said, ready for the guards, and what the snapshot leaves out.
@@ -19,6 +22,9 @@ pub struct Built {
     /// Files the working tree has and `HEAD` does not, left out because untracked files are not
     /// included. Empty when they are.
     pub skipped: Vec<String>,
+    /// Holds the scratch objects the tree is stored in, which `git archive` still reads: it goes
+    /// when the caller drops it, once the tree is shipped or refused.
+    pub workspace: Workspace,
 }
 
 /// What git prints to stderr outside a repository.
@@ -40,19 +46,27 @@ fn locate_repo(exec: &dyn Exec) -> Result<Repo> {
 }
 
 /// The tree of the working tree: `base` plus the changes of tracked files (and the untracked files
-/// when asked), written from a temporary index.
+/// when asked), written from a temporary index into the scratch object directory.
 fn write_tree(
     exec: &dyn Exec,
-    scratch: &dyn Scratch,
+    workspace: &Workspace,
     repo: &Repo,
     base: &Commit,
     inclusion: Inclusion,
 ) -> Result<TreeId> {
-    let index = scratch.index()?;
-    let file = index.file();
-    read(exec, &repo.read_tree(file, base), "git read-tree")?;
-    read(exec, &repo.add(file, inclusion), "git add")?;
-    TreeId::parse(&read(exec, &repo.write_tree(file), "git write-tree")?)
+    let index = workspace.index();
+    read(exec, &repo.read_tree(index, base), "git read-tree")?;
+    read(exec, &repo.add(index, inclusion), "git add")?;
+    TreeId::parse(&read(exec, &repo.write_tree(index), "git write-tree")?)
+}
+
+/// The repository with a scratch object store for what the build stores, reading the repository's
+/// own objects through an alternate.
+fn in_scratch(exec: &dyn Exec, repo: Repo, workspace: &Workspace) -> Result<Repo> {
+    let printed = read(exec, &repo.objects_directory(), "git rev-parse --git-path")?;
+    let shared = repo.absolute_objects_directory(&printed)?;
+    let store = ObjectStore::new(workspace.objects(), &shared)?;
+    Ok(repo.in_scratch(store))
 }
 
 /// The target of every symlink, one `git cat-file` each: a repository has few of them.
@@ -91,48 +105,62 @@ fn find_lfs_pointers(
     }
 }
 
-/// What a snapshot of the working tree would leave out, for the user to see.
-fn find_skipped(exec: &dyn Exec, repo: &Repo, inclusion: Inclusion) -> Result<Vec<String>> {
-    match inclusion {
-        Inclusion::WithUntracked => Ok(vec![]),
-        Inclusion::TrackedOnly => {
-            let status = read(exec, &repo.status(), "git status")?;
-            Ok(parse_not_in_head(&status))
-        }
-    }
+/// What the working tree has beyond `HEAD`, from one `git status`.
+struct Status {
+    /// Left out of the snapshot when only tracked files are shipped, so empty when untracked files
+    /// are included.
+    left_out: Vec<String>,
+    unmerged: Vec<String>,
+}
+
+fn read_status(exec: &dyn Exec, repo: &Repo, inclusion: Inclusion) -> Result<Status> {
+    let text = read(exec, &repo.status(), "git status")?;
+    let left_out = match inclusion {
+        Inclusion::WithUntracked => vec![],
+        Inclusion::TrackedOnly => parse_not_in_head(&text),
+    };
+    Ok(Status {
+        left_out,
+        unmerged: parse_unmerged(&text),
+    })
 }
 
 /// Make the tree of the working tree and read the facts the guards judge it by.
 pub fn build(exec: &dyn Exec, scratch: &dyn Scratch, policy: &Policy) -> Result<Built> {
     let repo = locate_repo(exec)?;
-    let base = Commit::parse(&read(exec, &repo.head(), "git rev-parse HEAD")?)?;
+    let base = parse_head(&read(exec, &repo.head(), "git rev-parse HEAD")?)?;
     let head_tree = TreeId::parse(&read(exec, &repo.head_tree(), "git rev-parse HEAD^{tree}")?)?;
-    let tree = write_tree(exec, scratch, &repo, &base, policy.inclusion)?;
+    let workspace = scratch.workspace()?;
+    let repo = in_scratch(exec, repo, &workspace)?;
+    let tree = write_tree(exec, &workspace, &repo, &base, policy.inclusion)?;
     let entries = parse_ls_tree(&read(exec, &repo.ls_tree(&tree), "git ls-tree")?)?;
     let added = parse_names(&read(exec, &repo.added(&base, &tree), "git diff-tree")?);
     let links = read_links(exec, &repo, &entries)?;
     let lfs_pointers = find_lfs_pointers(exec, &repo, &tree, &entries)?;
-    let skipped = find_skipped(exec, &repo, policy.inclusion)?;
+    let Status { left_out, unmerged } = read_status(exec, &repo, policy.inclusion)?;
     let facts = Facts {
         base,
         head_tree,
         tree,
         entries,
         added,
+        left_out: left_out.clone(),
+        unmerged,
         links,
         lfs_pointers,
     };
     Ok(Built {
         repo,
         tree: BuiltTree::new(facts)?,
-        skipped,
+        skipped: left_out,
+        workspace,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::snapshot::{DirtyPolicy, SubmodulePolicy};
+    use crate::domain::snapshot::{Cleanliness, DirtyPolicy, SubmodulePolicy};
     use crate::ports::fake::{FakeExec, FakeScratch, Reply, output};
 
     const BASE: &str = "cccccccccccccccccccccccccccccccccccccccc";
@@ -160,6 +188,7 @@ mod tests {
             output(0, "/work/proj\n", ""),
             output(0, &format!("{BASE}\n"), ""),
             output(0, &format!("{HEAD_TREE}\n"), ""),
+            output(0, ".git/objects\n", ""),
             output(0, "", ""),
             output(0, "", ""),
             output(0, &format!("{TREE}\n"), ""),
@@ -190,47 +219,137 @@ mod tests {
         assert_eq!(scratch.taken.get(), 1);
         assert_eq!(
             scratch.dropped.get(),
-            1,
-            "the index is gone when build returns"
+            0,
+            "the objects stay until the caller is done with the tree"
         );
         let calls = words(&exec);
         assert_eq!(calls[0], "rev-parse --show-toplevel");
         assert!(
-            calls[3].starts_with("-C /work/proj read-tree "),
+            calls[3].ends_with("rev-parse --git-path objects"),
             "{}",
             calls[3]
         );
-        assert!(calls[4].ends_with("add -u"), "{}", calls[4]);
-        assert!(calls[5].ends_with("write-tree"), "{}", calls[5]);
         assert!(
-            calls[8].ends_with(&format!("cat-file blob {BLOB}")),
+            calls[4].starts_with("-C /work/proj read-tree "),
             "{}",
-            calls[8]
+            calls[4]
         );
-        let with_index: Vec<usize> = exec
-            .calls
-            .borrow()
-            .iter()
-            .enumerate()
-            .filter(|(_, (argv, _))| !argv.envs().is_empty())
-            .map(|(index, _)| index)
-            .collect();
-        assert_eq!(with_index, [3, 4, 5], "only read-tree, add and write-tree");
-        let argv = exec.calls.borrow()[3].0.clone();
-        assert_eq!(argv.envs()[0].value(), "/scratch/index");
+        assert!(calls[5].ends_with("add -u"), "{}", calls[5]);
+        assert!(calls[6].ends_with("write-tree"), "{}", calls[6]);
+        assert!(
+            calls[9].ends_with(&format!("cat-file blob {BLOB}")),
+            "{}",
+            calls[9]
+        );
+        assert_scratch_envs(&exec);
+        drop(built);
+        assert_eq!(scratch.dropped.get(), 1, "and go with it");
+    }
+
+    /// Which calls carry which of git's variables, by their place in the sequence of `replies`.
+    fn assert_scratch_envs(exec: &FakeExec) {
+        let names = |at: usize| -> Vec<String> {
+            let calls = exec.calls.borrow();
+            calls[at]
+                .0
+                .envs()
+                .iter()
+                .map(|v| v.name().to_string())
+                .collect()
+        };
+        let store = ["GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"];
+        assert!(
+            names(4).iter().eq(["GIT_INDEX_FILE"]),
+            "read-tree: index only"
+        );
+        for at in [5, 6] {
+            assert!(
+                names(at).iter().eq([store[0], store[1], "GIT_INDEX_FILE"]),
+                "{at}: {:?}",
+                names(at)
+            );
+        }
+        for at in [7, 8, 9] {
+            assert!(names(at).iter().eq(store), "{at}: {:?}", names(at));
+        }
+        for at in [0, 1, 2, 3, 10] {
+            assert!(names(at).is_empty(), "{at} must not touch the objects");
+        }
+        let calls = exec.calls.borrow();
+        let value = |at: usize, name: &str| {
+            calls[at]
+                .0
+                .envs()
+                .iter()
+                .find(|v| v.name() == name)
+                .unwrap()
+                .value()
+                .to_string()
+        };
+        assert_eq!(value(4, "GIT_INDEX_FILE"), "/scratch/index");
+        assert_eq!(value(5, "GIT_OBJECT_DIRECTORY"), "/scratch/objects");
+        assert_eq!(
+            value(5, "GIT_ALTERNATE_OBJECT_DIRECTORIES"),
+            "/work/proj/.git/objects"
+        );
+    }
+
+    /// The tree git built is `HEAD`'s (`HEAD_TREE`) while the working tree has a file staged as new,
+    /// or one renamed away, or a plain untracked one: that is not a clean snapshot.
+    #[test]
+    fn a_tree_equal_to_heads_is_dirty_when_the_working_tree_has_files_it_leaves_out() {
+        for status in [
+            "A  new.py\0",
+            "R  b.py\0a.py\0",
+            "?? scratch.txt\0",
+            "AM new.py\0",
+        ] {
+            let mut all = replies(false, vec![output(0, status, "")]);
+            all[6] = output(0, &format!("{HEAD_TREE}\n"), "");
+            let exec = FakeExec::new(all, vec![]);
+            let built = build(
+                &exec,
+                &FakeScratch::default(),
+                &policy(Inclusion::TrackedOnly),
+            )
+            .unwrap();
+            let cleared = built.tree.clear(&policy(Inclusion::TrackedOnly)).unwrap();
+            assert_eq!(cleared.cleanliness(), Cleanliness::Dirty, "{status:?}");
+        }
+        let mut all = replies(false, vec![output(0, " M big.py\0", "")]);
+        all[6] = output(0, &format!("{HEAD_TREE}\n"), "");
+        let built = build(
+            &FakeExec::new(all, vec![]),
+            &FakeScratch::default(),
+            &policy(Inclusion::TrackedOnly),
+        )
+        .unwrap();
+        let cleared = built.tree.clear(&policy(Inclusion::TrackedOnly)).unwrap();
+        assert_eq!(cleared.cleanliness(), Cleanliness::Clean);
+    }
+
+    #[test]
+    fn a_merge_in_progress_is_a_refusal_whatever_is_included() {
+        for inclusion in [Inclusion::TrackedOnly, Inclusion::WithUntracked] {
+            let exec = FakeExec::new(
+                replies(false, vec![output(0, "UU conflict.py\0", "")]),
+                vec![],
+            );
+            let built = build(&exec, &FakeScratch::default(), &policy(inclusion)).unwrap();
+            assert_eq!(
+                built.tree.clear(&policy(inclusion)).unwrap_err(),
+                crate::domain::snapshot::Refusal::Unmerged(vec!["conflict.py".into()])
+            );
+        }
     }
 
     #[test]
     fn untracked_files_are_added_with_a_dash_a_and_nothing_is_reported_skipped() {
-        let exec = FakeExec::new(replies(false, vec![]), vec![]);
+        let exec = FakeExec::new(replies(false, vec![output(0, "?? new.py\0", "")]), vec![]);
         let scratch = FakeScratch::default();
         let built = build(&exec, &scratch, &policy(Inclusion::WithUntracked)).unwrap();
         assert!(built.skipped.is_empty());
-        assert!(words(&exec)[4].ends_with("add -A"));
-        assert!(
-            !words(&exec).iter().any(|call| call.contains("status")),
-            "no status call when nothing is left out"
-        );
+        assert!(words(&exec)[5].ends_with("add -A"));
     }
 
     #[test]
@@ -239,8 +358,8 @@ mod tests {
         let exec = FakeExec::new(
             {
                 let mut r = replies(false, vec![output(0, "", "")]);
-                r[6] = output(0, &small, "");
-                r.insert(8, output(0, &format!("{TREE}:model.bin\0"), ""));
+                r[7] = output(0, &small, "");
+                r.insert(9, output(0, &format!("{TREE}:model.bin\0"), ""));
                 r
             },
             vec![],
@@ -278,8 +397,8 @@ mod tests {
         let small = format!("100644 blob {BLOB}     130\tx\0");
         let with_grep = |reply: Reply| {
             let mut r = replies(false, vec![output(0, "", "")]);
-            r[6] = output(0, &small, "");
-            r.insert(8, reply);
+            r[7] = output(0, &small, "");
+            r.insert(9, reply);
             FakeExec::new(r, vec![])
         };
         let p = policy(Inclusion::TrackedOnly);
@@ -314,7 +433,7 @@ mod tests {
             err.starts_with("snapshot mode needs a git repository"),
             "{err}"
         );
-        for failing in 1..8 {
+        for failing in 1..10 {
             let mut all = replies(false, vec![output(0, "", "")]);
             all.truncate(failing);
             all.push(output(128, "", "fatal: broken"));

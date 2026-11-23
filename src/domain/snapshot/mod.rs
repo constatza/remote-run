@@ -24,7 +24,7 @@ pub use gc::{
     RootEntry, Why, gc_lines, parse_report,
 };
 pub use gc_script::{Listed, Rechecked, Trashed, gc_script};
-pub use git::{IndexFile, Repo, toplevel};
+pub use git::{IndexFile, ObjectStore, Repo, ScratchObjects, parse_head, toplevel};
 pub use guard::{
     BuiltTree, Cleanliness, ClearedTree, DirtyPolicy, Facts, Inclusion, Link, LockFile, Policy,
     Refusal, ShippedSnapshot, SubmodulePolicy, UnsafeLink,
@@ -36,7 +36,7 @@ pub use remote::{
 };
 pub use tree::{
     Entry, EntryKind, ObjectId, TreeId, lfs_pointer_paths, may_be_lfs_pointer, parse_ls_tree,
-    parse_names, parse_not_in_head,
+    parse_names, parse_not_in_head, parse_unmerged,
 };
 
 /// Which way `rr run` gets code to the remote host.

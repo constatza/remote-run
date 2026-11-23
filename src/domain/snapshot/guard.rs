@@ -78,6 +78,12 @@ pub struct Facts {
     pub entries: Vec<Entry>,
     /// The paths the tree has and `base` does not.
     pub added: Vec<String>,
+    /// The paths the working tree has that `HEAD` does not and the tree leaves out (untracked files
+    /// and staged additions when only tracked files are shipped). The working tree is not the
+    /// snapshot while there are any.
+    pub left_out: Vec<String>,
+    /// The paths with an unresolved merge conflict; the files hold conflict markers.
+    pub unmerged: Vec<String>,
     /// The target of every symlink entry.
     pub links: Vec<Link>,
     /// The paths of git-lfs pointer files among the entries.
@@ -134,6 +140,12 @@ pub struct UnsafeLink {
     pub target: String,
 }
 
+impl fmt::Display for UnsafeLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} -> {}", self.path, self.target)
+    }
+}
+
 /// Why a snapshot was not shipped. A refusal is a result, not an error: nothing was sent, or
 /// nothing that exists was trusted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +160,8 @@ pub enum Refusal {
     LfsPointers(Vec<String>),
     UnsafeSymlinks(Vec<UnsafeLink>),
     SecretNames(Vec<String>),
+    /// A merge is in progress: these paths have conflicts, so their files hold conflict markers.
+    Unmerged(Vec<String>),
     /// `git archive` left files out (`export-ignore`) or added some.
     ArchiveMismatch {
         expected: usize,
@@ -191,21 +205,21 @@ impl fmt::Display for Refusal {
                  --allow-submodules ships the pointers",
                 listed(paths)
             ),
-            Refusal::UnsafeSymlinks(links) => {
-                let names: Vec<String> = links
-                    .iter()
-                    .map(|link| format!("{} -> {}", link.path, link.target))
-                    .collect();
-                write!(
-                    f,
-                    "symlinks that point out of the tree (an absolute target or `..`): {}",
-                    listed(&names)
-                )
-            }
+            Refusal::UnsafeSymlinks(links) => write!(
+                f,
+                "symlinks that point out of the tree (an absolute target or `..`): {}",
+                listed(&links.iter().map(UnsafeLink::to_string).collect::<Vec<_>>())
+            ),
             Refusal::SecretNames(paths) => write!(
                 f,
                 "untracked files with secret-looking names: {}; name each one with --allow-path \
                  to ship it anyway",
+                listed(paths)
+            ),
+            Refusal::Unmerged(paths) => write!(
+                f,
+                "a merge is in progress and these paths have conflicts: {}; resolve them (or abort \
+                 the merge) first",
                 listed(paths)
             ),
             Refusal::ArchiveMismatch { expected, found } => write!(
@@ -237,7 +251,9 @@ impl BuiltTree {
                 bail!("the target of the symlink {:?} was not read", entry.path);
             }
         }
-        let cleanliness = if facts.tree == facts.head_tree {
+        // the tree of a working tree with files `HEAD` lacks that were left out is `HEAD`'s tree,
+        // but the working tree is not that tree
+        let cleanliness = if facts.tree == facts.head_tree && facts.left_out.is_empty() {
             Cleanliness::Clean
         } else {
             Cleanliness::Dirty
@@ -245,10 +261,14 @@ impl BuiltTree {
         Ok(Self { facts, cleanliness })
     }
 
-    /// Check the tree against `policy`, in a fixed order: dirtiness, size, submodules and
-    /// lfs pointers, symlinks, secret names. The first guard that fails is the refusal.
+    /// Check the tree against `policy`, in a fixed order: a merge in progress, dirtiness, size,
+    /// submodules and lfs pointers, symlinks, secret names. The first guard that fails is the
+    /// refusal.
     pub fn clear(self, policy: &Policy) -> Result<ClearedTree, Refusal> {
         let Self { facts, cleanliness } = self;
+        if !facts.unmerged.is_empty() {
+            return Err(Refusal::Unmerged(facts.unmerged));
+        }
         match (cleanliness, policy.dirty) {
             (Cleanliness::Dirty, DirtyPolicy::Refuse) => return Err(Refusal::Dirty),
             (Cleanliness::Dirty | Cleanliness::Clean, DirtyPolicy::Allow)
@@ -440,6 +460,8 @@ mod tests {
             tree: TreeId::parse(A).unwrap(),
             entries,
             added: vec![],
+            left_out: vec![],
+            unmerged: vec![],
             links: vec![],
             lfs_pointers: vec![],
         }
@@ -486,6 +508,40 @@ mod tests {
         dirty.tree = TreeId::parse(B).unwrap();
         assert_eq!(clear(dirty, &strict).unwrap_err(), Refusal::Dirty);
         assert!(clear(facts(vec![file("a.py")]), &strict).is_ok());
+    }
+
+    /// `git add new.py` or `git mv a b`, or a plain untracked file, with only tracked files
+    /// shipped: the snapshot is `HEAD`'s tree but the working tree is not.
+    #[test]
+    fn files_the_snapshot_leaves_out_make_it_dirty_even_when_the_tree_is_heads() {
+        for left_out in [vec!["new.py".to_string()], vec!["b.py".to_string()]] {
+            let mut f = facts(vec![file("a.py")]);
+            f.left_out = left_out;
+            let cleared = clear(f, &policy()).unwrap();
+            assert_eq!(cleared.cleanliness(), Cleanliness::Dirty);
+            let mut f = facts(vec![file("a.py")]);
+            f.left_out = vec!["new.py".into()];
+            let strict = Policy {
+                dirty: DirtyPolicy::Refuse,
+                ..policy()
+            };
+            assert_eq!(clear(f, &strict).unwrap_err(), Refusal::Dirty);
+        }
+    }
+
+    #[test]
+    fn a_merge_in_progress_is_refused_before_anything_else() {
+        let mut f = facts(vec![file("a.py")]);
+        f.unmerged = vec!["a.py".into()];
+        f.tree = TreeId::parse(B).unwrap();
+        let strict = Policy {
+            dirty: DirtyPolicy::Refuse,
+            limit: 0,
+            ..policy()
+        };
+        let refusal = clear(f, &strict).unwrap_err();
+        assert_eq!(refusal, Refusal::Unmerged(vec!["a.py".into()]));
+        assert!(refusal.to_string().contains("a merge is in progress"));
     }
 
     #[test]

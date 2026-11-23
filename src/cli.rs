@@ -163,6 +163,15 @@ impl TryFrom<ModeFlags> for Mode {
                  --require-clean need --mode snapshot"
             ),
             ModeName::Checkout => Ok(Mode::Checkout),
+            // an allowed path names an untracked file; with tracked files only it would do nothing
+            ModeName::Snapshot
+                if !flags.allowed.is_empty()
+                    && flags.inclusion != Some(Inclusion::WithUntracked) =>
+            {
+                anyhow::bail!(
+                    "--allow-path names an untracked file, so it needs --include-untracked"
+                )
+            }
             ModeName::Snapshot => Ok(Mode::Snapshot(Policy {
                 inclusion: flags.inclusion.unwrap_or(Inclusion::TrackedOnly),
                 allowed: flags.allowed,
@@ -768,6 +777,33 @@ mod tests {
                 assert!(err.contains("need --mode snapshot"), "{args:?}: {err}");
             }
         }
+    }
+
+    #[test]
+    fn an_allowed_path_without_untracked_files_is_refused_not_ignored() {
+        let err = mode_of(&[
+            "run",
+            "--mode",
+            "snapshot",
+            "--allow-path",
+            "a.pem",
+            "--",
+            "ls",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("needs --include-untracked"), "{err}");
+        let both = [
+            "run",
+            "--mode",
+            "snapshot",
+            "--include-untracked",
+            "--allow-path",
+            "a.pem",
+            "--",
+            "ls",
+        ];
+        assert!(mode_of(&both).is_ok());
     }
 
     #[test]

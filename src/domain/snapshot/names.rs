@@ -31,13 +31,26 @@ impl AllowedPath {
 }
 
 /// Names that are exactly this.
-const SECRET_NAMES: [&str; 3] = [".netrc", ".npmrc", ".pypirc"];
+const SECRET_NAMES: [&str; 4] = [".netrc", ".npmrc", ".pypirc", ".ssh"];
 /// Names that start with this: `.env`, `.env.local`, an ssh key `id_ed25519`.
 const SECRET_PREFIXES: [&str; 2] = [".env", "id_"];
 /// Names that end with this: certificates and keys.
-const SECRET_SUFFIXES: [&str; 4] = [".pem", ".key", ".p12", ".kdbx"];
-/// Names that hold this anywhere: cloud credential files.
+const SECRET_SUFFIXES: [&str; 8] = [
+    ".pem",
+    ".key",
+    ".p12",
+    ".kdbx",
+    ".pfx",
+    ".jks",
+    ".gpg",
+    ".htpasswd",
+];
+/// Names that hold this anywhere: cloud credential files (and `.git-credentials`).
 const SECRET_PART: &str = "credentials";
+/// A cloud service account's key file: `service-account.json`, `service-account-prod.json`.
+const SERVICE_ACCOUNT: (&str, &str) = ("service-account", ".json");
+/// A directory and the file in it that is the secret, not the rest of the directory.
+const SECRET_IN_DIRECTORY: (&str, &str) = (".kube", "config");
 
 /// Whether one path component looks like a secret (ASCII case ignored). A deny list is a net with
 /// holes (`secrets.yaml` passes), which is why untracked files are opt-in at all; this only stops
@@ -50,12 +63,17 @@ fn component_is_secret(component: &str) -> bool {
             .any(|prefix| name.starts_with(prefix))
         || SECRET_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
         || name.contains(SECRET_PART)
+        || (name.starts_with(SERVICE_ACCOUNT.0) && name.ends_with(SERVICE_ACCOUNT.1))
 }
 
 /// Whether any part of `path` looks like a secret: a file named so, or one inside a directory
 /// named so.
 pub fn looks_secret(path: &str) -> bool {
-    path.split('/').any(component_is_secret)
+    let components: Vec<String> = path.split('/').map(str::to_ascii_lowercase).collect();
+    components.iter().any(|part| component_is_secret(part))
+        || components
+            .windows(2)
+            .any(|pair| pair[0] == SECRET_IN_DIRECTORY.0 && pair[1] == SECRET_IN_DIRECTORY.1)
 }
 
 #[cfg(test)]
@@ -81,6 +99,18 @@ mod tests {
             ".pypirc",
             "bundle.p12",
             ".env/anything.txt",
+            "certs/client.pfx",
+            "store.jks",
+            "backup.GPG",
+            "web/.htpasswd",
+            "users.htpasswd",
+            ".git-credentials",
+            ".ssh/id_x",
+            "home/.ssh/config",
+            ".kube/config",
+            "deploy/.kube/config",
+            "service-account.json",
+            "gcp/service-account-prod.json",
         ] {
             assert!(looks_secret(path), "{path}");
         }
@@ -97,6 +127,11 @@ mod tests {
             "idle.py",
             "secrets.yaml",
             "src/id.py",
+            ".kube/cache/x",
+            "ssh/config",
+            "service-accounts.txt",
+            "service-account.yaml",
+            "kube/config",
         ] {
             assert!(!looks_secret(path), "{path}");
         }

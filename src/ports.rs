@@ -6,7 +6,7 @@ pub use crate::domain::argv::{Argv, Captured, CapturedBytes, Payload, Stdin};
 use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath};
 use crate::domain::sanitize::sanitize_bytes;
 use crate::domain::shell::Script;
-use crate::domain::snapshot::IndexFile;
+use crate::domain::snapshot::{IndexFile, ScratchObjects};
 pub use crate::domain::ssh::Terminal;
 use anyhow::Result;
 use std::io::{self, BufRead, Read, Write};
@@ -255,31 +255,43 @@ pub trait Remote {
     ) -> Result<Teed>;
 }
 
-/// A private temporary index file for git, and what removes it. Dropping the value removes the file,
-/// so the user's own index is never the one a snapshot is built in.
-pub struct ScratchIndex {
-    file: IndexFile,
+/// A private temporary index file and object directory for git, and what removes them. Dropping
+/// the value removes both, so the user's own index and object directory are never the ones a
+/// snapshot is built in.
+pub struct Workspace {
+    index: IndexFile,
+    objects: ScratchObjects,
     // held for its `Drop`: the adapter's temporary directory
     _removes_on_drop: Box<dyn std::any::Any>,
 }
 
-impl ScratchIndex {
-    pub fn new(file: IndexFile, removes_on_drop: Box<dyn std::any::Any>) -> Self {
+impl Workspace {
+    pub fn new(
+        index: IndexFile,
+        objects: ScratchObjects,
+        removes_on_drop: Box<dyn std::any::Any>,
+    ) -> Self {
         Self {
-            file,
+            index,
+            objects,
             _removes_on_drop: removes_on_drop,
         }
     }
 
-    pub fn file(&self) -> &IndexFile {
-        &self.file
+    pub fn index(&self) -> &IndexFile {
+        &self.index
+    }
+
+    pub fn objects(&self) -> &ScratchObjects {
+        &self.objects
     }
 }
 
 /// Where the temporary files `rr` needs locally come from (the only port that creates files).
 pub trait Scratch {
-    /// A path git may create an index file at, in a directory only the user can use.
-    fn index(&self) -> Result<ScratchIndex>;
+    /// A path git may create an index file at and a directory it may store objects in, inside a
+    /// directory only the user can use.
+    fn workspace(&self) -> Result<Workspace>;
 }
 
 /// A point on a monotonic clock: the time since that clock started. Only a [`Clock`] hands one out,
@@ -563,12 +575,15 @@ pub mod fake {
     /// The index path every [`FakeScratch`] hands out.
     pub const FAKE_INDEX: &str = "/scratch/index";
 
+    /// The object directory every [`FakeScratch`] hands out.
+    pub const FAKE_OBJECTS: &str = "/scratch/objects";
+
     impl Scratch for FakeScratch {
-        fn index(&self) -> Result<ScratchIndex> {
+        fn workspace(&self) -> Result<Workspace> {
             self.taken.set(self.taken.get() + 1);
-            let file = IndexFile::parse(FAKE_INDEX)?;
-            Ok(ScratchIndex::new(
-                file,
+            Ok(Workspace::new(
+                IndexFile::parse(FAKE_INDEX)?,
+                ScratchObjects::parse(FAKE_OBJECTS)?,
                 Box::new(CountsDrop(Rc::clone(&self.dropped))),
             ))
         }

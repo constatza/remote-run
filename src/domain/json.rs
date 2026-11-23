@@ -72,6 +72,7 @@ enum SnapshotReason {
     LfsPointers,
     UnsafeSymlinks,
     SecretNames,
+    MergeInProgress,
     ArchiveMismatch,
     SnapshotNotPrivate,
 }
@@ -256,6 +257,7 @@ fn snapshot(refusal: &Refusal) -> SnapshotBody {
             Refusal::LfsPointers(_) => SnapshotReason::LfsPointers,
             Refusal::UnsafeSymlinks(_) => SnapshotReason::UnsafeSymlinks,
             Refusal::SecretNames(_) => SnapshotReason::SecretNames,
+            Refusal::Unmerged(_) => SnapshotReason::MergeInProgress,
             Refusal::ArchiveMismatch { .. } => SnapshotReason::ArchiveMismatch,
             Refusal::RemoteNotPrivate { .. } => SnapshotReason::SnapshotNotPrivate,
         },
@@ -455,6 +457,7 @@ mod tests {
                 "unsafe_symlinks",
             ),
             (Refusal::SecretNames(vec![".env".into()]), "secret_names"),
+            (Refusal::Unmerged(vec!["a.py".into()]), "merge_in_progress"),
             (
                 Refusal::ArchiveMismatch {
                     expected: 3,

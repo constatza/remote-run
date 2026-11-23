@@ -5,11 +5,11 @@ use crate::domain::argv::{Argv, Captured, CapturedBytes, Payload, Stdin};
 use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath, listener_held};
 use crate::domain::host::Host;
 use crate::domain::shell::Script;
-use crate::domain::snapshot::IndexFile;
+use crate::domain::snapshot::{IndexFile, ScratchObjects};
 use crate::domain::ssh::{Liveness, Terminal, ssh_argv};
 use crate::ports::{
-    Child as PortChild, Clock, Echo, Ended, Exec, Instant, Net, Ownership, Remote, Scratch,
-    ScratchIndex, Teed, tee_lines, write_sanitized,
+    Child as PortChild, Clock, Echo, Ended, Exec, Instant, Net, Ownership, Remote, Scratch, Teed,
+    Workspace, tee_lines, write_sanitized,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::{self, Write};
@@ -641,10 +641,10 @@ fn stream_filtered_with(
 pub struct OsScratch;
 
 impl Scratch for OsScratch {
-    fn index(&self) -> Result<ScratchIndex> {
+    fn workspace(&self) -> Result<Workspace> {
         let mut builder = tempfile::Builder::new();
         builder.prefix("rr-snapshot-");
-        // the directory holds only the user's index; no one else may enter it
+        // the directory holds only the user's index and objects; no one else may enter it
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -652,13 +652,18 @@ impl Scratch for OsScratch {
         }
         let dir = builder
             .tempdir()
-            .context("could not create a temporary directory for the snapshot index")?;
-        let path = dir.path().join("index");
-        let path = path
-            .to_str()
-            .context("the temporary directory is not valid UTF-8")?;
-        let file = IndexFile::parse(path)?;
-        Ok(ScratchIndex::new(file, Box::new(dir)))
+            .context("could not create a temporary directory for the snapshot")?;
+        let objects = dir.path().join("objects");
+        std::fs::create_dir(&objects)
+            .context("could not create the snapshot's scratch object directory")?;
+        let utf8 = |path: &std::path::Path| {
+            path.to_str()
+                .map(str::to_string)
+                .context("the temporary directory is not valid UTF-8")
+        };
+        let index = IndexFile::parse(&utf8(&dir.path().join("index"))?)?;
+        let objects = ScratchObjects::parse(&utf8(&objects)?)?;
+        Ok(Workspace::new(index, objects, Box::new(dir)))
     }
 }
 
@@ -908,11 +913,11 @@ mod tests {
     }
 
     #[test]
-    fn the_scratch_index_is_a_fresh_path_in_a_private_directory_removed_on_drop() {
+    fn the_scratch_workspace_is_a_fresh_path_in_a_private_directory_removed_on_drop() {
         use std::os::unix::fs::PermissionsExt;
-        let first = OsScratch.index().unwrap();
-        let second = OsScratch.index().unwrap();
-        let path = |index: &ScratchIndex| index.file().to_string();
+        let first = OsScratch.workspace().unwrap();
+        let second = OsScratch.workspace().unwrap();
+        let path = |space: &Workspace| space.index().to_string();
         assert_ne!(path(&first), path(&second));
         let dir = std::path::Path::new(&path(&first))
             .parent()
@@ -920,6 +925,7 @@ mod tests {
             .to_owned();
         assert_eq!(dir.metadata().unwrap().permissions().mode() & 0o077, 0);
         assert!(dir.is_dir());
+        assert!(dir.join("objects").is_dir(), "a scratch object directory");
         drop(first);
         assert!(!dir.exists(), "the directory goes with the value");
     }

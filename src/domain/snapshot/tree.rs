@@ -159,25 +159,43 @@ pub fn lfs_pointer_paths(
     Ok(found)
 }
 
+/// The status codes (`XY`) git prints for a path with an unresolved merge conflict.
+const UNMERGED_CODES: [&str; 7] = ["UU", "AA", "DD", "AU", "UA", "DU", "UD"];
+
+/// Each entry of `git status --porcelain=v1 -z` as its code and path. A rename or copy is followed
+/// by its old name as a field of its own, which is skipped: it is not an entry.
+fn status_entries(status_z: &str) -> Vec<(&str, &str)> {
+    let mut fields = status_z.split('\0').filter(|field| !field.is_empty());
+    let mut entries = Vec::new();
+    while let Some(field) = fields.next() {
+        let (code, path) = field.split_at(field.len().min(2));
+        let path = path.strip_prefix(' ').unwrap_or(path);
+        if code.contains(['R', 'C']) {
+            fields.next();
+        }
+        entries.push((code, path));
+    }
+    entries
+}
+
 /// The paths a working tree has that `HEAD` does not, from `git status --porcelain=v1 -z`: the
 /// untracked ones (`??`) and the new names of staged additions, renames and copies. `git add -u`
 /// leaves exactly these out of the snapshot.
 pub fn parse_not_in_head(status_z: &str) -> Vec<String> {
-    let mut fields = status_z.split('\0').filter(|field| !field.is_empty());
-    let mut found = Vec::new();
-    while let Some(field) = fields.next() {
-        let (code, path) = field.split_at(field.len().min(2));
-        let path = path.strip_prefix(' ').unwrap_or(path);
-        let renamed = code.contains(['R', 'C']);
-        if renamed {
-            // `-z` prints the new name, then the old one as a field of its own
-            fields.next();
-        }
-        if code == "??" || code.contains(['A', 'R', 'C']) {
-            found.push(path.to_string());
-        }
-    }
-    found
+    status_entries(status_z)
+        .into_iter()
+        .filter(|(code, _)| *code == "??" || code.contains(['A', 'R', 'C']))
+        .map(|(_, path)| path.to_string())
+        .collect()
+}
+
+/// The paths with an unresolved merge conflict. A tree that holds one has conflict markers in it.
+pub fn parse_unmerged(status_z: &str) -> Vec<String> {
+    status_entries(status_z)
+        .into_iter()
+        .filter(|(code, _)| UNMERGED_CODES.contains(code))
+        .map(|(_, path)| path.to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -288,5 +306,24 @@ mod tests {
         assert!(parse_not_in_head("").is_empty());
         // the field after a rename is its old name, whatever it looks like
         assert_eq!(parse_not_in_head("R  b\0?? old\0"), ["b"]);
+    }
+
+    #[test]
+    fn unmerged_paths_are_the_seven_conflict_codes() {
+        let status = "UU both.py\0AA add.py\0DD gone.py\0AU ours.py\0UA theirs.py\0\
+                      DU a.py\0UD b.py\0 M fine.py\0A  new.py\0R  new\0UU old\0?? u.py\0";
+        assert_eq!(
+            parse_unmerged(status),
+            [
+                "both.py",
+                "add.py",
+                "gone.py",
+                "ours.py",
+                "theirs.py",
+                "a.py",
+                "b.py"
+            ]
+        );
+        assert!(parse_unmerged("").is_empty());
     }
 }

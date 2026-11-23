@@ -132,7 +132,10 @@ pub fn run(
         Ok(cleared) => cleared,
         Err(refusal) => return Ok(Outcome::SnapshotRefused(refusal)),
     };
-    let (snapshot, delivery) = match ship(&place, cleared, &built.repo, ports)? {
+    let shipment = ship(&place, cleared, &built.repo, ports)?;
+    // the scratch objects are only needed to archive the tree, which `ship` has done
+    drop(built.workspace);
+    let (snapshot, delivery) = match shipment {
         Shipment::Shipped { snapshot, delivery } => (snapshot, delivery),
         Shipment::Refused(refusal) => return Ok(Outcome::SnapshotRefused(refusal)),
     };
@@ -188,6 +191,7 @@ mod tests {
             output(0, "/work/proj\n", ""),
             output(0, &format!("{BASE}\n"), ""),
             output(0, &format!("{HEAD_TREE}\n"), ""),
+            output(0, ".git/objects\n", ""),
             output(0, "", ""),
             output(0, "", ""),
             output(0, &format!("{TREE}\n"), ""),

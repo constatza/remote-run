@@ -451,3 +451,159 @@ fn gc_with_a_queue_it_cannot_read_deletes_nothing_and_exits_3() {
         "below the floor is a usage error"
     );
 }
+
+impl World {
+    /// Every file under the repository's object directory: loose objects, packs, their indexes.
+    fn objects(&self) -> Vec<PathBuf> {
+        fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&self.path("repo/.git/objects"), &mut found);
+        found.sort();
+        found
+    }
+}
+
+/// Building the tree stores its objects in a scratch directory, so a tree a guard refuses (a
+/// secret-named file, a file over the limit) leaves nothing in the user's `.git/objects`, and a
+/// tree that is shipped still archives from the scratch objects.
+#[test]
+fn a_refused_or_shipped_build_leaves_no_object_in_the_users_repository() {
+    if !git_available() {
+        return;
+    }
+    let world = World::new();
+    let before = world.objects();
+    world.write(".env", "TOKEN=hunter2\n");
+    let secret = world.snapshot_run(&["--include-untracked"], &["true"]);
+    assert_eq!(secret.status.code(), Some(3), "{}", text(&secret.stderr));
+    world.write(".env", "ok\n");
+    fs::rename(world.path("repo/.env"), world.path("repo/big.bin")).unwrap();
+    world.write("big.bin", &"x".repeat(5000));
+    let big = world.snapshot_run(
+        &["--include-untracked", "--snapshot-limit", "1K"],
+        &["true"],
+    );
+    assert_eq!(big.status.code(), Some(3), "{}", text(&big.stderr));
+    assert_eq!(world.objects(), before, "refused builds stored nothing");
+    world.write("a.py", "print('changed')\n");
+    let shipped = world.snapshot_run(&["--include-untracked"], &["cat", "a.py"]);
+    assert_eq!(shipped.status.code(), Some(0), "{}", text(&shipped.stderr));
+    assert_eq!(text(&shipped.stdout), "print('changed')\n");
+    assert_eq!(
+        world.objects(),
+        before,
+        "a shipped build stored nothing either"
+    );
+}
+
+/// `--require-clean` and `RR_DIRTY` describe the working tree, not only the tree git builds: a file
+/// staged as new, a rename and a plain untracked file are all things the snapshot leaves out.
+#[test]
+fn require_clean_sees_files_the_snapshot_leaves_out() {
+    if !git_available() {
+        return;
+    }
+    let clean = World::new();
+    let ok = clean.snapshot_run(&["--require-clean"], &["echo", "$RR_DIRTY"]);
+    assert_eq!(ok.status.code(), Some(0), "{}", text(&ok.stderr));
+    for (name, change) in [
+        ("staged new", &["add", "new.py"][..]),
+        ("renamed", &["mv", "a.py", "c.py"]),
+        ("untracked", &["status"]),
+    ] {
+        let world = World::new();
+        world.write("new.py", "x = 1\n");
+        world.git(change);
+        let refused = world.snapshot_run(&["--require-clean"], &["true"]);
+        assert_eq!(
+            refused.status.code(),
+            Some(3),
+            "{name}: {}",
+            text(&refused.stderr)
+        );
+        assert!(world.scripts().is_empty(), "{name}");
+        let marked = world.snapshot_run(&[], &["sh", "-c", "echo dirty=$RR_DIRTY"]);
+        assert_eq!(
+            text(&marked.stdout),
+            "dirty=true\n",
+            "{name}: {}",
+            text(&marked.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_merge_in_progress_is_refused_before_anything_is_sent() {
+    if !git_available() {
+        return;
+    }
+    let world = World::new();
+    world.git(&["checkout", "-q", "-b", "side"]);
+    world.write("a.py", "print('side')\n");
+    world.git(&["commit", "-q", "-am", "side"]);
+    world.git(&["checkout", "-q", "main"]);
+    world.write("a.py", "print('main')\n");
+    world.git(&["commit", "-q", "-am", "main"]);
+    let merge = world
+        .git_command()
+        .args(["merge", "side"])
+        .output()
+        .unwrap();
+    assert!(!merge.status.success(), "the merge must conflict");
+    for flags in [&[][..], &["--include-untracked"]] {
+        let run = world.snapshot_run(flags, &["true"]);
+        assert_eq!(run.status.code(), Some(3), "{}", text(&run.stderr));
+        assert!(
+            text(&run.stderr).contains("a merge is in progress"),
+            "{}",
+            text(&run.stderr)
+        );
+    }
+    assert!(world.scripts().is_empty());
+}
+
+#[test]
+fn an_allowed_path_without_untracked_files_is_refused() {
+    if !git_available() {
+        return;
+    }
+    let world = World::new();
+    let out = world.snapshot_run(&["--allow-path", ".env"], &["true"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("needs --include-untracked"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// A git-lfs pointer written with CRLF line ends is still a pointer, and a file that only looks a
+/// little like one is not.
+#[test]
+fn an_lfs_pointer_with_crlf_line_ends_is_refused() {
+    if !git_available() {
+        return;
+    }
+    let world = World::new();
+    world.write(
+        "model.bin",
+        "version https://git-lfs.github.com/spec/v1\r\noid sha256:abc\r\nsize 5\r\n",
+    );
+    world.write("note.txt", "version https://git-lfs.github.com/spec/v1r\n");
+    world.git(&["add", "-A"]);
+    world.git(&["commit", "-q", "-m", "pointers"]);
+    let refused = world.snapshot_run(&[], &["true"]);
+    assert_eq!(refused.status.code(), Some(3), "{}", text(&refused.stderr));
+    let stderr = text(&refused.stderr);
+    assert!(stderr.contains("model.bin"), "{stderr}");
+    assert!(!stderr.contains("note.txt"), "{stderr}");
+}
