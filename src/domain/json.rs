@@ -12,7 +12,7 @@ use crate::domain::outcome::{Outcome, TrustState};
 use crate::domain::pull::{PullOutcome, Reason};
 use crate::domain::sanitize::sanitize;
 use crate::domain::slurm::{JobStatus, WaitOutcome};
-use crate::domain::snapshot::Refusal;
+use crate::domain::snapshot::{GcOutcome, GcRefusal, GcReport, Refusal, Why};
 use crate::domain::status::{LogTail, StatusReport};
 use crate::domain::transfer::Transfer;
 use serde::Serialize;
@@ -49,6 +49,7 @@ enum Body {
     Status(StatusBody),
     Forward(ForwardBody),
     Snapshot(SnapshotBody),
+    Gc(GcBody),
 }
 
 /// A snapshot that was not shipped.
@@ -73,6 +74,46 @@ enum SnapshotReason {
     SecretNames,
     ArchiveMismatch,
     SnapshotNotPrivate,
+}
+
+/// How `rr gc` ended. Names are full directory names (a tree id, or `.tmp-…` and `.trash-…`).
+#[derive(Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+enum GcBody {
+    Cleaned {
+        removed: Vec<String>,
+        kept: Vec<KeptJson>,
+        /// set aside as `.trash-…` but not fully removed
+        failed: Vec<String>,
+    },
+    Refused {
+        reason: GcReason,
+        detail: String,
+    },
+}
+
+#[derive(Serialize)]
+struct KeptJson {
+    name: String,
+    why: WhyJson,
+}
+
+/// Why an entry stayed, as a name a script can match on.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WhyJson {
+    Newest,
+    Young,
+    InUse,
+    NotYours,
+    Error,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GcReason {
+    RootNotSafe,
+    QueueUnreadable,
 }
 
 /// How a forward that `rr` closed ended.
@@ -222,6 +263,43 @@ fn snapshot(refusal: &Refusal) -> SnapshotBody {
     }
 }
 
+fn gc(outcome: &GcOutcome) -> GcBody {
+    match outcome {
+        GcOutcome::Cleaned(report) => cleaned(report),
+        GcOutcome::Refused(why) => GcBody::Refused {
+            reason: match why {
+                GcRefusal::RootNotSafe => GcReason::RootNotSafe,
+                GcRefusal::QueueUnreadable => GcReason::QueueUnreadable,
+            },
+            detail: clean(&why.to_string()),
+        },
+    }
+}
+
+fn cleaned(report: &GcReport) -> GcBody {
+    let names = |entries: &[crate::domain::snapshot::RootEntry]| {
+        entries.iter().map(|entry| clean(entry.name())).collect()
+    };
+    GcBody::Cleaned {
+        removed: names(&report.removed),
+        kept: report
+            .kept
+            .iter()
+            .map(|kept| KeptJson {
+                name: clean(kept.entry.name()),
+                why: match kept.why {
+                    Why::Newest => WhyJson::Newest,
+                    Why::Young => WhyJson::Young,
+                    Why::InUse => WhyJson::InUse,
+                    Why::NotYours => WhyJson::NotYours,
+                    Why::Error => WhyJson::Error,
+                },
+            })
+            .collect(),
+        failed: names(&report.failed),
+    }
+}
+
 fn wait(outcome: &WaitOutcome) -> WaitBody {
     match outcome {
         WaitOutcome::Completed(rows) => WaitBody::Completed { jobs: jobs(rows) },
@@ -285,6 +363,7 @@ fn parts(outcome: &Outcome) -> (Source, Body) {
             Closed::SshEnded(_) => (Source::Remote, Body::Forward(ForwardBody::SshEnded)),
         },
         Outcome::SnapshotRefused(refusal) => (Source::Rr, Body::Snapshot(snapshot(refusal))),
+        Outcome::Gc(outcome) => (Source::Rr, Body::Gc(gc(outcome))),
     }
 }
 
@@ -400,6 +479,81 @@ mod tests {
             assert_eq!(value["reason"], reason);
             let detail = value["detail"].as_str().unwrap();
             assert!(!detail.contains('\u{1b}'), "{detail:?}");
+        }
+    }
+
+    #[test]
+    fn a_clean_up_lists_what_went_what_stayed_and_why() {
+        use crate::domain::snapshot::{GcOutcome, GcReport, Kept, RootEntry, Why};
+        let entry = |name: &str| RootEntry::parse(name).unwrap();
+        let report = GcReport {
+            removed: vec![entry(A), entry(".tmp-old")],
+            kept: vec![
+                Kept {
+                    entry: entry(B),
+                    why: Why::InUse,
+                },
+                Kept {
+                    entry: entry(".tmp-new"),
+                    why: Why::Young,
+                },
+                Kept {
+                    entry: entry(".trash-x"),
+                    why: Why::NotYours,
+                },
+            ],
+            failed: vec![],
+        };
+        let (value, exit) = json_of(&Outcome::Gc(GcOutcome::Cleaned(report)));
+        assert_eq!(exit, Exit::Success);
+        assert_eq!(
+            value,
+            json!({
+                "source": "rr", "exit": 0, "kind": "gc", "result": "cleaned",
+                "removed": [A, ".tmp-old"],
+                "kept": [
+                    {"name": B, "why": "in_use"},
+                    {"name": ".tmp-new", "why": "young"},
+                    {"name": ".trash-x", "why": "not_yours"},
+                ],
+                "failed": [],
+            })
+        );
+    }
+
+    #[test]
+    fn a_clean_up_that_left_something_half_removed_fails_and_a_refusal_names_its_reason() {
+        use crate::domain::snapshot::{GcOutcome, GcRefusal, GcReport, RootEntry};
+        let entry = |name: &str| RootEntry::parse(name).unwrap();
+        let failing = GcReport {
+            failed: vec![entry(A)],
+            ..GcReport::default()
+        };
+        let (value, exit) = json_of(&Outcome::Gc(GcOutcome::Cleaned(failing)));
+        assert_eq!(
+            (value["failed"][0].as_str(), exit),
+            (Some(A), Exit::Rr(RrCode::Failure))
+        );
+        for (why, name) in [
+            (GcRefusal::RootNotSafe, "root_not_safe"),
+            (GcRefusal::QueueUnreadable, "queue_unreadable"),
+        ] {
+            let (value, exit) = json_of(&Outcome::Gc(GcOutcome::Refused(why)));
+            assert_eq!(exit, Exit::Rr(RrCode::Refused));
+            assert_eq!(
+                (
+                    value["kind"].as_str(),
+                    value["result"].as_str(),
+                    value["reason"].as_str()
+                ),
+                (Some("gc"), Some("refused"), Some(name))
+            );
+            assert!(
+                value["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("nothing was deleted")
+            );
         }
     }
 

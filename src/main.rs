@@ -240,6 +240,7 @@ fn dispatch(
             app::run::run(session, args, ports)
         }
         RemoteCmd::Fwd(args) => fwd(session, args, ports, env),
+        RemoteCmd::Gc(args) => app::gc::run(session, args.into(), ports),
         RemoteCmd::Get {
             remote,
             local,

@@ -15,6 +15,7 @@ pub mod cancel;
 mod copy;
 pub mod exec;
 pub mod fwd;
+pub mod gc;
 pub mod get;
 mod git;
 pub mod log;

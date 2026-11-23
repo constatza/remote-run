@@ -357,3 +357,97 @@ fn checkout_stays_the_default_and_a_snapshot_flag_without_the_mode_is_refused() 
     assert!(text(&out.stderr).contains("need --mode snapshot"));
     assert!(world.scripts().is_empty());
 }
+
+impl World {
+    /// A `squeue` on the stand-in remote's `PATH` that lists these `<id> <directory>` lines.
+    fn queue(&self, lines: &[String]) {
+        let squeue = self.path("bin/squeue");
+        let body: String = lines
+            .iter()
+            .map(|line| format!("echo '{line}'\n"))
+            .collect();
+        fs::write(&squeue, format!("#!/bin/sh\n{body}exit 0\n")).unwrap();
+        fs::set_permissions(&squeue, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Pretend the snapshot was last run in `days` days ago.
+    fn last_used(&self, name: &str, days: u64) {
+        let used = self
+            .path("remote/proj/.rr-snapshots")
+            .join(name)
+            .join(".rr-used");
+        let status = Command::new("touch")
+            .arg("-d")
+            .arg(format!("{days} days ago"))
+            .arg(used)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+#[test]
+fn gc_removes_an_old_snapshot_and_keeps_one_a_job_runs_from() {
+    if !git_available() {
+        return;
+    }
+    let world = World::new();
+    world.write("a.py", "print('one')\n");
+    assert_eq!(world.snapshot_run(&[], &["true"]).status.code(), Some(0));
+    world.write("a.py", "print('two')\n");
+    assert_eq!(world.snapshot_run(&[], &["true"]).status.code(), Some(0));
+    let names = world.snapshots();
+    assert_eq!(names.len(), 2);
+    for name in &names {
+        world.last_used(name, 30);
+    }
+    let busy = fs::canonicalize(world.path("remote/proj/.rr-snapshots").join(&names[0])).unwrap();
+    world.queue(&[format!("41 {}/src", busy.display())]);
+
+    let out = world.rr(&["gc", "--older-than", "7d"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let shown = text(&out.stdout);
+    assert!(shown.contains(&format!("removed {}", names[1])), "{shown}");
+    assert!(
+        shown.contains(&format!("kept {} (an active job runs from it)", names[0])),
+        "{shown}"
+    );
+    assert_eq!(world.snapshots(), [names[0].clone()]);
+
+    let json = world.rr(&["--json", "gc", "--older-than", "7d"]);
+    let document: serde_json::Value = serde_json::from_str(text(&json.stdout).trim()).unwrap();
+    assert_eq!(document["kind"], "gc");
+    assert_eq!(document["result"], "cleaned");
+    assert_eq!(document["kept"][0]["why"], "in_use");
+    assert_eq!(document["exit"], 0);
+}
+
+#[test]
+fn gc_with_a_queue_it_cannot_read_deletes_nothing_and_exits_3() {
+    if !git_available() {
+        return;
+    }
+    let world = World::new();
+    assert_eq!(world.snapshot_run(&[], &["true"]).status.code(), Some(0));
+    let names = world.snapshots();
+    world.last_used(&names[0], 30);
+    let squeue = world.path("bin/squeue");
+    fs::write(&squeue, "#!/bin/sh\necho 'slurm down' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&squeue, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = world.rr(&["gc", "--older-than", "1h"]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("nothing was deleted"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(world.snapshots(), names);
+
+    let young = world.rr(&["gc", "--older-than", "59m"]);
+    assert_eq!(
+        young.status.code(),
+        Some(2),
+        "below the floor is a usage error"
+    );
+}

@@ -8,7 +8,7 @@ use crate::domain::json;
 use crate::domain::pull::{Next, PullOutcome, next};
 use crate::domain::sanitize::{error_line, sanitize};
 use crate::domain::slurm::{JobStatus, WaitOutcome};
-use crate::domain::snapshot::Refusal;
+use crate::domain::snapshot::{GcOutcome, Refusal, gc_lines};
 use crate::domain::status::{LogTail, StatusReport};
 use crate::domain::transfer::Transfer;
 use std::path::PathBuf;
@@ -32,6 +32,8 @@ pub enum Outcome {
     Forwarded(Closed),
     /// A snapshot guard said no, so nothing was run (`rr run --mode snapshot`).
     SnapshotRefused(Refusal),
+    /// `rr gc` cleaned the snapshot root, or refused to touch it.
+    Gc(GcOutcome),
 }
 
 /// What `rr trust` did with a project file.
@@ -137,6 +139,32 @@ fn render_text(outcome: &Outcome) -> Rendered {
             exit: Exit::Rr(RrCode::Refused),
             stdout: String::new(),
             stderr: lines(&[format!("rr: refused: {}", sanitize(&refusal.to_string()))]),
+        },
+        Outcome::Gc(outcome) => render_gc(outcome),
+    }
+}
+
+/// A clean-up prints its report on stdout; entries left half removed make it a failure, and a
+/// refusal is a refusal like any other (nothing was deleted).
+fn render_gc(outcome: &GcOutcome) -> Rendered {
+    match outcome {
+        GcOutcome::Cleaned(report) if report.failed.is_empty() => Rendered {
+            exit: Exit::Success,
+            stdout: lines(&gc_lines(report)),
+            stderr: String::new(),
+        },
+        GcOutcome::Cleaned(report) => Rendered {
+            exit: Exit::Rr(RrCode::Failure),
+            stdout: lines(&gc_lines(report)),
+            stderr: lines(&[
+                "rr: some entries were set aside but not fully removed; run `rr gc` again"
+                    .to_string(),
+            ]),
+        },
+        GcOutcome::Refused(why) => Rendered {
+            exit: Exit::Rr(RrCode::Refused),
+            stdout: String::new(),
+            stderr: lines(&[format!("rr: refused: {why}")]),
         },
     }
 }
@@ -303,6 +331,50 @@ mod tests {
             stderr: "\u{1b}[2Jnot yours\n".into(),
         }));
         assert!(remote.stderr.contains("?[2Jnot yours"), "{}", remote.stderr);
+    }
+
+    #[test]
+    fn a_clean_up_prints_its_report_and_a_refusal_prints_why_nothing_was_deleted() {
+        use crate::domain::snapshot::{GcRefusal, GcReport, Kept, RootEntry, Why};
+        let entry = |name: &str| RootEntry::parse(name).unwrap();
+        let report = GcReport {
+            removed: vec![entry(A)],
+            kept: vec![Kept {
+                entry: entry(B),
+                why: Why::Newest,
+            }],
+            failed: vec![],
+        };
+        let done = text(&Outcome::Gc(GcOutcome::Cleaned(report.clone())));
+        assert_eq!(done.exit, Exit::Success);
+        assert_eq!(
+            done.stdout,
+            format!(
+                "removed {A}\nkept {B} (one of the newest kept by --keep)\n1 removed, 1 kept, 0 failed\n"
+            )
+        );
+        assert_eq!(done.stderr, "");
+        let partly = GcReport {
+            failed: vec![entry(".trash-x")],
+            ..report
+        };
+        let partly = text(&Outcome::Gc(GcOutcome::Cleaned(partly)));
+        assert_eq!(partly.exit, Exit::Rr(RrCode::Failure));
+        assert!(
+            partly.stdout.contains("failed .trash-x"),
+            "{}",
+            partly.stdout
+        );
+        assert!(partly.stderr.starts_with("rr: some entries were set aside"));
+        let refused = text(&Outcome::Gc(GcOutcome::Refused(GcRefusal::QueueUnreadable)));
+        assert_eq!(refused.exit, Exit::Rr(RrCode::Refused));
+        assert_eq!(refused.stdout, "");
+        assert!(
+            refused
+                .stderr
+                .starts_with("rr: refused: could not tell which snapshots")
+        );
+        assert_eq!(refused.stderr.lines().count(), 1);
     }
 
     #[test]

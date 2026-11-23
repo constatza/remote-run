@@ -101,13 +101,15 @@ fn run_in(
 }
 
 /// The directory the snapshots live in is inside the project directory, so there must be one.
-fn project_place(session: &Session) -> Result<Place> {
+pub(crate) fn project_place(session: &Session) -> Result<Place> {
     match &session.place.dir {
         Some(dir) => Ok(Place {
             env: None,
             dir: Some(dir.clone()),
         }),
-        None => bail!("--mode snapshot needs a project directory on the remote (set `dir`)"),
+        None => bail!(
+            "snapshots live in the project directory on the remote, so there must be one (set `dir`)"
+        ),
     }
 }
 

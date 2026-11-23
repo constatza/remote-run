@@ -12,7 +12,8 @@ use remote_run::domain::pull::JobPolicy;
 use remote_run::domain::recipe::{Assignment, RecipeName, Values};
 use remote_run::domain::slurm::{AcctColumns, AcctSelection, Follow, JobId, JobSet};
 use remote_run::domain::snapshot::{
-    AllowedPath, DEFAULT_SNAPSHOT_LIMIT, DirtyPolicy, Inclusion, Mode, Policy, SubmodulePolicy,
+    Age, AllowedPath, DEFAULT_SNAPSHOT_LIMIT, DirtyPolicy, Inclusion, Keep, Mode, Policy,
+    SubmodulePolicy,
 };
 use remote_run::domain::transfer::parse_size;
 use remote_run::domain::wait::{DEFAULT_TIMEOUT, PollInterval};
@@ -188,7 +189,10 @@ impl RemoteCmd {
     pub fn stdout_use(&self) -> StdoutUse {
         match self {
             // `fwd` writes only to stderr; its one document is the end of the forward
-            RemoteCmd::Job(_) | RemoteCmd::Pull { .. } | RemoteCmd::Fwd(_) => StdoutUse::Result,
+            // `gc` prints its report as the result, after everything has been done
+            RemoteCmd::Job(_) | RemoteCmd::Pull { .. } | RemoteCmd::Fwd(_) | RemoteCmd::Gc(_) => {
+                StdoutUse::Result
+            }
             // `--wait` shows the command's output on stderr under `--json`
             RemoteCmd::Run { wait, .. } => match wait.completion {
                 Completion::Wait => StdoutUse::Result,
@@ -298,6 +302,8 @@ pub enum RemoteCmd {
     Do(DoArgs),
     /// Forward a cluster port to localhost over ssh (127.0.0.1 only; closes after --ttl)
     Fwd(FwdArgs),
+    /// Delete snapshots that no job uses and no run has touched for --older-than
+    Gc(GcArgs),
     /// Copy from the remote (rsync); relative remote paths are inside the project directory
     Get {
         remote: String,
@@ -427,6 +433,27 @@ impl TryFrom<DoArgs> for app::recipe::Args {
             policy: args.policy,
             terminal: args.terminal,
         })
+    }
+}
+
+/// `rr gc`'s arguments.
+#[derive(clap::Args)]
+pub struct GcArgs {
+    /// delete a snapshot only when no run has used it for this long (90m, 12h, 30d; at least 1h);
+    /// there is no default, so nothing is deleted by accident
+    #[arg(long = "older-than", value_name = "AGE", required = true, value_parser = Age::parse)]
+    older_than: Age,
+    /// never delete the N newest snapshots, whatever their age
+    #[arg(long, value_name = "N", default_value_t = Keep::NONE, value_parser = Keep::parse)]
+    keep: Keep,
+}
+
+impl From<GcArgs> for app::gc::Args {
+    fn from(args: GcArgs) -> Self {
+        Self {
+            age: args.older_than,
+            keep: args.keep,
+        }
     }
 }
 
@@ -1015,6 +1042,7 @@ mod tests {
             &["status", "1"],
             &["pull"],
             &["fwd", "gpu-01:5000"],
+            &["gc", "--older-than", "2h"],
             &["run", "--wait", "--", "ls"],
         ] {
             assert_eq!(stdout(result), StdoutUse::Result, "{result:?}");
@@ -1023,6 +1051,35 @@ mod tests {
         assert_eq!(Cli::try_parse_from(argv).unwrap().echo(), Echo::Stderr);
         let argv = ["rr", "--host", "h", "wait", "1"];
         assert_eq!(Cli::try_parse_from(argv).unwrap().echo(), Echo::Stdout);
+    }
+
+    #[test]
+    fn gc_needs_an_age_of_at_least_an_hour_and_keeps_none_by_default() {
+        let gc = |args: &[&str]| {
+            let mut argv = vec!["rr", "--host", "h", "gc"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Cmd::Remote(RemoteCmd::Gc(args)) => app::gc::Args::from(args),
+                _ => panic!("not gc"),
+            })
+        };
+        let args = gc(&["--older-than", "36h"]).unwrap();
+        assert_eq!((args.age.seconds(), args.keep.count()), (129_600, 0));
+        let args = gc(&["--older-than", "7d", "--keep", "3"]).unwrap();
+        assert_eq!((args.age.seconds(), args.keep.count()), (604_800, 3));
+        for bad in [
+            &[][..],
+            &["--keep", "3"],
+            &["--older-than", "59m"],
+            &["--older-than", "0s"],
+            &["--older-than", "7"],
+            &["--older-than", "all"],
+            &["--older-than", "2h", "--keep", "-1"],
+            &["--older-than", "2h", "--keep", "x"],
+            &["--older-than", "2h", "extra"],
+        ] {
+            assert!(gc(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
