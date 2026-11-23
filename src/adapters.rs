@@ -7,7 +7,7 @@ use crate::domain::host::Host;
 use crate::domain::shell::Script;
 use crate::domain::ssh::{Terminal, ssh_argv};
 use crate::ports::{
-    Child as PortChild, Clock, Exec, Instant, Net, Remote, Teed, tee_lines, write_sanitized,
+    Child as PortChild, Clock, Echo, Exec, Instant, Net, Remote, Teed, tee_lines, write_sanitized,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::{self, Write};
@@ -60,7 +60,7 @@ impl Exec for OsExec {
         stream_filtered_to(argv, io::stdout(), io::stderr())
     }
 
-    fn stream_tee(&self, argv: &Argv, prefix: &str) -> Result<Teed> {
+    fn stream_tee(&self, argv: &Argv, prefix: &str, echo: Echo) -> Result<Teed> {
         let mut child = command(argv)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
@@ -71,7 +71,10 @@ impl Exec for OsExec {
             let _ = child.wait();
             return Err(anyhow!("{} has no output pipe", argv.program()));
         };
-        let copied = tee_lines(output, &mut io::stdout(), prefix);
+        let copied = match echo {
+            Echo::Stdout => tee_lines(output, &mut io::stdout(), prefix),
+            Echo::Stderr => tee_lines(output, &mut io::stderr(), prefix),
+        };
         // a child that is still writing into a pipe nobody reads would never end
         if copied.is_err() {
             let _ = child.kill();
@@ -392,9 +395,15 @@ impl Remote for Ssh<'_> {
             .stream_filtered(&ssh_argv(self.host, &script.to_string(), terminal))
     }
 
-    fn stream_tee(&self, script: &Script, terminal: Terminal, prefix: &str) -> Result<Teed> {
-        self.exec
-            .stream_tee(&ssh_argv(self.host, &script.to_string(), terminal), prefix)
+    fn stream_tee(
+        &self,
+        script: &Script,
+        terminal: Terminal,
+        prefix: &str,
+        echo: Echo,
+    ) -> Result<Teed> {
+        let argv = ssh_argv(self.host, &script.to_string(), terminal);
+        self.exec.stream_tee(&argv, prefix, echo)
     }
 }
 
@@ -512,17 +521,19 @@ mod tests {
         let script =
             "echo noise; echo 'Submitted batch job 5'; echo 'Submitted batch job 6'; exit 3";
         let teed = OsExec
-            .stream_tee(&sh(script), "Submitted batch job ")
+            .stream_tee(&sh(script), "Submitted batch job ", Echo::Stdout)
             .unwrap();
         assert_eq!(teed.code, 3);
         assert_eq!(
             teed.matched,
             ["Submitted batch job 5", "Submitted batch job 6"]
         );
-        let killed = OsExec.stream_tee(&sh("kill -9 $$"), "x").unwrap();
+        let killed = OsExec
+            .stream_tee(&sh("kill -9 $$"), "x", Echo::Stderr)
+            .unwrap();
         assert_ne!(killed.code, 0);
         let missing = Argv::new("rr-no-such-program", vec![]);
-        assert!(OsExec.stream_tee(&missing, "x").is_err());
+        assert!(OsExec.stream_tee(&missing, "x", Echo::Stdout).is_err());
     }
 
     /// What the user's terminal would have received from `script`, and the child's exit code.

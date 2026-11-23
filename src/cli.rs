@@ -11,7 +11,7 @@ use remote_run::domain::pull::JobPolicy;
 use remote_run::domain::slurm::{Follow, JobId};
 use remote_run::domain::transfer::parse_size;
 use remote_run::domain::wait::{DEFAULT_TIMEOUT, PollInterval};
-use remote_run::ports::Terminal;
+use remote_run::ports::{Echo, Terminal};
 use remote_run::trust::TrustAction;
 use std::time::Duration;
 
@@ -32,7 +32,9 @@ pub struct Cli {
     #[arg(long = "env", env = "RR_ENV", global = true)]
     pub env_file: Option<String>,
     /// write the result as one JSON object on stdout (for `wait`, `status`, `pull`, `get`, `put`,
-    /// `trust`; a command that streams a program's output prints the JSON after it)
+    /// `cancel`, `trust` and `run --wait`, which then shows the command's output on stderr);
+    /// refused for `q`, `acct`, `log`, `x`, `fwd` and `run` without `--wait`, whose output is
+    /// a program's text
     #[arg(long = "json", num_args = 0, default_value = "text", default_missing_value = "json", value_parser = parse_format, global = true)]
     pub format: Format,
     #[command(subcommand)]
@@ -89,13 +91,59 @@ pub struct RunWait {
 }
 
 impl RunWait {
-    pub fn after(self) -> After {
+    pub fn after(self, echo: Echo) -> After {
         match self.completion {
             Completion::Return => After::Return,
-            Completion::Wait => After::Wait(Limits {
-                timeout: self.timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs),
-                poll: self.poll.unwrap_or_default(),
-            }),
+            Completion::Wait => After::Wait {
+                limits: Limits {
+                    timeout: self.timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs),
+                    poll: self.poll.unwrap_or_default(),
+                },
+                echo,
+            },
+        }
+    }
+}
+
+/// What a command does with the user's stdout, which decides whether `--json` can apply to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdoutUse {
+    /// Nothing is written to it before the result, so `--json` can make the result one document.
+    Result,
+    /// The command shows a program's own output on it: a JSON document after that text would not
+    /// be one document, so `--json` is refused for these.
+    ProgramOutput,
+}
+
+impl RemoteCmd {
+    /// Matched without a wildcard, so a new command must say which it is.
+    pub fn stdout_use(&self) -> StdoutUse {
+        match self {
+            RemoteCmd::Job(_)
+            | RemoteCmd::Cancel { .. }
+            | RemoteCmd::Pull { .. }
+            | RemoteCmd::Get { .. }
+            | RemoteCmd::Put { .. } => StdoutUse::Result,
+            // `--wait` shows the command's output on stderr under `--json`
+            RemoteCmd::Run { wait, .. } => match wait.completion {
+                Completion::Wait => StdoutUse::Result,
+                Completion::Return => StdoutUse::ProgramOutput,
+            },
+            RemoteCmd::Q
+            | RemoteCmd::Acct { .. }
+            | RemoteCmd::Log { .. }
+            | RemoteCmd::X { .. }
+            | RemoteCmd::Fwd(_) => StdoutUse::ProgramOutput,
+        }
+    }
+}
+
+impl Cli {
+    /// Where a command's own output goes when it is shown while the result is still to come.
+    pub fn echo(&self) -> Echo {
+        match self.format {
+            Format::Text => Echo::Stdout,
+            Format::Json => Echo::Stderr,
         }
     }
 }
@@ -499,22 +547,26 @@ mod tests {
     #[test]
     fn run_waits_only_when_asked_and_status_takes_one_job() {
         let after = |args: &[&str]| match command_of(args) {
-            Cmd::Remote(RemoteCmd::Run { wait, .. }) => wait.after(),
+            Cmd::Remote(RemoteCmd::Run { wait, .. }) => wait.after(Echo::Stdout),
             _ => panic!("not a run"),
         };
         assert!(matches!(after(&["run", "--", "ls"]), After::Return));
         assert!(matches!(
             after(&["run", "--wait", "--", "ls"]),
-            After::Wait(_)
+            After::Wait { .. }
         ));
         let custom = after(&["run", "--wait", "--timeout", "9", "ls"]);
-        assert!(matches!(custom, After::Wait(l) if l.timeout == Duration::from_secs(9)));
+        assert!(
+            matches!(custom, After::Wait { limits: l, .. } if l.timeout == Duration::from_secs(9))
+        );
         // after the command a flag belongs to the command
         assert!(matches!(after(&["run", "ls", "--wait"]), After::Return));
         let both = after(&["run", "--wait", "--poll", "5", "--timeout", "9", "ls"]);
-        assert!(matches!(both, After::Wait(l) if l.poll.duration() == Duration::from_secs(5)));
+        assert!(
+            matches!(both, After::Wait { limits: l, .. } if l.poll.duration() == Duration::from_secs(5))
+        );
         let plain = after(&["run", "--wait", "ls"]);
-        assert!(matches!(plain, After::Wait(l)
+        assert!(matches!(plain, After::Wait { limits: l, .. }
             if l.timeout == DEFAULT_TIMEOUT && l.poll == PollInterval::default()));
         // the limits mean nothing without --wait, so they are not accepted silently
         assert!(refused(&["run", "--timeout", "9", "--", "ls"]));
@@ -536,6 +588,40 @@ mod tests {
         assert_eq!(format(&["q", "--json"]), Format::Json);
         assert_eq!(format(&["--json", "wait", "1"]), Format::Json);
         assert!(refused(&["q", "--json=text"]));
+    }
+
+    /// A command that shows a program's text on stdout has no JSON form; the rest do.
+    #[test]
+    fn json_is_for_the_commands_that_leave_stdout_to_the_result() {
+        let stdout = |args: &[&str]| match command_of(args) {
+            Cmd::Remote(command) => command.stdout_use(),
+            Cmd::Trust { .. } => panic!("trust is not a remote command"),
+        };
+        for streaming in [
+            &["q"][..],
+            &["acct"],
+            &["log", "1"],
+            &["x", "ls"],
+            &["run", "--", "ls"],
+            &["fwd", "gpu-01:5000"],
+        ] {
+            assert_eq!(stdout(streaming), StdoutUse::ProgramOutput, "{streaming:?}");
+        }
+        for result in [
+            &["wait", "1"][..],
+            &["status", "1"],
+            &["pull"],
+            &["cancel", "1"],
+            &["get", "a"],
+            &["put", "a"],
+            &["run", "--wait", "--", "ls"],
+        ] {
+            assert_eq!(stdout(result), StdoutUse::Result, "{result:?}");
+        }
+        let argv = ["rr", "--host", "h", "--json", "wait", "1"];
+        assert_eq!(Cli::try_parse_from(argv).unwrap().echo(), Echo::Stderr);
+        let argv = ["rr", "--host", "h", "wait", "1"];
+        assert_eq!(Cli::try_parse_from(argv).unwrap().echo(), Echo::Stdout);
     }
 
     #[test]

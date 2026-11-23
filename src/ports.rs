@@ -45,6 +45,14 @@ pub struct Teed {
     pub matched: Vec<String>,
 }
 
+/// Which of the user's streams a tee shows the child's output on. Under `--json` stdout is one
+/// document, so the output of a command that is run and then waited for goes to stderr.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Echo {
+    Stdout,
+    Stderr,
+}
+
 /// Copy `reader` to `writer` unchanged, a line at a time (flushed, like [`write_sanitized`]), and
 /// return the lines that start with `prefix`. A line longer than [`MAX_LINE_BYTES`] is read in
 /// pieces, so its later pieces are not seen as line starts.
@@ -86,10 +94,10 @@ pub trait Exec {
     /// [`write_sanitized`] to the user's stdout and stderr, so nothing it prints can carry a
     /// terminal control sequence. Stdin stays inherited.
     fn stream_filtered(&self, argv: &Argv) -> Result<i32>;
-    /// Like [`Exec::stream`] for the user's stdout, which shows the child's bytes unchanged while
-    /// they are also read: the lines that start with `prefix` come back in [`Teed`]. Stdin and
-    /// stderr stay inherited.
-    fn stream_tee(&self, argv: &Argv, prefix: &str) -> Result<Teed>;
+    /// Like [`Exec::stream`], but the child's stdout is shown unchanged on `echo` while it is also
+    /// read: the lines that start with `prefix` come back in [`Teed`]. Stdin and the child's stderr
+    /// stay inherited.
+    fn stream_tee(&self, argv: &Argv, prefix: &str, echo: Echo) -> Result<Teed>;
     /// Start `argv` without waiting for it: no stdin, no stdout, its stderr filtered like
     /// [`Exec::stream_filtered`]. For a program that is meant to keep running (an ssh tunnel); the
     /// child ends when the handle is dropped, and when `rr` is killed or interrupted.
@@ -138,7 +146,13 @@ pub trait Remote {
     /// commands whose output is the remote's text rather than a program the user chose to run.
     fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32>;
     /// Like [`Remote::stream`], with the output also read as in [`Exec::stream_tee`].
-    fn stream_tee(&self, script: &Script, terminal: Terminal, prefix: &str) -> Result<Teed>;
+    fn stream_tee(
+        &self,
+        script: &Script,
+        terminal: Terminal,
+        prefix: &str,
+        echo: Echo,
+    ) -> Result<Teed>;
 }
 
 /// A point on a monotonic clock: the time since that clock started. Only a [`Clock`] hands one out,
@@ -232,7 +246,7 @@ pub mod fake {
         Capture,
         Stream(Terminal),
         StreamFiltered(Terminal),
-        StreamTee(Terminal),
+        StreamTee(Terminal, Echo),
     }
 
     /// A scripted [`Remote`]: it records every script and answers from queues. A call with nothing
@@ -320,10 +334,16 @@ pub mod fake {
         }
 
         /// What the command prints is what [`FakeRemote::emit`] queued; `shown` gets it unchanged.
-        fn stream_tee(&self, script: &Script, terminal: Terminal, prefix: &str) -> Result<Teed> {
+        fn stream_tee(
+            &self,
+            script: &Script,
+            terminal: Terminal,
+            prefix: &str,
+            echo: Echo,
+        ) -> Result<Teed> {
             self.calls
                 .borrow_mut()
-                .push((script.to_string(), RemoteCall::StreamTee(terminal)));
+                .push((script.to_string(), RemoteCall::StreamTee(terminal, echo)));
             let raw = self.emitted.borrow_mut().pop_front().unwrap_or_default();
             let matched = tee_lines(raw.as_slice(), &mut *self.shown.borrow_mut(), prefix)?;
             let code = self
@@ -517,7 +537,7 @@ pub mod fake {
                 .expect("an unexpected stream"))
         }
 
-        fn stream_tee(&self, argv: &Argv, _prefix: &str) -> Result<Teed> {
+        fn stream_tee(&self, argv: &Argv, _prefix: &str, _echo: Echo) -> Result<Teed> {
             self.calls.borrow_mut().push((argv.clone(), How::StreamTee));
             let code = self
                 .streams

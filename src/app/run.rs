@@ -5,15 +5,18 @@ use super::{Ports, exec, pull};
 use crate::config::Session;
 use crate::domain::outcome::{Outcome, pull_report};
 use crate::domain::pull::{JobPolicy, Next, next};
-use crate::ports::Terminal;
+use crate::ports::{Echo, Terminal};
 use anyhow::Result;
 
 /// What happens once the command has ended.
 #[derive(Clone, Copy, Debug)]
 pub enum After {
     Return,
-    /// Wait for the jobs the command submitted.
-    Wait(Limits),
+    /// Wait for the jobs the command submitted, showing the command's output on `echo`.
+    Wait {
+        limits: Limits,
+        echo: Echo,
+    },
 }
 
 pub struct Args {
@@ -50,7 +53,9 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
             };
             match args.after {
                 After::Return => exec::run(session, command, ports),
-                After::Wait(limits) => run_then_wait(session, command, limits, ports),
+                After::Wait { limits, echo } => {
+                    run_then_wait(session, command, limits, echo, ports)
+                }
             }
         }
     }

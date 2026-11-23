@@ -5,7 +5,7 @@ use crate::config::Session;
 use crate::domain::outcome::Outcome;
 use crate::domain::place::script;
 use crate::domain::shell::{Script, quote};
-use crate::ports::{Teed, Terminal};
+use crate::ports::{Echo, Teed, Terminal};
 use anyhow::Result;
 
 pub struct Args {
@@ -27,10 +27,13 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     )
 }
 
-/// Like [`run`], with the output also read for the lines that start with `prefix`.
-pub fn tee(session: &Session, args: Args, prefix: &str, ports: &Ports) -> Result<Teed> {
+/// Like [`run`], with the output shown on `echo` and also read for the lines that start with
+/// `prefix`.
+pub fn tee(session: &Session, args: Args, prefix: &str, echo: Echo, ports: &Ports) -> Result<Teed> {
     let script = script(&session.place, body(&args));
-    ports.remote.stream_tee(&script, args.terminal, prefix)
+    ports
+        .remote
+        .stream_tee(&script, args.terminal, prefix, echo)
 }
 
 #[cfg(test)]
