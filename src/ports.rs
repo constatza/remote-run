@@ -3,7 +3,7 @@
 
 // the vocabulary the ports speak is the core's
 pub use crate::domain::argv::{Argv, Captured, Stdin};
-use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath, Ttl};
+use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath};
 use crate::domain::sanitize::sanitize_bytes;
 use crate::domain::shell::Script;
 pub use crate::domain::ssh::Terminal;
@@ -118,13 +118,13 @@ impl Instant {
     }
 }
 
-/// The point at which a forward must be over: its start plus its [`Ttl`].
+/// The point at which something must be over: its start plus how long it may take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadline(Instant);
 
 impl Deadline {
-    pub fn after(start: Instant, ttl: Ttl) -> Self {
-        Self(start.after(ttl.duration()))
+    pub fn after(start: Instant, limit: Duration) -> Self {
+        Self(start.after(limit))
     }
 
     pub fn expired(self, now: Instant) -> bool {

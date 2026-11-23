@@ -2,6 +2,8 @@
 //! the enum they stand for, so no boolean reaches the commands.
 
 use clap::{Parser, Subcommand};
+use remote_run::app;
+use remote_run::domain::fwd::{Browser, LoopbackPort, Transport, Ttl, Wanted};
 use remote_run::domain::pull::JobPolicy;
 use remote_run::domain::slurm::{Follow, JobId};
 use remote_run::domain::transfer::parse_size;
@@ -92,6 +94,8 @@ pub enum RemoteCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Forward a cluster port to localhost over ssh (127.0.0.1 only; closes after --ttl)
+    Fwd(FwdArgs),
     /// Copy from the remote (rsync); relative remote paths are inside the project directory
     Get {
         remote: String,
@@ -109,6 +113,38 @@ pub enum RemoteCmd {
         #[arg(long, default_value = "1G", value_parser = parse_size)]
         limit: u64,
     },
+}
+
+/// `rr fwd`'s arguments.
+#[derive(clap::Args)]
+pub struct FwdArgs {
+    /// host:port on the cluster side, or the name of a forward in the config
+    #[arg(value_parser = Wanted::parse)]
+    pub target: Wanted,
+    /// local port (default: a free one)
+    #[arg(long, value_parser = LoopbackPort::parse)]
+    pub local: Option<LoopbackPort>,
+    /// listen on a Unix socket in $XDG_RUNTIME_DIR that only you can open, not on TCP
+    #[arg(long = "socket", num_args = 0, default_value = "tcp", default_missing_value = "socket", value_parser = parse_transport, conflicts_with = "local")]
+    pub transport: Transport,
+    /// open the URL in your browser once it works
+    #[arg(long = "open", num_args = 0, default_value = "leave", default_missing_value = "open", value_parser = parse_browser)]
+    pub browser: Browser,
+    /// close the forward after this long (90s, 30m, 8h, up to 7d)
+    #[arg(long, default_value = "8h", value_parser = Ttl::parse)]
+    pub ttl: Ttl,
+}
+
+impl From<FwdArgs> for app::fwd::Args {
+    fn from(args: FwdArgs) -> Self {
+        Self {
+            wanted: args.target,
+            local: args.local,
+            transport: args.transport,
+            ttl: args.ttl,
+            browser: args.browser,
+        }
+    }
 }
 
 /// A flag that takes no value reads as one of two variants: the first when it is absent, the
@@ -148,6 +184,26 @@ fn parse_follow(text: &str) -> Result<Follow, String> {
         text,
         ("once", Follow::Once),
         ("follow", Follow::Follow),
+    )
+}
+
+/// `--socket` is `socket`; absent it is `tcp`.
+fn parse_transport(text: &str) -> Result<Transport, String> {
+    flag(
+        "--socket",
+        text,
+        ("tcp", Transport::Tcp),
+        ("socket", Transport::Socket),
+    )
+}
+
+/// `--open` is `open`; absent it is `leave`.
+fn parse_browser(text: &str) -> Result<Browser, String> {
+    flag(
+        "--open",
+        text,
+        ("leave", Browser::Leave),
+        ("open", Browser::Open),
     )
 }
 
@@ -261,12 +317,54 @@ mod tests {
         );
     }
 
+    fn fwd_of(args: &[&str]) -> FwdArgs {
+        let argv: Vec<&str> = ["fwd"].into_iter().chain(args.iter().copied()).collect();
+        match command_of(&argv) {
+            Cmd::Remote(RemoteCmd::Fwd(args)) => args,
+            _ => panic!("not a fwd"),
+        }
+    }
+
+    #[test]
+    fn fwd_defaults_to_tcp_for_eight_hours_and_takes_flags_without_values() {
+        let plain = fwd_of(&["gpu-01:5000"]);
+        assert_eq!(plain.transport, Transport::Tcp);
+        assert_eq!(plain.browser, Browser::Leave);
+        assert_eq!(plain.ttl, Ttl::DEFAULT);
+        assert_eq!(plain.local, None);
+        let all = fwd_of(&["mlflow", "--open", "--ttl", "30m", "--local", "5051"]);
+        assert_eq!(all.browser, Browser::Open);
+        assert_eq!(all.ttl.to_string(), "30m");
+        assert_eq!(all.local.map(|p| p.get()), Some(5051));
+        assert_eq!(fwd_of(&["mlflow", "--socket"]).transport, Transport::Socket);
+    }
+
+    #[test]
+    fn fwd_refuses_what_ssh_would_misread_before_anything_starts() {
+        for bad in [
+            &["fwd", "-oProxyCommand=x:1"][..],
+            &["fwd", "--", "-h:80"],
+            &["fwd", "h:0"],
+            &["fwd", "../x"],
+            &["fwd", "h:1", "--local", "0"],
+            &["fwd", "h:1", "--ttl", "0s"],
+            &["fwd", "h:1", "--ttl", "9d"],
+            &["fwd", "h:1", "--socket", "--local", "5051"],
+            &["fwd", "h:1", "--open=yes"],
+            &["fwd"],
+        ] {
+            assert!(refused(bad), "{bad:?}");
+        }
+    }
+
     #[test]
     fn a_flag_parser_refuses_a_spelling_that_is_neither_variant() {
         assert!(parse_terminal("tty").is_err());
         assert!(parse_follow("yes").is_err());
         assert!(parse_trust("true").is_err());
         assert!(parse_policy("1").is_err());
+        assert!(parse_transport("unix").is_err());
+        assert!(parse_browser("true").is_err());
         assert_eq!(
             parse_follow("x").unwrap_err(),
             "--follow takes no value (got \"x\")"

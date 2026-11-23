@@ -7,6 +7,7 @@ use crate::domain::host::Host;
 use crate::domain::ssh::SSH_OPTIONS;
 use anyhow::{Context, Result, bail};
 use core::time::Duration;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU16;
 use url::Url;
@@ -130,6 +131,12 @@ impl ForwardName {
     }
 }
 
+impl fmt::Display for ForwardName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// What the user typed to say where to forward: a target, or the name of a configured forward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Wanted {
@@ -146,6 +153,74 @@ impl Wanted {
             ForwardName::parse(text).map(Self::Named)
         }
     }
+}
+
+/// A forward from the config: where it goes, and the local port it insists on, if any. Without
+/// `local` a free port is picked per run, so two forwards never share the cookies of one
+/// `127.0.0.1:<port>` origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardSpec {
+    pub target: ForwardTarget,
+    pub local: Option<LoopbackPort>,
+}
+
+/// The forwards configured by name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ForwardTable(BTreeMap<ForwardName, ForwardSpec>);
+
+impl FromIterator<(ForwardName, ForwardSpec)> for ForwardTable {
+    fn from_iter<I: IntoIterator<Item = (ForwardName, ForwardSpec)>>(entries: I) -> Self {
+        Self(entries.into_iter().collect())
+    }
+}
+
+/// What one `rr fwd` will forward, once the table has been consulted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// Names the socket file. A forward given as `host:port` is named by its remote port.
+    pub name: ForwardName,
+    pub target: ForwardTarget,
+    pub local: Option<LoopbackPort>,
+}
+
+impl ForwardTable {
+    /// The plan for `wanted`; `local` from the command line wins over the table's.
+    pub fn plan(&self, wanted: Wanted, local: Option<LoopbackPort>) -> Result<Plan> {
+        match wanted {
+            Wanted::Target(target) => Ok(Plan {
+                name: ForwardName::parse(&target.port.to_string())?,
+                target,
+                local,
+            }),
+            Wanted::Named(name) => {
+                let Some(spec) = self.0.get(&name) else {
+                    let known: Vec<&str> = self.0.keys().map(ForwardName::as_str).collect();
+                    bail!("no forward named {name} in the config (configured: {known:?})");
+                };
+                Ok(Plan {
+                    target: spec.target.clone(),
+                    local: local.or(spec.local),
+                    name,
+                })
+            }
+        }
+    }
+}
+
+/// Which kind of local listener the user asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// A TCP port on loopback: what a browser can use.
+    Tcp,
+    /// A Unix socket only the user can open: for command-line clients.
+    Socket,
+}
+
+/// Whether to open the forward in the user's browser once it listens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Browser {
+    Leave,
+    Open,
 }
 
 /// How long a forward may live, 1 s up to [`MAX_TTL`].

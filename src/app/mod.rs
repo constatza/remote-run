@@ -14,6 +14,7 @@ pub mod acct;
 pub mod cancel;
 mod copy;
 pub mod exec;
+pub mod fwd;
 pub mod get;
 mod git;
 pub mod log;
@@ -22,6 +23,7 @@ pub mod put;
 pub mod q;
 pub mod run;
 pub mod trust;
+pub mod tunnel;
 
 /// What a command may use besides its arguments.
 pub struct Ports<'a> {
@@ -108,6 +110,7 @@ mod testing {
                 env: Some(EnvFile::parse("env.sh").unwrap()),
                 dir: Some(RemoteDir::parse("proj").unwrap()),
             },
+            forwards: Default::default(),
         }
     }
 

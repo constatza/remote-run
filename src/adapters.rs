@@ -758,16 +758,17 @@ mod tests {
 
     #[test]
     fn the_net_hands_out_loopback_ports_and_sees_who_listens() {
-        let port = OsNet.free_port(None).unwrap();
+        // the listener keeps its port for the whole test: a port freed and asked for again could
+        // meanwhile be taken by any other test's connection
+        let listener = TcpListener::bind((LOOPBACK_ADDR, 0)).unwrap();
+        let port = LoopbackPort::from_u16(listener.local_addr().unwrap().port()).unwrap();
+        assert_ne!(OsNet.free_port(None).unwrap(), port);
         let endpoint = Endpoint::Tcp(port);
-        let listener = TcpListener::bind((LOOPBACK_ADDR, port.get())).unwrap();
         assert!(OsNet.accepts(&endpoint));
         assert!(
             OsNet.free_port(Some(port)).is_err(),
             "a taken port is refused"
         );
-        drop(listener);
-        assert_eq!(OsNet.free_port(Some(port)).unwrap(), port);
     }
 
     #[cfg(unix)]
