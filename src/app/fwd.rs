@@ -83,7 +83,7 @@ fn announce(
     let target = &plan.target;
     match listening.endpoint() {
         Endpoint::Tcp(port) => {
-            let url = OpenUrl::of_forward(*port)?;
+            let url = OpenUrl::of_forward(*port);
             ports.notes.note(&format!("rr: {} -> {target} (closes in {ttl})", url.as_str()));
             if browser == Browser::Open && !matches!(ports.exec.stream(&url.opener()), Ok(0)) {
                 ports.notes.note("rr: could not open a browser; open the URL yourself");

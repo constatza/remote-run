@@ -10,7 +10,6 @@ use core::time::Duration;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU16;
-use url::Url;
 
 /// The one address a forward listens on. A wildcard bind would put an unauthenticated service on
 /// the network, so the argv builder spells it out and nothing can change it.
@@ -326,37 +325,21 @@ pub fn argv(host: &Host, endpoint: &Endpoint, target: &ForwardTarget) -> Argv {
     Argv::new("ssh", args)
 }
 
-/// A URL that `--open` may hand to a browser: `http`, on the loopback host, at the forward's own
-/// port, without user information. A prefix test would pass `http://127.0.0.1:5051@evil.example/`,
-/// so the text is parsed and its parts compared.
+/// The URL `--open` hands to a browser: `http`, on the loopback host, at the forward's own port,
+/// without user information. It can only be made from a [`LoopbackPort`], so those parts hold by
+/// construction and no text is parsed: no input path reaches a URL, so a parser has nothing to
+/// check. A user-supplied URL would need one back, with its scheme, host, port and login compared.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenUrl(Url);
+pub struct OpenUrl(String);
 
 impl OpenUrl {
-    pub fn parse(text: &str, port: LoopbackPort) -> Result<Self> {
-        let url = Url::parse(text).with_context(|| format!("not a URL: {text:?}"))?;
-        let host_ok = matches!(
-            url.host(),
-            Some(url::Host::Ipv4(ip)) if ip.is_loopback()
-        ) || matches!(url.host(), Some(url::Host::Domain("localhost")));
-        let ok = url.scheme() == "http"
-            && host_ok
-            && url.port() == Some(port.get())
-            && url.username().is_empty()
-            && url.password().is_none();
-        if !ok {
-            bail!("refusing to open {text:?}: not http on localhost port {port} without a login");
-        }
-        Ok(Self(url))
-    }
-
     /// The URL of the service behind a TCP forward at `port`.
-    pub fn of_forward(port: LoopbackPort) -> Result<Self> {
-        Self::parse(&format!("http://{LOOPBACK}:{port}/"), port)
+    pub fn of_forward(port: LoopbackPort) -> Self {
+        Self(format!("http://{LOOPBACK}:{port}/"))
     }
 
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.0
     }
 
     /// The program that opens it in the user's browser; the URL is one argument, never shell text.
@@ -556,40 +539,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_plain_http_loopback_url_at_the_forwards_port_may_be_opened() {
-        let p = port(5051);
-        for text in [
-            "http://127.0.0.1:5051/",
-            "http://localhost:5051/x?y=1",
-            "http://127.0.0.2:5051/",
-        ] {
-            assert!(OpenUrl::parse(text, p).is_ok(), "{text}");
-        }
-        for text in [
-            "http://127.0.0.1:5051@evil.example/",
-            "http://user:pw@127.0.0.1:5051/",
-            "http://user@127.0.0.1:5051/",
-            "https://127.0.0.1:5051/",
-            "file:///etc/passwd",
-            "javascript:alert(1)",
-            "http://127.0.0.1:5052/",
-            "http://127.0.0.1/",
-            "http://127.0.0.1:80/",
-            "http://evil.example:5051/",
-            "http://127.0.0.1.evil.example:5051/",
-            "http://localhost.evil.example:5051/",
-            "http://[::1]:5051/",
-            "http://0.0.0.0:5051/",
-            "-x",
-            "",
-        ] {
-            assert!(OpenUrl::parse(text, p).is_err(), "{text}");
-        }
+    fn the_url_is_plain_http_on_loopback_at_the_forwards_port() {
+        assert_eq!(
+            OpenUrl::of_forward(port(5051)).as_str(),
+            "http://127.0.0.1:5051/"
+        );
+        assert_eq!(OpenUrl::of_forward(port(1)).as_str(), "http://127.0.0.1:1/");
     }
 
     #[test]
     fn the_opener_gets_the_url_as_one_argument() {
-        let url = OpenUrl::of_forward(port(5051)).unwrap();
+        let url = OpenUrl::of_forward(port(5051));
         let opener = url.opener();
         assert_eq!(opener.args(), ["http://127.0.0.1:5051/"]);
         assert!(["xdg-open", "open", "explorer"].contains(&opener.program()));
