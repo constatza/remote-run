@@ -29,8 +29,9 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     let mut unreadable_polls = 0;
     loop {
         let reading = Reading::from_capture(ports.remote.capture(&poll))?;
+        let elapsed = ports.clock.now().since(start);
         let progress = Progress {
-            elapsed: ports.clock.now().since(start),
+            elapsed,
             timeout: args.limits.timeout,
             unreadable_polls,
         };
@@ -40,7 +41,11 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
                 unreadable_polls: n,
             } => {
                 unreadable_polls = n;
-                ports.clock.sleep(args.limits.poll.duration());
+                // the last sleep ends at the timeout, so `--timeout` is not overshot by a poll
+                let remaining = args.limits.timeout.saturating_sub(elapsed);
+                ports
+                    .clock
+                    .sleep(args.limits.poll.duration().min(remaining));
             }
         }
     }
@@ -176,6 +181,19 @@ mod tests {
             3,
             "polls at 0, 30, 60, 90 s"
         );
+    }
+
+    #[test]
+    fn the_last_sleep_ends_at_the_timeout_instead_of_overshooting_it() {
+        let running = reply("7", "RUNNING");
+        let fakes = Fakes::new(vec![], vec![], vec![(0, running.as_str(), ""); 3], vec![]);
+        let outcome = run(&session(), args(Duration::from_secs(45)), &fakes.ports()).unwrap();
+        assert_eq!(
+            render(&outcome, Format::Text).exit,
+            Exit::Rr(RrCode::Timeout)
+        );
+        let polls = [Duration::from_secs(30), Duration::from_secs(15)];
+        assert_eq!(*fakes.clock.slept.borrow(), polls);
     }
 
     /// Exit 6 and never 5: the link was down, the job may be fine.
