@@ -5,8 +5,9 @@
 use crate::domain::argv::Argv;
 use crate::domain::exit::RemoteExit;
 use crate::domain::host::Host;
+use crate::domain::name::plain_name;
 use crate::domain::ssh::SSH_OPTIONS;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use core::time::Duration;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -24,9 +25,6 @@ pub const MAX_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// `sun_path` holds 108 bytes including the final NUL; a longer socket path cannot be bound.
 const SUN_PATH_MAX: usize = 107;
-
-/// The longest forward name: it ends up in a socket file name under the runtime directory.
-const NAME_MAX: usize = 32;
 
 /// A port from digits only: `u16::from_str` would also take a leading `+`.
 fn parse_port(text: &str) -> Result<NonZeroU16> {
@@ -111,19 +109,15 @@ pub struct ForwardName(String);
 
 impl ForwardName {
     pub fn parse(text: &str) -> Result<Self> {
-        let ok = !text.is_empty()
-            && !text.starts_with('-')
-            && text.len() <= NAME_MAX
-            && text
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
-        if !ok {
-            bail!(
-                "not a forward name: {text:?} (1-{NAME_MAX} letters, digits, '_' and '-'; \
-                 use host:port to forward a target directly)"
-            );
-        }
-        Ok(Self(text.to_string()))
+        // The shared message ends in ")"; the hint goes inside it so the text stays one sentence.
+        let name = plain_name("forward", text).map_err(|err| {
+            let rule = err.to_string();
+            anyhow!(
+                "{}; use host:port to forward a target directly)",
+                rule.strip_suffix(')').unwrap_or(&rule)
+            )
+        })?;
+        Ok(Self(name))
     }
 
     pub fn as_str(&self) -> &str {

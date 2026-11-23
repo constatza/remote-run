@@ -13,6 +13,7 @@ pub mod interp;
 pub mod json;
 pub mod local;
 pub mod logpath;
+pub mod name;
 pub mod outcome;
 pub mod place;
 pub mod pull;

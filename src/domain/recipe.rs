@@ -2,28 +2,13 @@
 //! placeholders and filled in at the call. The command is a list of words, never a shell string:
 //! every filled word is quoted on its own, so a value cannot add a word or run anything.
 
+use crate::domain::name::plain_name;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-/// The longest name of a recipe or a slot.
-const NAME_MAX: usize = 32;
 /// How `--set` separates a slot from its value.
 pub const ASSIGN: char = '=';
-
-/// `[A-Za-z0-9_-]+`, no leading `-`: a name that is safe in a message and cannot look like a flag.
-fn plain_name(what: &str, text: &str) -> Result<String> {
-    let ok = !text.is_empty()
-        && !text.starts_with('-')
-        && text.len() <= NAME_MAX
-        && text
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
-    if !ok {
-        bail!("not a {what} name: {text:?} (1-{NAME_MAX} letters, digits, '_' and '-')");
-    }
-    Ok(text.to_string())
-}
 
 macro_rules! name_type {
     ($(#[$doc:meta])* $type:ident, $what:literal) => {
@@ -62,14 +47,14 @@ pub enum RecipePull {
     /// The guarded fast-forward of `rr run`.
     Checkout,
     /// Run in the remote directory as it is, like `rr x`.
-    Skip,
+    None,
 }
 
 impl RecipePull {
     pub fn parse(text: &str) -> Result<Self> {
         match text {
             "checkout" => Ok(Self::Checkout),
-            "none" => Ok(Self::Skip),
+            "none" => Ok(Self::None),
             other => bail!("not a pull mode: {other:?} (use \"checkout\" or \"none\")"),
         }
     }
@@ -305,7 +290,7 @@ mod tests {
 
     #[test]
     fn a_recipe_needs_a_program_and_the_program_can_be_a_slot() {
-        assert!(Recipe::new(&[], RecipePull::Skip).is_err());
+        assert!(Recipe::new(&[], RecipePull::None).is_err());
         let run = recipe(&["{python}", "-V"]);
         let filled = run.fill(&values(&["python=python3"]), &[]).unwrap();
         assert_eq!(filled, words(&["python3", "-V"]));
@@ -322,7 +307,7 @@ mod tests {
         assert_eq!(Assignment::parse("a=b=c").unwrap().value, "b=c");
         assert!(Assignment::parse("novalue").is_err());
         assert!(Assignment::parse("-a=1").is_err());
-        assert_eq!(RecipePull::parse("none").unwrap(), RecipePull::Skip);
+        assert_eq!(RecipePull::parse("none").unwrap(), RecipePull::None);
         assert!(RecipePull::parse("snapshot").is_err());
         assert!(
             Values::new(vec![

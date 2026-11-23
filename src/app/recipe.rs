@@ -29,7 +29,7 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
             let run_args = RunArgs::new(args.policy, args.terminal, cmd, After::Return);
             run::run(session, run_args, ports)
         }
-        RecipePull::Skip => {
+        RecipePull::None => {
             // --force lifts a pull guard; with no pull there is nothing for it to lift
             if args.policy == JobPolicy::Override {
                 bail!(
@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn a_recipe_without_a_pull_runs_the_quoted_words_in_the_project() {
         let fakes = Fakes::remote_streaming(vec![3]);
-        let session = with_recipe(RecipePull::Skip);
+        let session = with_recipe(RecipePull::None);
         let outcome = run(
             &session,
             args("train", &["cfg=a b"], &["$(id)"]),
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn force_on_a_recipe_that_does_not_pull_is_refused_not_ignored() {
         let fakes = Fakes::remote_streaming(vec![]);
-        let session = with_recipe(RecipePull::Skip);
+        let session = with_recipe(RecipePull::None);
         let forced = Args {
             policy: JobPolicy::Override,
             ..args("train", &["cfg=a"], &[])
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn an_unknown_recipe_a_missing_value_and_a_bad_value_run_nothing() {
         let fakes = Fakes::remote_streaming(vec![]);
-        let session = with_recipe(RecipePull::Skip);
+        let session = with_recipe(RecipePull::None);
         let ports = fakes.ports();
         let unknown = run(&session, args("nope", &[], &[]), &ports).unwrap_err();
         assert_eq!(unknown.to_string(), "no recipe nope (known: train)");

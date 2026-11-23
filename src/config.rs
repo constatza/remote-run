@@ -432,7 +432,7 @@ mod tests {
         let ok = forwards("[recipe.train]\nrun = [\"python\", \"{cfg}\"]\npull = \"none\"\n");
         let table = resolve(ok.clone()).unwrap().recipes;
         let name = RecipeName::parse("train").unwrap();
-        assert_eq!(table[&name].pull(), RecipePull::Skip);
+        assert_eq!(table[&name].pull(), RecipePull::None);
         // each of these is well-formed TOML that only `resolve` can refuse
         for bad in [
             "[recipe.t]\nrun = []\n",
