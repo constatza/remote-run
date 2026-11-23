@@ -376,6 +376,42 @@ pub fn argv(host: &Host, endpoint: &Endpoint, target: &ForwardTarget) -> Argv {
     Argv::new("ssh", args)
 }
 
+/// The `st` column of `/proc/net/tcp` for a socket in LISTEN state.
+const PROC_LISTEN: &str = "0A";
+
+/// The column of `/proc/net/tcp` that holds the socket's inode.
+const PROC_INODE_COLUMN: usize = 9;
+
+/// Whether a listener on `127.0.0.1:port` belongs to a process, from the text of its
+/// `/proc/net/tcp` (`table`) and the link texts of its `/proc/<pid>/fd/*` (`links`, each
+/// `socket:[inode]` for a socket). A connect to the port succeeds against any listener, so this is
+/// what ties the port to ssh: a process that took the port between `rr` choosing it and ssh
+/// binding it holds a different inode. Anything unreadable or unexpected is "not held".
+pub fn listener_held(table: &str, links: &[String], port: LoopbackPort) -> bool {
+    // the kernel prints the address as the raw u32 in host byte order
+    let local = format!(
+        "{:08X}:{:04X}",
+        u32::from_ne_bytes([127, 0, 0, 1]),
+        port.get()
+    );
+    let held: Vec<u64> = links.iter().filter_map(|l| socket_inode(l)).collect();
+    table
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|cols| cols.get(1) == Some(&local.as_str()) && cols.get(3) == Some(&PROC_LISTEN))
+        .filter_map(|cols| cols.get(PROC_INODE_COLUMN)?.parse::<u64>().ok())
+        .any(|inode| held.contains(&inode))
+}
+
+/// The inode in a `/proc/<pid>/fd` link text `socket:[inode]`, digits only.
+fn socket_inode(link: &str) -> Option<u64> {
+    let digits = link.strip_prefix("socket:[")?.strip_suffix(']')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// The URL `--open` hands to a browser: `http`, on the loopback host, at the forward's own port,
 /// without user information. It can only be made from a [`LoopbackPort`], so those parts hold by
 /// construction and no text is parsed: no input path reaches a URL, so a parser has nothing to
@@ -549,6 +585,79 @@ mod tests {
             107
         );
         assert!(SocketPath::new(&dir(98), &name).is_err());
+    }
+
+    /// A `/proc/net/tcp` as the kernel writes it: 127.0.0.1:8080 and 127.0.0.1:8081 listening, a
+    /// connected socket (state 01) with 8080 as local port, and a wildcard listener on 8082.
+    const TCP_TABLE: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:1F91 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 222 1 0000000000000000 100 0 0 10 0
+   2: 0100007F:1F90 0100007F:D2E4 01 00000000:00000000 00:00000000 00000000  1000        0 333 1 0000000000000000 100 0 0 10 0
+   3: 00000000:1F92 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 444 1 0000000000000000 100 0 0 10 0
+";
+
+    fn links(inodes: &[&str]) -> Vec<String> {
+        inodes.iter().map(|n| format!("socket:[{n}]")).collect()
+    }
+
+    /// The table with the address column in the host's byte order, as the kernel prints it.
+    fn proc_table() -> String {
+        let loopback = format!("{:08X}", u32::from_ne_bytes([127, 0, 0, 1]));
+        TCP_TABLE.replace("0100007F", &loopback)
+    }
+
+    #[test]
+    fn a_listener_is_held_when_one_of_the_childs_sockets_is_the_loopback_listener() {
+        assert!(listener_held(
+            &proc_table(),
+            &links(&["5", "111"]),
+            port(8080)
+        ));
+        assert!(listener_held(&proc_table(), &links(&["222"]), port(8081)));
+    }
+
+    /// The foreign process that took the port first: the child holds no listener on it.
+    #[test]
+    fn a_listener_of_another_process_is_not_held() {
+        assert!(!listener_held(
+            &proc_table(),
+            &links(&["5", "6"]),
+            port(8080)
+        ));
+        assert!(!listener_held(&proc_table(), &[], port(8080)));
+        // the child's own listener on another port does not vouch for this one
+        assert!(!listener_held(&proc_table(), &links(&["222"]), port(8080)));
+    }
+
+    /// Only a socket in LISTEN state on 127.0.0.1 counts: a connection of the child to the port
+    /// (state 01) and a listener on another address are not the forward.
+    #[test]
+    fn only_a_listening_loopback_socket_counts() {
+        let connected = listener_held(&proc_table(), &links(&["333"]), port(8080));
+        assert!(!connected, "a connected socket is not a listener");
+        let wildcard = listener_held(&proc_table(), &links(&["444"]), port(0x1F92));
+        assert!(!wildcard, "a wildcard listener is not the loopback one");
+    }
+
+    #[test]
+    fn what_cannot_be_read_is_not_held() {
+        assert!(!listener_held("", &links(&["111"]), port(8080)));
+        assert!(!listener_held(
+            "garbage\nmore",
+            &links(&["111"]),
+            port(8080)
+        ));
+        // a link that is not exactly `socket:[digits]` names no socket
+        for link in [
+            "socket:[111",
+            "socket:[+111]",
+            "socket:[]",
+            "pipe:[111]",
+            "socket:[111]x",
+        ] {
+            let held = listener_held(&proc_table(), &[link.to_string()], port(8080));
+            assert!(!held, "{link}");
+        }
     }
 
     fn argv_of(endpoint: &Endpoint) -> Vec<String> {

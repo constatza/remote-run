@@ -21,23 +21,31 @@ const PATIENCE: Duration = Duration::from_secs(20);
 const INTERRUPTED: i32 = 130;
 
 /// The stub: record the pid and the argv, then bind the `-L` port on loopback and hold it, as an
-/// ssh tunnel would. Without `STUB_BIND` it only sleeps (a tunnel that never comes up).
+/// ssh tunnel would. With `STUB_FOREIGN` another process binds it instead, as one that won the
+/// race for the port would, and the stub itself only sleeps. Without either it only sleeps (a
+/// tunnel that never comes up).
 const STUB: &str = r#"#!/bin/sh
 echo $$ > "$STUB_PIDFILE"
 printf '%s\n' "$@" > "$STUB_ARGS"
-[ -n "$STUB_BIND" ] || exec sleep 60
+[ -n "$STUB_BIND$STUB_FOREIGN" ] || exec sleep 60
 while [ $# -gt 0 ]; do
     [ "$1" = -L ] && spec=$2
     shift
 done
 port=${spec#127.0.0.1:}
 port=${port%%:*}
-exec python3 -c 'import socket, sys, time
+holder='import socket, sys, time
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", int(sys.argv[1])))
 s.listen(5)
-time.sleep(60)' "$port"
+time.sleep(60)'
+if [ -n "$STUB_FOREIGN" ]; then
+    python3 -c "$holder" "$port" &
+    echo $! > "$STUB_FOREIGN_PIDFILE"
+    exec sleep 60
+fi
+exec python3 -c "$holder" "$port"
 "#;
 
 /// How `rr` is run against the stub.
@@ -47,6 +55,8 @@ enum Tunnel {
     Listening,
     /// The stub never binds it.
     Silent,
+    /// Another process binds it and the stub (ssh) does not.
+    Foreign,
 }
 
 /// A directory with a stub `ssh` on a `PATH` of its own.
@@ -67,6 +77,10 @@ impl Stub {
 
     fn pidfile(&self) -> PathBuf {
         self.dir.path().join("ssh.pid")
+    }
+
+    fn foreign_pidfile(&self) -> PathBuf {
+        self.dir.path().join("foreign.pid")
     }
 
     fn argv_file(&self) -> PathBuf {
@@ -94,9 +108,13 @@ impl Stub {
             .env("HOME", self.dir.path())
             .env("STUB_PIDFILE", self.pidfile())
             .env("STUB_ARGS", self.argv_file());
-        if tunnel == Tunnel::Listening {
-            command.env("STUB_BIND", "1");
-        }
+        match tunnel {
+            Tunnel::Listening => command.env("STUB_BIND", "1"),
+            Tunnel::Foreign => command
+                .env("STUB_FOREIGN", "1")
+                .env("STUB_FOREIGN_PIDFILE", self.foreign_pidfile()),
+            Tunnel::Silent => &mut command,
+        };
         command
             .stdin(Stdio::null())
             .stdout(fs::File::create(self.stdout_file()).unwrap())
@@ -154,6 +172,19 @@ fn url_line(stub: &Stub) -> String {
             .lines()
             .find(|l| l.starts_with("rr: http://"))
             .map(String::from)
+    })
+}
+
+/// The local port `rr` gave ssh in `-L`, from the argv the stub recorded.
+fn forwarded_port(stub: &Stub) -> u16 {
+    until("the stub's argv", || {
+        let argv = fs::read_to_string(stub.argv_file()).ok()?;
+        let spec = argv.lines().skip_while(|w| *w != "-L").nth(1)?.to_string();
+        spec.strip_prefix("127.0.0.1:")?
+            .split(':')
+            .next()?
+            .parse()
+            .ok()
     })
 }
 
@@ -277,4 +308,33 @@ fn the_url_is_announced_once_the_port_accepts_and_ssh_gets_options_ended_before_
     assert_eq!((dashes, host), ("--", "cluster"));
     rr.kill().unwrap();
     rr.wait().unwrap();
+}
+
+/// The race: a process that is not ssh holds the forwarded port, so a connect succeeds. Whatever
+/// `rr` waited for before, it must not announce this one, and must stop ssh when told to.
+#[test]
+fn a_listener_that_is_not_ssh_is_never_announced() {
+    let Some(stub) = listening_stub() else { return };
+    let mut rr = stub.rr(Tunnel::Foreign, &[]);
+    let ssh = ssh_pid(&stub);
+    let foreign: u32 = until("the foreign listener to start", || {
+        fs::read_to_string(stub.foreign_pidfile())
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    });
+    let port = forwarded_port(&stub);
+    until("the foreign listener to accept", || {
+        TcpStream::connect(("127.0.0.1", port)).ok()
+    });
+    // many polls and the settle time, in which the old check would have printed the URL
+    std::thread::sleep(Duration::from_secs(2));
+    let printed = stub.stderr();
+    signal("-TERM", rr.id());
+    let status = wait_for(&mut rr);
+    signal("-KILL", foreign);
+    assert!(!printed.contains("rr: http://"), "announced: {printed}");
+    assert!(status.code().is_some_and(|c| c != 0), "{status:?}");
+    assert!(!alive(ssh), "ssh outlived rr");
 }

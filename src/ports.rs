@@ -157,6 +157,8 @@ pub enum Ended {
 
 /// A program started by [`Exec::spawn`].
 pub trait Child {
+    /// Its process id, which names the sockets it holds (see [`Net::held_by`]).
+    fn pid(&self) -> u32;
     /// How it ended, or `None` while it runs.
     fn try_wait(&mut self) -> Result<Option<Ended>>;
     /// End it and reap it. Ending a child that has already ended is not an error.
@@ -166,8 +168,8 @@ pub trait Child {
 /// The local network and the files a forward needs.
 pub trait Net {
     /// A TCP port on loopback that nothing listens on: `want` when given (an error if taken),
-    /// else any free one. Another process can still take it before ssh binds; ssh then fails
-    /// (`ExitOnForwardFailure`), which `rr` reports.
+    /// else any free one. Another process can still take it before ssh binds, so a listener on
+    /// it proves nothing until [`Net::held_by`] says ssh holds it.
     fn free_port(&self, want: Option<LoopbackPort>) -> Result<LoopbackPort>;
     /// An error when something already exists at `path`: a stale socket would make ssh fail to
     /// bind, and removing a file that is not ours is not `rr`'s call.
@@ -176,8 +178,13 @@ pub trait Net {
     /// [`Net::socket_unused`] found free before ssh was started, once ssh has been reaped: the
     /// file is then ssh's, and a SIGKILLed ssh cannot unlink it.
     fn remove_socket(&self, path: &SocketPath) -> Result<()>;
-    /// Whether a connection to `endpoint` is accepted right now.
+    /// Whether a connection to `endpoint` is accepted right now. Any listener answers, so for a TCP
+    /// port this alone does not say whose it is: see [`Net::held_by`].
     fn accepts(&self, endpoint: &Endpoint) -> bool;
+    /// Whether the process `pid` holds the listening socket on `127.0.0.1:port`. `false` when that
+    /// cannot be established (another process listens, the socket table is unreadable, or the
+    /// system cannot tell), so a caller that announces only on `true` fails closed.
+    fn held_by(&self, port: LoopbackPort, pid: u32) -> bool;
 }
 
 /// Runs scripts on the remote host; a trait so tests can record what would be sent. It takes a
@@ -497,7 +504,14 @@ pub mod fake {
     /// The code a killed fake child reads as: 128 + SIGKILL.
     const KILLED_EXIT: i32 = 137;
 
+    /// The pid every [`FakeChild`] has.
+    pub const FAKE_CHILD_PID: u32 = 4242;
+
     impl Child for FakeChild {
+        fn pid(&self) -> u32 {
+            FAKE_CHILD_PID
+        }
+
         fn try_wait(&mut self) -> Result<Option<Ended>> {
             if self.killed.get() > 0 {
                 return Ok(Some(Ended::Exited(KILLED_EXIT)));
@@ -529,6 +543,10 @@ pub mod fake {
         pub free: Option<u16>,
         pub accepts: RefCell<VecDeque<bool>>,
         pub socket_taken: bool,
+        /// The pid that holds the listener on the port (`None`: some other process does).
+        pub holder: Option<u32>,
+        /// The `(port, pid)` pairs `held_by` was asked about.
+        pub asked: RefCell<Vec<(u16, u32)>>,
         /// The socket paths `remove_socket` was asked to remove.
         pub removed: RefCell<Vec<String>>,
     }
@@ -539,6 +557,8 @@ pub mod fake {
                 free,
                 accepts: RefCell::new(accepts.into()),
                 socket_taken: false,
+                holder: Some(FAKE_CHILD_PID),
+                asked: RefCell::default(),
                 removed: RefCell::default(),
             }
         }
@@ -563,6 +583,11 @@ pub mod fake {
         fn remove_socket(&self, path: &SocketPath) -> Result<()> {
             self.removed.borrow_mut().push(path.as_str().to_string());
             Ok(())
+        }
+
+        fn held_by(&self, port: LoopbackPort, pid: u32) -> bool {
+            self.asked.borrow_mut().push((port.get(), pid));
+            self.holder == Some(pid)
         }
 
         fn accepts(&self, _: &Endpoint) -> bool {

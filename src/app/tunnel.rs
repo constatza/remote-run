@@ -29,9 +29,8 @@ const POLL: Duration = Duration::from_millis(200);
 /// How long ssh gets to authenticate and bind before `rr` gives up on it.
 const START_LIMIT: Duration = Duration::from_secs(30);
 
-/// How long a port that accepts must keep ssh alive before it counts as listening. A foreign
-/// process listening on the port makes the connection succeed while ssh is still failing to bind,
-/// and ssh then exits (`ExitOnForwardFailure`).
+/// How long ssh must stay alive once it holds the listener before it counts as listening: it
+/// exits at once when it fails after binding (`ExitOnForwardFailure`).
 const SETTLE: Duration = Duration::from_millis(500);
 
 /// ssh could not be stopped: it may still be running and may still own its socket file. A value
@@ -166,17 +165,37 @@ impl StartingForward {
             if self.look()? == Look::Interrupted {
                 return Ok(Look::Interrupted);
             }
-            if net.accepts(&self.endpoint) {
+            if self.is_ssh_listening(net) {
                 clock.sleep(SETTLE);
                 return self.look();
             }
             if give_up.expired(clock.now()) {
+                // a port that answers without being ssh's is the race this check closes
+                let foreign = if net.accepts(&self.endpoint) {
+                    ": the port answers, but its listener is not ssh's"
+                } else {
+                    ""
+                };
                 bail!(
-                    "ssh did not open the forward within {}s",
+                    "ssh did not open the forward within {}s{foreign}",
                     START_LIMIT.as_secs()
                 );
             }
             clock.sleep(POLL);
+        }
+    }
+
+    /// Whether the endpoint accepts and, for a TCP port, the listener is ssh's own: a connect
+    /// succeeds against any listener, including one that took the port between `rr` choosing it
+    /// and ssh binding it, so only a listener held by ssh's pid counts. A socket path was absent
+    /// before ssh started and lies in the private runtime directory, so it needs no owner.
+    fn is_ssh_listening(&self, net: &dyn Net) -> bool {
+        if !net.accepts(&self.endpoint) {
+            return false;
+        }
+        match &self.endpoint {
+            Endpoint::Tcp(port) => net.held_by(*port, self.child.pid()),
+            Endpoint::Unix(_) => true,
         }
     }
 
