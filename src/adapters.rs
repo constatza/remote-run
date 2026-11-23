@@ -157,10 +157,18 @@ struct OsChild {
 }
 
 impl OsChild {
-    /// Wait for the stderr copy to finish; it ends when the child (and any process that kept its
-    /// stderr) is gone.
+    /// Wait for the stderr copy to finish, but only [`STDERR_GRACE`]: it ends when every holder of
+    /// the pipe is gone, and a process that outlives ssh and keeps its stderr (a `ProxyCommand`)
+    /// could hold `rr` for as long as it likes. Past the limit the thread is left to finish alone.
     fn finish_stderr(&mut self) {
-        if let Some(copy) = self.stderr_copy.take() {
+        let Some(copy) = self.stderr_copy.take() else {
+            return;
+        };
+        let deadline = WallClock::now() + STDERR_GRACE;
+        while !copy.is_finished() && WallClock::now() < deadline {
+            std::thread::sleep(STOP_POLL);
+        }
+        if copy.is_finished() {
             let _ = copy.join();
         }
     }
@@ -374,6 +382,10 @@ fn take_pipes(child: &mut Child) -> Option<(ChildStdout, ChildStderr)> {
 /// How long a child gets to leave after SIGTERM before it is killed. `ssh -t` puts the local tty
 /// in raw mode and restores it only when it ends on its own, so a kill is the last resort.
 const STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// How long the last words of a child (its stderr) are waited for once it has ended. Long enough
+/// for a pipe to drain; short enough that a process that kept the pipe open does not stall `rr`.
+const STDERR_GRACE: Duration = Duration::from_secs(1);
 
 /// How often a stopping child is checked for having ended.
 const STOP_POLL: Duration = Duration::from_millis(10);
@@ -1138,6 +1150,25 @@ mod tests {
         }
     }
 
+    /// A process that outlives ssh and keeps its stderr (a `ProxyCommand`, here a background
+    /// `sleep`) must not hold `rr` until it ends; the message that was already written still shows.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_that_keeps_the_stderr_open_does_not_hold_the_child_s_end() {
+        let seen = Shared::default();
+        let argv = sh("sleep 8 & echo 'Permission denied' >&2; exit 255");
+        let started = WallClock::now();
+        let mut child = spawn_child_with(&argv, seen.clone()).unwrap();
+        assert_eq!(ended_with(&mut child), 255);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        let text = String::from_utf8(seen.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text, "Permission denied\n");
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_stderr_of_a_child_that_is_killed_is_written_when_kill_returns() {
@@ -1181,6 +1212,27 @@ mod tests {
         assert!(shown.contains("Submitted batch job 9"), "{shown}");
         assert!(shown.contains("closed"), "{shown}");
         assert!(started.elapsed() < Duration::from_secs(20), "child stopped");
+    }
+
+    /// The echo fails on the line that carries the job id itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_tee_on_the_matching_line_still_names_the_job() {
+        struct AlwaysFails;
+        impl Write for AlwaysFails {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let script = "echo 'Submitted batch job 9'; exec sleep 30";
+        let err = within(move || {
+            stream_tee_to(&sh(script), "Submitted batch job ", &mut AlwaysFails).unwrap_err()
+        });
+        let shown = format!("{err:#}");
+        assert!(shown.contains("[Submitted batch job 9]"), "{shown}");
     }
 
     #[test]

@@ -106,12 +106,14 @@ fn tee_into(
         {
             return Ok(());
         }
-        writer.write_all(&line)?;
-        writer.flush()?;
+        // recorded before the echo: a failing write on the matching line itself must still hand
+        // back its job id
         if at_line_start && line.starts_with(prefix.as_bytes()) {
             let text = String::from_utf8_lossy(&line);
             matched.push(text.trim_end_matches(['\r', '\n']).to_string());
         }
+        writer.write_all(&line)?;
+        writer.flush()?;
         at_line_start = line.ends_with(b"\n");
     }
 }
@@ -455,6 +457,9 @@ pub mod fake {
         waits: VecDeque<Option<Ended>>,
         killed: Rc<Cell<u32>>,
         kill_fails: bool,
+        /// `try_wait` fails from this call on (counted from 0), until the child is killed.
+        wait_fails_from: Option<u32>,
+        waited: u32,
     }
 
     impl FakeChild {
@@ -470,8 +475,16 @@ pub mod fake {
                 waits: waits.into(),
                 killed: Rc::clone(&killed),
                 kill_fails: false,
+                wait_fails_from: None,
+                waited: 0,
             };
             (child, killed)
+        }
+
+        /// Make `try_wait` fail from its `call`th call on (counted from 0).
+        pub fn with_failing_wait_from(mut self, call: u32) -> Self {
+            self.wait_fails_from = Some(call);
+            self
         }
 
         /// Make `kill` fail (after it has been counted), as for a child that cannot be signalled.
@@ -488,6 +501,10 @@ pub mod fake {
         fn try_wait(&mut self) -> Result<Option<Ended>> {
             if self.killed.get() > 0 {
                 return Ok(Some(Ended::Exited(KILLED_EXIT)));
+            }
+            self.waited += 1;
+            if self.wait_fails_from.is_some_and(|from| self.waited > from) {
+                anyhow::bail!("cannot poll the child");
             }
             Ok(match self.waits.len() {
                 0 => None,
@@ -813,6 +830,23 @@ pub mod fake {
             tee_lines(&raw[..], &mut FailsOnSecondWrite(0), "Submitted batch job ").unwrap_err();
         assert_eq!(err.matched, ["Submitted batch job 9"]);
         assert_eq!(err.to_string(), "closed");
+    }
+
+    /// The echo fails on the very line that carries the job id: the job is submitted all the same.
+    #[test]
+    fn a_write_error_on_the_matching_line_still_returns_that_line() {
+        struct AlwaysFails;
+        impl Write for AlwaysFails {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let raw = b"Submitted batch job 9\n";
+        let err = tee_lines(&raw[..], &mut AlwaysFails, "Submitted batch job ").unwrap_err();
+        assert_eq!(err.matched, ["Submitted batch job 9"]);
     }
 
     #[test]

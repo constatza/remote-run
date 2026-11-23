@@ -73,6 +73,10 @@ impl Stub {
         self.dir.path().join("ssh.argv")
     }
 
+    fn stdout_file(&self) -> PathBuf {
+        self.dir.path().join("rr.stdout")
+    }
+
     fn stderr_file(&self) -> PathBuf {
         self.dir.path().join("rr.stderr")
     }
@@ -95,10 +99,14 @@ impl Stub {
         }
         command
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(fs::File::create(self.stdout_file()).unwrap())
             .stderr(fs::File::create(self.stderr_file()).unwrap())
             .spawn()
             .unwrap()
+    }
+
+    fn stdout(&self) -> String {
+        fs::read_to_string(self.stdout_file()).unwrap_or_default()
     }
 
     fn stderr(&self) -> String {
@@ -231,6 +239,21 @@ fn the_ttl_ends_the_forward_with_success_and_no_ssh_left() {
     assert!(status.success(), "{status:?}\n{}", stub.stderr());
     assert!(!alive(ssh_pid(&stub)), "ssh outlived the ttl");
     assert!(stub.stderr().contains("time to live reached"));
+}
+
+/// `fwd` writes nothing to stdout while it runs, so `--json` is one document at its end and the
+/// URL line stays text on stderr.
+#[test]
+fn json_makes_the_end_of_the_forward_one_document_on_stdout() {
+    let Some(stub) = listening_stub() else { return };
+    let mut rr = stub.rr(Tunnel::Listening, &["--ttl", "1s", "--json"]);
+    let status = wait_for(&mut rr);
+    assert!(status.success(), "{status:?}\n{}", stub.stderr());
+    assert_eq!(
+        stub.stdout(),
+        "{\"source\":\"rr\",\"exit\":0,\"kind\":\"forward\",\"result\":\"expired\"}\n"
+    );
+    assert!(stub.stderr().contains("rr: http://127.0.0.1:"));
 }
 
 #[test]

@@ -58,17 +58,27 @@ fn usage_error(err: clap::Error) -> ExitCode {
 }
 
 /// Write the result and return the exit code. A closed pipe (`rr --json ... | head -1`) is how a
-/// reader says it has enough, not a failure to report, and `print!` would panic on it. Any other
-/// write error is told on stderr, and turns a success into a failure: the result was not delivered.
+/// reader says it has enough, not a failure to report, and `print!` would panic on it. Both
+/// streams are always attempted: a closed stdout must not hide the notes on stderr. Any other
+/// write error is told on stderr whatever the exit code, and turns a success into a failure: the
+/// result was not delivered.
 fn emit(rendered: &Rendered, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    let wrote = write_all(out, &rendered.stdout).and(write_all(err, &rendered.stderr));
-    match (wrote, rendered.exit) {
-        (Err(failure), Exit::Success) if failure.kind() != io::ErrorKind::BrokenPipe => {
-            // stderr may be what failed; there is nowhere left to say so then
-            let _ = writeln!(err, "rr: could not write the result: {failure}");
-            ExitCode::from(RrCode::Failure.code())
-        }
-        _ => ExitCode::from(rendered.exit.code()),
+    let wrote = [
+        write_all(out, &rendered.stdout),
+        write_all(err, &rendered.stderr),
+    ];
+    let failure = wrote
+        .into_iter()
+        .filter_map(Result::err)
+        .find(|failure| failure.kind() != io::ErrorKind::BrokenPipe);
+    let Some(failure) = failure else {
+        return ExitCode::from(rendered.exit.code());
+    };
+    // stderr may be what failed; there is nowhere left to say so then
+    let _ = writeln!(err, "rr: could not write the result: {failure}");
+    match rendered.exit {
+        Exit::Success => ExitCode::from(RrCode::Failure.code()),
+        other => ExitCode::from(other.code()),
     }
 }
 
@@ -82,7 +92,8 @@ struct StderrNotes;
 
 impl Notes for StderrNotes {
     fn note(&self, line: &str) {
-        eprintln!("{line}");
+        // `eprintln!` panics when stderr is closed (`2>&1 | head`); a lost note is not worth that
+        let _ = writeln!(io::stderr().lock(), "{line}");
     }
 }
 
@@ -115,7 +126,7 @@ fn refuse_json_for(command: &RemoteCmd, format: Format) -> Result<()> {
     match (format, command.stdout_use()) {
         (Format::Json, StdoutUse::ProgramOutput) => bail!(
             "--json does not apply to a command that writes to stdout before its result (q, acct, \
-             log, x, fwd, cancel, get, put, run without --wait): that would not be one JSON \
+             log, x, cancel, get, put, run without --wait): that would not be one JSON \
              document"
         ),
         (Format::Json, StdoutUse::Result) | (Format::Text, _) => Ok(()),
@@ -277,6 +288,33 @@ mod tests {
         let full = Failing(io::ErrorKind::StorageFull);
         let code = emit(&rendered(Exit::remote(7)), &mut { full }, &mut Vec::new());
         assert_eq!(code, ExitCode::from(7));
+    }
+
+    /// A failing stdout must not hide stderr, and the failure is told whatever the exit code.
+    #[test]
+    fn both_streams_are_attempted_and_a_write_failure_is_told_for_any_exit() {
+        for exit in [Exit::Success, Exit::remote(7)] {
+            let mut err = Vec::new();
+            let full = Failing(io::ErrorKind::StorageFull);
+            let _ = emit(&rendered(exit), &mut { full }, &mut err);
+            let shown = String::from_utf8(err).unwrap();
+            assert!(shown.starts_with("rr: note\n"), "{shown}");
+            assert!(shown.contains("could not write"), "{shown}");
+        }
+        // a broken stdout hides no stderr either, and a broken stderr fails a success
+        let mut err = Vec::new();
+        let _ = emit(
+            &rendered(Exit::Success),
+            &mut Failing(io::ErrorKind::BrokenPipe),
+            &mut err,
+        );
+        assert_eq!(err, b"rr: note\n");
+        let code = emit(
+            &rendered(Exit::Success),
+            &mut Vec::new(),
+            &mut Failing(io::ErrorKind::StorageFull),
+        );
+        assert_eq!(code, ExitCode::from(RrCode::Failure.code()));
     }
 
     #[test]

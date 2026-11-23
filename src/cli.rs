@@ -31,9 +31,9 @@ pub struct Cli {
     /// remote shell file sourced before every command (PATH, uv, Slurm settings)
     #[arg(long = "env", env = "RR_ENV", global = true)]
     pub env_file: Option<String>,
-    /// write the result as one JSON object on stdout (for `wait`, `status`, `pull`, `trust` and
-    /// `run --wait`, which then shows the command's output on stderr); refused for `q`, `acct`,
-    /// `log`, `x`, `fwd`, `cancel`, `get`, `put` and `run` without `--wait`, which write to stdout
+    /// write the result as one JSON object on stdout (for `wait`, `status`, `pull`, `trust`, `fwd`
+    /// and `run --wait`, which then shows the command's output on stderr); refused for `q`, `acct`,
+    /// `log`, `x`, `cancel`, `get`, `put` and `run` without `--wait`, which write to stdout
     /// themselves
     #[arg(long = "json", num_args = 0, default_value = "text", default_missing_value = "json", value_parser = parse_format, global = true)]
     pub format: Format,
@@ -119,7 +119,8 @@ impl RemoteCmd {
     /// Matched without a wildcard, so a new command must say which it is.
     pub fn stdout_use(&self) -> StdoutUse {
         match self {
-            RemoteCmd::Job(_) | RemoteCmd::Pull { .. } => StdoutUse::Result,
+            // `fwd` writes only to stderr; its one document is the end of the forward
+            RemoteCmd::Job(_) | RemoteCmd::Pull { .. } | RemoteCmd::Fwd(_) => StdoutUse::Result,
             // `--wait` shows the command's output on stderr under `--json`
             RemoteCmd::Run { wait, .. } => match wait.completion {
                 Completion::Wait => StdoutUse::Result,
@@ -133,8 +134,7 @@ impl RemoteCmd {
             | RemoteCmd::Q
             | RemoteCmd::Acct { .. }
             | RemoteCmd::Log { .. }
-            | RemoteCmd::X { .. }
-            | RemoteCmd::Fwd(_) => StdoutUse::ProgramOutput,
+            | RemoteCmd::X { .. } => StdoutUse::ProgramOutput,
         }
     }
 }
@@ -338,7 +338,10 @@ fn parse_completion(text: &str) -> Result<Completion, String> {
 
 /// Whether `--json` is among `args` before a `--`. Read from the raw arguments for the one case
 /// where clap has refused the line and so gave no [`Cli`]: the usage error is then written in the
-/// format the caller asked for.
+/// format the caller asked for. It cannot tell the words of a remote command (`rr run --poll 1
+/// echo --json`) from rr's own flags, because where the command starts depends on which options
+/// take a value; such a line, when it is refused, gets its usage error as JSON. That is a
+/// misformatted error, never a wrong result, and a `--` before the command avoids it.
 pub fn format_of_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Format {
     let mut words = args.into_iter().skip(1).take_while(|arg| arg != "--");
     if words.any(|arg| arg == "--json") {
@@ -617,7 +620,6 @@ mod tests {
             &["log", "1"],
             &["x", "ls"],
             &["run", "--", "ls"],
-            &["fwd", "gpu-01:5000"],
             &["cancel", "1"],
             &["get", "a"],
             &["put", "a"],
@@ -628,6 +630,7 @@ mod tests {
             &["wait", "1"][..],
             &["status", "1"],
             &["pull"],
+            &["fwd", "gpu-01:5000"],
             &["run", "--wait", "--", "ls"],
         ] {
             assert_eq!(stdout(result), StdoutUse::Result, "{result:?}");

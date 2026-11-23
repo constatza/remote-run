@@ -1,6 +1,7 @@
 //! What `rr` knows about Slurm: the `squeue`, `sacct` and `scancel` command text and the field
 //! layouts it reads back. Pure; every runtime value reaches the text through [`quote`].
 
+use crate::domain::argv::Captured;
 use crate::domain::exit::{Exit, RrCode};
 use crate::domain::shell::{Script, lit, number, quote};
 use anyhow::{Context, Result, bail};
@@ -350,6 +351,18 @@ impl WaitOutcome {
 /// a stalled `slurmdbd` would leave `sacct` waiting, and `rr wait` with it, past `--timeout`.
 const SACCT_POLL_LIMIT_SECS: u32 = 60;
 
+/// The exit code of `timeout` when it had to end its command.
+const TIMEOUT_EXIT: i32 = 124;
+
+/// What a polled `sacct` printed. Exit 124 is `timeout` ending a stalled `sacct`, which has no
+/// stderr to show, so it is named by its limit; any other failure shows the code and stderr.
+pub fn sacct_stdout(captured: Captured) -> Result<String> {
+    if captured.code == TIMEOUT_EXIT {
+        bail!("sacct did not answer within {SACCT_POLL_LIMIT_SECS}s");
+    }
+    captured.into_stdout("sacct")
+}
+
 /// One `JobID,State` line per job (`-X`), for
 /// [`parse_states`](crate::domain::wait::parse_states). The comma-joined ids are one quoted word.
 /// `timeout` ends a stalled `sacct` with exit 124, which the wait reads as an unreadable poll,
@@ -368,7 +381,9 @@ pub fn states_script(jobs: &JobSet) -> Script {
 
 /// One job's record and progress, for `rr status`.
 pub fn status_script(job: &JobId) -> Script {
-    lit("sacct -n -X ")
+    lit("timeout ")
+        .word(number(SACCT_POLL_LIMIT_SECS))
+        .lit(" sacct -n -X ")
         .lit(SACCT_PARSABLE)
         .lit(" -j ")
         .word(quote(job.as_str()))
@@ -553,7 +568,7 @@ mod tests {
         assert!(STATUS_FIELDS.ends_with(SACCT_FIELDS));
         assert_eq!(
             status_script(&id("9")).to_string(),
-            format!(r#"sacct -n -X -P --delimiter=$'\x1f' -j '9' -o {STATUS_FIELDS}"#)
+            format!(r#"timeout 60 sacct -n -X -P --delimiter=$'\x1f' -j '9' -o {STATUS_FIELDS}"#)
         );
     }
 

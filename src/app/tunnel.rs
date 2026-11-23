@@ -53,6 +53,43 @@ impl std::fmt::Display for NotStopped {
 
 impl std::error::Error for NotStopped {}
 
+/// An error after which ssh is known not to run: it was reaped, it ended by itself, or it never
+/// started. The caller keeps a socket file on any error without this marker, so a new failure
+/// path is safe until it proves ssh gone.
+#[derive(Debug)]
+pub struct SshEnded(String);
+
+impl SshEnded {
+    pub fn error(message: impl std::fmt::Display) -> anyhow::Error {
+        anyhow::Error::new(Self(message.to_string()))
+    }
+}
+
+impl std::fmt::Display for SshEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SshEnded {}
+
+/// Kill `child` for the sake of `err`: `err` comes back marked [`SshEnded`] when the kill worked,
+/// and with [`NotStopped`] on top when it did not.
+fn stop_after(child: &mut dyn Child, err: &anyhow::Error) -> anyhow::Error {
+    match child.kill() {
+        Ok(()) => SshEnded::error(format!("{err:#}")),
+        Err(kill) => anyhow::anyhow!("{err:#}").context(NotStopped::new(&kill)),
+    }
+}
+
+/// Kill `child`, then report `end`; a kill that fails is [`NotStopped`].
+fn stop_for(child: &mut dyn Child, end: End) -> Result<End> {
+    child
+        .kill()
+        .map(|()| end)
+        .map_err(|kill| anyhow::Error::new(NotStopped::new(&kill)))
+}
+
 /// How a held forward ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum End {
@@ -99,10 +136,10 @@ impl StartingForward {
         target: &ForwardTarget,
         endpoint: Endpoint,
     ) -> Result<Self> {
-        Ok(Self {
-            child: exec.spawn(&argv(host, &endpoint, target))?,
-            endpoint,
-        })
+        let child = exec
+            .spawn(&argv(host, &endpoint, target))
+            .map_err(|err| SshEnded::error(format!("{err:#}")))?;
+        Ok(Self { child, endpoint })
     }
 
     /// Wait until `endpoint` accepts and ssh is still alive after [`SETTLE`]. On any failure ssh
@@ -114,11 +151,12 @@ impl StartingForward {
                 child: self.child,
                 endpoint: self.endpoint,
             })),
-            Ok(Look::Interrupted) => Ok(Started::Interrupted),
-            Err(err) => Err(match self.child.kill() {
-                Ok(()) => err,
-                Err(kill) => err.context(NotStopped::new(&kill)),
-            }),
+            // an interrupt has ended ssh through the child's own handler, but only a kill that
+            // succeeds here says it is gone
+            Ok(Look::Interrupted) => {
+                stop_for(&mut *self.child, End::Interrupted).map(|_| Started::Interrupted)
+            }
+            Err(err) => Err(stop_after(&mut *self.child, &err)),
         }
     }
 
@@ -163,16 +201,16 @@ impl ListeningForward {
     /// been reaped, except in an error that has [`NotStopped`] in its chain.
     pub fn hold(mut self, until: Deadline, clock: &dyn Clock) -> Result<End> {
         loop {
-            match self.child.try_wait()? {
-                Some(Ended::Exited(code)) => return Ok(End::Exited(code)),
-                Some(Ended::Interrupted) => return Ok(End::Interrupted),
-                None => {}
+            match self.child.try_wait() {
+                Ok(Some(Ended::Exited(code))) => return Ok(End::Exited(code)),
+                Ok(Some(Ended::Interrupted)) => {
+                    return stop_for(&mut *self.child, End::Interrupted);
+                }
+                Ok(None) => {}
+                Err(err) => return Err(stop_after(&mut *self.child, &err)),
             }
             if until.expired(clock.now()) {
-                self.child
-                    .kill()
-                    .map_err(|kill| anyhow::Error::new(NotStopped::new(&kill)))?;
-                return Ok(End::Expired);
+                return stop_for(&mut *self.child, End::Expired);
             }
             clock.sleep(POLL);
         }
