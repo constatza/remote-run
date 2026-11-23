@@ -92,7 +92,8 @@ fn an_error_under_json_is_one_error_document_and_exit_1() {
     assert_eq!(ran.stderr, "", "the error is in the document");
 }
 
-/// `x`, `q` and the like print a program's text: `--json` is refused before anything starts.
+/// `x`, `q`, `cancel`, `get`, `put` and the like write to stdout themselves: `--json` is refused
+/// before anything starts.
 #[test]
 fn a_streaming_command_refuses_json_before_it_touches_ssh() {
     for args in [
@@ -102,6 +103,9 @@ fn a_streaming_command_refuses_json_before_it_touches_ssh() {
         &["--json", "x", "ls"],
         &["--json", "run", "--", "ls"],
         &["--json", "fwd", "gpu-01:5000"],
+        &["--json", "cancel", "7"],
+        &["--json", "get", "out.txt"],
+        &["--json", "put", "in.txt"],
     ] {
         let (ran, dir) = rr("touch \"$STUB_DIR/ssh-was-run\"", args);
         assert_eq!(ran.code, Some(1), "{args:?}");

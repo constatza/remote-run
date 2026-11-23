@@ -119,17 +119,18 @@ impl RemoteCmd {
     /// Matched without a wildcard, so a new command must say which it is.
     pub fn stdout_use(&self) -> StdoutUse {
         match self {
-            RemoteCmd::Job(_)
-            | RemoteCmd::Cancel { .. }
-            | RemoteCmd::Pull { .. }
-            | RemoteCmd::Get { .. }
-            | RemoteCmd::Put { .. } => StdoutUse::Result,
+            RemoteCmd::Job(_) | RemoteCmd::Pull { .. } => StdoutUse::Result,
             // `--wait` shows the command's output on stderr under `--json`
             RemoteCmd::Run { wait, .. } => match wait.completion {
                 Completion::Wait => StdoutUse::Result,
                 Completion::Return => StdoutUse::ProgramOutput,
             },
-            RemoteCmd::Q
+            // `cancel` shows what `scancel` prints, `get` and `put` leave rsync's stdout inherited:
+            // all three write to the user's stdout before the result
+            RemoteCmd::Cancel { .. }
+            | RemoteCmd::Get { .. }
+            | RemoteCmd::Put { .. }
+            | RemoteCmd::Q
             | RemoteCmd::Acct { .. }
             | RemoteCmd::Log { .. }
             | RemoteCmd::X { .. }
@@ -605,6 +606,9 @@ mod tests {
             &["x", "ls"],
             &["run", "--", "ls"],
             &["fwd", "gpu-01:5000"],
+            &["cancel", "1"],
+            &["get", "a"],
+            &["put", "a"],
         ] {
             assert_eq!(stdout(streaming), StdoutUse::ProgramOutput, "{streaming:?}");
         }
@@ -612,9 +616,6 @@ mod tests {
             &["wait", "1"][..],
             &["status", "1"],
             &["pull"],
-            &["cancel", "1"],
-            &["get", "a"],
-            &["put", "a"],
             &["run", "--wait", "--", "ls"],
         ] {
             assert_eq!(stdout(result), StdoutUse::Result, "{result:?}");

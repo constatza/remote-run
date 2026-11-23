@@ -68,8 +68,9 @@ fn session(given: Settings, env: &Environment) -> Result<Session> {
 fn refuse_json_for(command: &RemoteCmd, format: Format) -> Result<()> {
     match (format, command.stdout_use()) {
         (Format::Json, StdoutUse::ProgramOutput) => bail!(
-            "--json does not apply to a command that prints a program's own output (q, acct, log, \
-             x, fwd, run without --wait): its text would not be one JSON document"
+            "--json does not apply to a command that writes to stdout before its result (q, acct, \
+             log, x, fwd, cancel, get, put, run without --wait): that would not be one JSON \
+             document"
         ),
         (Format::Json, StdoutUse::Result) | (Format::Text, _) => Ok(()),
     }
