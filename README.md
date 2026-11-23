@@ -71,6 +71,7 @@ rr pull [--force]             # fast-forward the remote checkout to your local H
 rr run [-t] [--force] [--wait] -- <cmd>...   # pull, then run; --wait then waits for the jobs it submitted
 rr get <remote> [local]       # rsync from the remote; relative paths are inside the project
 rr put <local> [remote]       # rsync to the remote (default: the project directory); never deletes
+rr fwd <host:port|name> [--open] [--socket] [--local P] [--ttl 8h]   # ssh port forward to localhost
 ```
 
 What reaches your terminal:
@@ -114,6 +115,29 @@ Code reaches the cluster only as a pushed commit. Push first (`git push`), then:
 3. It runs `git merge --ff-only <commit>`, so a diverged remote fails instead of merging. If the directory holds `uv.lock`, it also runs `uv sync --frozen --check`, which checks the environment without changing it. A mismatch exits with code 3 and prints what `uv` said; a remote without `uv` on `PATH` is an error (1), not a mismatch. `rr` never runs `uv sync` itself.
 
 Exit codes: 0 ok, 3 refused, any other code is the remote command's own or an `rr` error (1).
+
+### `rr fwd`
+
+Reach a service on a compute node (MLflow, TensorBoard, Jupyter) from your machine:
+
+```sh
+rr fwd gpu-01:5000 --open     # http://127.0.0.1:<free port>/ in your browser
+rr fwd mlflow --ttl 2h        # a forward named in the config, closed after 2 hours
+rr fwd gpu-01:5000 --socket   # a Unix socket in $XDG_RUNTIME_DIR for curl and other clients
+```
+
+```toml
+# ~/.config/rr/config.toml (a trusted .rr.toml may also have it)
+[forward.mlflow]
+target = "gpu-01:5000"
+local = 5051                  # optional; without it a free port is picked on every run
+```
+
+- It listens on `127.0.0.1` only; there is no way to bind another address. The URL is printed only after ssh has stayed up with the port accepting connections. If the port is taken, or ssh ends right after the port opened, nothing is printed and the exit code is not 0.
+- The forward ends after `--ttl` (default 8h, at most 7d), when ssh ends, on Ctrl-C, SIGTERM or SIGHUP, and, on Linux, when `rr` is killed with SIGKILL (the kernel signals ssh; other systems have no such guarantee). It runs with `ControlMaster=no`, so ending ssh really closes the tunnel.
+- A fixed `--local` port is checked free before ssh starts. By default each run picks a random port, because a browser shares the cookies of `127.0.0.1` across ports, so two forwards you keep open on fixed ports can see each other's login.
+- `--socket` creates `$XDG_RUNTIME_DIR/rr-<name>.sock`, readable only by you; `<name>` is the config name, or the remote port for `host:port`. A browser cannot use it, so `--socket` and `--open` do not combine. An existing file at that path is an error; remove it yourself if no `rr fwd` uses it.
+- Loopback is not private. On a shared workstation every local user can reach `127.0.0.1:<port>`, and any web page open in your browser can send requests to it (cross-site requests, DNS rebinding). Do not forward a service that has no login of its own unless you accept that; `--socket` protects against other local users but not against your own browser or programs.
 
 ### Example: a uv project with a submit command
 

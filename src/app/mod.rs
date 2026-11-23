@@ -14,6 +14,7 @@ pub mod acct;
 pub mod cancel;
 mod copy;
 pub mod exec;
+pub mod fwd;
 pub mod get;
 mod git;
 pub mod log;
@@ -23,6 +24,7 @@ pub mod q;
 pub mod run;
 pub mod status;
 pub mod trust;
+pub mod tunnel;
 pub mod wait;
 
 /// What a command may use besides its arguments.
@@ -114,6 +116,7 @@ mod testing {
                 env: Some(EnvFile::parse("env.sh").unwrap()),
                 dir: Some(RemoteDir::parse("proj").unwrap()),
             },
+            forwards: Default::default(),
         }
     }
 

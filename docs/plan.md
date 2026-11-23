@@ -30,7 +30,7 @@ Commits `91c06e7` to `8a09db1`, then the A6 commits. The tree passes `cargo fmt 
 | A5 README and `about` wording | done | none; `about` and the README name `wait` and `status`, and `rr` still has no `submit` or `watch` command |
 | A6 pull guards | partly | done: fail-closed state parsing, `realpath -m` workdirs, an unresolvable workdir blocks, uv missing is exit 127 and a mismatch is 75; the state script runs `git fetch -q --prune origin` so a branch deleted upstream stops counting; an empty `dir` is an error; the merge script re-asserts `HEAD == from` and a clean tree and exits 76 (`Reason::StateChanged { stderr }`, a refusal that shows the remote's sanitized stderr); `git branch -r --contains` must be non-empty or the target is `NotOnOrigin`; the POSIX-login-shell note is in the README (the script still goes as `bash -c '<script>'`, not on stdin). Open: the merge script does not re-check the job guard, so a job submitted between the state read and the merge is not seen. Not done: confirming on a real host that the stand-in-tested `git branch -r --contains <sha> --list 'origin/*'` and `realpath -m` behave the same on the cluster's git and coreutils |
 | B `wait`, `--json`, `status` | done (fake-tested only) | needs the real host: `rr wait` with a killed ssh must exit 6, `sacct -X -j` on an array parent and on a just-submitted id, `rr run --wait` with a real `sbatch` line, `ssh -t` with a piped stdout (`rr run -t --wait`). Not done: `--json` for `q` and `acct` (they stream the cluster's text), `rr status` restart count (no `sacct` field known for it), progress lines while waiting |
-| C `fwd` | not started | all |
+| C `fwd` | done | needs a check on the real host: `ss -ltn` shows the listener only on 127.0.0.1, and a real ssh dies with `rr` (PR_SET_PDEATHSIG; the test uses a stub ssh). The target host is resolved by the ssh server, not by `rr`. No end-to-end test with a real listener: the tests use a fake `ssh` child and, for `PR_SET_PDEATHSIG` and SIGTERM, a stub `ssh` script on `PATH` (`tests/fwd.rs`) |
 | D snapshots | not started | step 0 probe on the real host first |
 | E recipes and smaller items | not started | all |
 
@@ -213,7 +213,7 @@ Tests: a fake `Remote` returning scripted sacct output (PENDING, RUNNING, COMPLE
 
 ## Phase C: item 3, `rr fwd`
 
-Status: not started.
+Status: done.
 
 Keep the size estimate (about 150 lines), with these changes:
 

@@ -6,6 +6,7 @@
 
 pub mod argv;
 pub mod exit;
+pub mod fwd;
 pub mod host;
 pub mod ids;
 pub mod json;

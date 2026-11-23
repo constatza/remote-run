@@ -3,6 +3,7 @@
 
 // the vocabulary the ports speak is the core's
 pub use crate::domain::argv::{Argv, Captured, Stdin};
+use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath};
 use crate::domain::sanitize::sanitize_bytes;
 use crate::domain::shell::Script;
 pub use crate::domain::ssh::Terminal;
@@ -87,6 +88,33 @@ pub trait Exec {
     /// they are also read: the lines that start with `prefix` come back in [`Teed`]. Stdin and
     /// stderr stay inherited.
     fn stream_tee(&self, argv: &Argv, prefix: &str) -> Result<Teed>;
+    /// Start `argv` without waiting for it: no stdin, no stdout, its stderr filtered like
+    /// [`Exec::stream_filtered`]. For a program that is meant to keep running (an ssh tunnel); the
+    /// child ends when the handle is dropped, and when `rr` is killed or interrupted.
+    fn spawn(&self, argv: &Argv) -> Result<Box<dyn Child>>;
+}
+
+/// A program started by [`Exec::spawn`].
+pub trait Child {
+    /// Its exit code once it has ended (a child killed by a signal reads as non-zero, never as
+    /// success), else `None` while it runs.
+    fn try_wait(&mut self) -> Result<Option<i32>>;
+    /// End it and reap it. Ending a child that has already ended is not an error.
+    fn kill(&mut self) -> Result<()>;
+}
+
+/// The local network and the files a forward needs: asking a question about the machine, never
+/// changing it.
+pub trait Net {
+    /// A TCP port on loopback that nothing listens on: `want` when given (an error if taken),
+    /// else any free one. Another process can still take it before ssh binds; ssh then fails
+    /// (`ExitOnForwardFailure`), which `rr` reports.
+    fn free_port(&self, want: Option<LoopbackPort>) -> Result<LoopbackPort>;
+    /// An error when something already exists at `path`: a stale socket would make ssh fail to
+    /// bind, and removing a file that is not ours is not `rr`'s call.
+    fn socket_unused(&self, path: &SocketPath) -> Result<()>;
+    /// Whether a connection to `endpoint` is accepted right now.
+    fn accepts(&self, endpoint: &Endpoint) -> bool;
 }
 
 /// Runs scripts on the remote host; a trait so tests can record what would be sent. It takes a
@@ -133,6 +161,20 @@ impl Instant {
     }
 }
 
+/// The point at which something must be over: its start plus how long it may take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deadline(Instant);
+
+impl Deadline {
+    pub fn after(start: Instant, limit: Duration) -> Self {
+        Self(start.after(limit))
+    }
+
+    pub fn expired(self, now: Instant) -> bool {
+        now >= self.0
+    }
+}
+
 /// Time and sleeping, injected so that waiting runs in virtual time under test: a test that really
 /// slept 30 seconds is a test nobody runs.
 pub trait Clock {
@@ -155,6 +197,7 @@ pub mod fake {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     /// How a recorded call ran.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +206,7 @@ pub mod fake {
         Stream,
         StreamFiltered,
         StreamTee,
+        Spawn,
     }
 
     /// A scripted answer to `capture`.
@@ -317,10 +361,95 @@ pub mod fake {
         }
     }
 
+    /// A child that answers `try_wait` from a script, repeating the last answer, and counts kills.
+    pub struct FakeChild {
+        waits: VecDeque<Option<i32>>,
+        killed: Rc<Cell<u32>>,
+    }
+
+    impl FakeChild {
+        /// `waits` are the answers of successive `try_wait` calls; once killed, it has ended.
+        pub fn new(waits: Vec<Option<i32>>) -> (Self, Rc<Cell<u32>>) {
+            let killed = Rc::new(Cell::new(0));
+            let child = Self {
+                waits: waits.into(),
+                killed: Rc::clone(&killed),
+            };
+            (child, killed)
+        }
+    }
+
+    /// The code a killed fake child reads as: 128 + SIGKILL.
+    pub const KILLED_EXIT: i32 = 137;
+
+    impl Child for FakeChild {
+        fn try_wait(&mut self) -> Result<Option<i32>> {
+            if self.killed.get() > 0 {
+                return Ok(Some(KILLED_EXIT));
+            }
+            Ok(match self.waits.len() {
+                0 => None,
+                1 => self.waits[0],
+                _ => self.waits.pop_front().flatten(),
+            })
+        }
+
+        fn kill(&mut self) -> Result<()> {
+            self.killed.set(self.killed.get() + 1);
+            Ok(())
+        }
+    }
+
+    /// A scripted [`Net`]: `free` is the port it hands out (`None`: every port is taken),
+    /// `accepts` answers successive checks, repeating the last, and `socket_taken` says whether a
+    /// file is in the way.
+    pub struct FakeNet {
+        pub free: Option<u16>,
+        pub accepts: RefCell<VecDeque<bool>>,
+        pub socket_taken: bool,
+    }
+
+    impl FakeNet {
+        pub fn new(free: Option<u16>, accepts: Vec<bool>) -> Self {
+            Self {
+                free,
+                accepts: RefCell::new(accepts.into()),
+                socket_taken: false,
+            }
+        }
+    }
+
+    impl Net for FakeNet {
+        fn free_port(&self, want: Option<LoopbackPort>) -> Result<LoopbackPort> {
+            match (self.free, want) {
+                (None, _) => anyhow::bail!("port in use"),
+                (Some(_), Some(want)) => Ok(want),
+                (Some(free), None) => LoopbackPort::from_u16(free),
+            }
+        }
+
+        fn socket_unused(&self, path: &SocketPath) -> Result<()> {
+            if self.socket_taken {
+                anyhow::bail!("{} exists", path.as_str());
+            }
+            Ok(())
+        }
+
+        fn accepts(&self, _: &Endpoint) -> bool {
+            let mut answers = self.accepts.borrow_mut();
+            if answers.len() > 1 {
+                answers.pop_front().unwrap_or_default()
+            } else {
+                answers.front().copied().unwrap_or_default()
+            }
+        }
+    }
+
     #[derive(Default)]
     pub struct FakeExec {
         captures: RefCell<VecDeque<Reply>>,
         streams: RefCell<VecDeque<i32>>,
+        children: RefCell<VecDeque<FakeChild>>,
         pub calls: RefCell<Vec<(Argv, How)>>,
     }
 
@@ -329,8 +458,15 @@ pub mod fake {
             Self {
                 captures: RefCell::new(captures.into()),
                 streams: RefCell::new(streams.into()),
+                children: RefCell::default(),
                 calls: RefCell::default(),
             }
+        }
+
+        /// The children that `spawn` hands out, in order.
+        pub fn with_children(self, children: Vec<FakeChild>) -> Self {
+            *self.children.borrow_mut() = children.into();
+            self
         }
 
         /// The program and arguments of every call, as words.
@@ -390,6 +526,12 @@ pub mod fake {
                 code,
                 matched: vec![],
             })
+        }
+
+        fn spawn(&self, argv: &Argv) -> Result<Box<dyn Child>> {
+            self.calls.borrow_mut().push((argv.clone(), How::Spawn));
+            let child = self.children.borrow_mut().pop_front();
+            Ok(Box::new(child.expect("an unexpected spawn")))
         }
     }
 

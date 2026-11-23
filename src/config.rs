@@ -5,12 +5,14 @@
 //! The user file suits what belongs to you on a cluster (the host alias, the shell file that puts
 //! `uv` on PATH); `.rr.toml` suits what belongs to a project (its remote directory).
 
+use crate::domain::fwd::{ForwardName, ForwardSpec, ForwardTable, ForwardTarget, LoopbackPort};
 use crate::domain::host::Host;
 use crate::domain::ids::{Digest, digest};
 use crate::domain::place::{EnvFile, Place, RemoteDir};
 use crate::trust::{TrustStore, store_file};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -27,15 +29,31 @@ pub struct Settings {
     pub dir: Option<String>,
     /// Remote shell file sourced before every command.
     pub env: Option<String>,
+    /// Forwards by name, for `rr fwd <name>`.
+    #[serde(default)]
+    pub forward: BTreeMap<String, ForwardEntry>,
+}
+
+/// One `[forward.<name>]` table, as written: validated by [`resolve`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardEntry {
+    /// `host:port` on the cluster side.
+    pub target: String,
+    /// A fixed local port; absent, a free one is picked on every run.
+    pub local: Option<u16>,
 }
 
 impl Settings {
-    /// `self` where set, else `lower` (pure).
+    /// `self` where set, else `lower` (pure); forwards merge by name.
     pub fn over(self, lower: Settings) -> Settings {
+        let mut forward = lower.forward;
+        forward.extend(self.forward);
         Settings {
             host: self.host.or(lower.host),
             dir: self.dir.or(lower.dir),
             env: self.env.or(lower.env),
+            forward,
         }
     }
 }
@@ -47,6 +65,8 @@ pub struct Environment {
     pub cwd: PathBuf,
     pub xdg_config_home: Option<String>,
     pub xdg_state_home: Option<String>,
+    /// A private per-user directory, where a forward's Unix socket goes.
+    pub xdg_runtime_dir: Option<String>,
     pub home: Option<String>,
     pub appdata: Option<String>,
 }
@@ -89,6 +109,7 @@ pub fn utf8_var(name: &str, value: Option<OsString>) -> Result<Option<String>> {
 pub struct Session {
     pub host: Host,
     pub place: Place,
+    pub forwards: ForwardTable,
 }
 
 /// Validate the merged settings once, at the boundary (pure).
@@ -104,7 +125,24 @@ pub fn resolve(settings: Settings) -> Result<Session> {
             env: settings.env.as_deref().map(EnvFile::parse).transpose()?,
             dir: settings.dir.as_deref().map(RemoteDir::parse).transpose()?,
         },
+        forwards: settings
+            .forward
+            .into_iter()
+            .map(|(name, entry)| resolve_forward(&name, entry))
+            .collect::<Result<_>>()?,
     })
+}
+
+fn resolve_forward(name: &str, entry: ForwardEntry) -> Result<(ForwardName, ForwardSpec)> {
+    let spec = || -> Result<ForwardSpec> {
+        Ok(ForwardSpec {
+            target: ForwardTarget::parse(&entry.target)?,
+            local: entry.local.map(LoopbackPort::from_u16).transpose()?,
+        })
+    };
+    let name = ForwardName::parse(name)?;
+    let spec = spec().with_context(|| format!("in forward.{name}"))?;
+    Ok((name, spec))
 }
 
 /// Read one file; a missing file is empty settings, a malformed one an error naming the file.
@@ -239,6 +277,7 @@ pub fn load(
 #[allow(clippy::disallowed_methods)] // tests build real files
 mod tests {
     use super::*;
+    use crate::domain::fwd::Wanted;
     use std::fs;
 
     fn settings(host: Option<&str>, dir: Option<&str>, env: Option<&str>) -> Settings {
@@ -246,6 +285,7 @@ mod tests {
             host: host.map(Into::into),
             dir: dir.map(Into::into),
             env: env.map(Into::into),
+            forward: BTreeMap::new(),
         }
     }
 
@@ -306,6 +346,55 @@ mod tests {
             resolve(settings(Some("h"), None, None)).unwrap().place,
             Place::default()
         );
+    }
+
+    fn forwards(text: &str) -> Settings {
+        toml::from_str(&format!("host = \"h\"\n{text}")).unwrap()
+    }
+
+    #[test]
+    fn forwards_are_validated_when_resolved_and_merge_by_name() {
+        let ok = forwards("[forward.mlflow]\ntarget = \"gpu-01:5000\"\nlocal = 5051\n");
+        let table = resolve(ok.clone()).unwrap().forwards;
+        let plan = table.plan(Wanted::parse("mlflow").unwrap(), None).unwrap();
+        assert_eq!(plan.target.to_string(), "gpu-01:5000");
+        assert_eq!(plan.local.map(LoopbackPort::get), Some(5051));
+        for bad in [
+            "[forward.mlflow]\ntarget = \"-oProxyCommand=x:1\"\n",
+            "[forward.mlflow]\ntarget = \"host\"\n",
+            "[forward.mlflow]\ntarget = \"h:1\"\nlocal = 0\n",
+            "[forward.\"../x\"]\ntarget = \"h:1\"\n",
+            "[forward.a]\ntarget = \"h:1\"\nbind = \"0.0.0.0\"\n",
+        ] {
+            let parsed: Result<Settings, _> = toml::from_str(&format!("host = \"h\"\n{bad}"));
+            assert!(
+                parsed.map_or(true, |settings| resolve(settings).is_err()),
+                "{bad}"
+            );
+        }
+        let project = forwards("[forward.mlflow]\ntarget = \"other:1\"\n");
+        let merged = project.over(ok);
+        assert_eq!(merged.forward["mlflow"].target, "other:1");
+        assert_eq!(merged.forward["mlflow"].local, None);
+    }
+
+    /// A forward can point `rr fwd` at any host:port of the cluster, so a project file supplies
+    /// one only after `rr trust`, like every other setting.
+    #[test]
+    fn a_forward_in_a_project_file_counts_only_once_it_is_trusted() {
+        let root = tempfile::tempdir().unwrap();
+        let text = "host = \"h\"\n[forward.db]\ntarget = \"internal:5432\"\n";
+        fs::write(root.path().join(PROJECT_FILE), text).unwrap();
+        let refused = load(root.path(), None, || Ok(TrustStore::default()));
+        assert!(refused.unwrap_err().to_string().contains("not trusted"));
+        let store = trusting(root.path());
+        let loaded = load(root.path(), None, || Ok(store)).unwrap();
+        assert!(loaded.forward.contains_key("db"));
+        let user = root.path().join("user.toml");
+        fs::write(&user, "[forward.mine]\ntarget = \"a:1\"\n").unwrap();
+        let store = trusting(root.path());
+        let both = load(root.path(), Some(&user), || Ok(store)).unwrap();
+        assert_eq!(both.forward.len(), 2);
     }
 
     #[test]

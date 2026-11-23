@@ -9,9 +9,8 @@ mod cli;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Cmd, JobCmd, RemoteCmd};
-use remote_run::adapters::OsExec;
-use remote_run::adapters::{Ssh, SystemClock};
+use cli::{Cli, Cmd, FwdArgs, JobCmd, RemoteCmd};
+use remote_run::adapters::{OsExec, OsNet, Ssh, SystemClock};
 use remote_run::app::{self, Ports};
 use remote_run::config::{Environment, Session, Settings, load, resolve, utf8_var};
 use remote_run::domain::outcome::{Outcome, render, render_error};
@@ -48,6 +47,7 @@ fn environment() -> Result<Environment> {
         cwd: std::env::current_dir()?,
         xdg_config_home: var("XDG_CONFIG_HOME")?,
         xdg_state_home: var("XDG_STATE_HOME")?,
+        xdg_runtime_dir: var("XDG_RUNTIME_DIR")?,
         home: var("HOME")?,
         appdata: var("APPDATA")?,
     })
@@ -72,6 +72,7 @@ fn run(cli: Cli, env: &Environment) -> Result<Outcome> {
         host: cli.host,
         dir: cli.dir,
         env: cli.env_file,
+        ..Settings::default()
     };
     let session = session(given, env)?;
     let exec = OsExec;
@@ -83,7 +84,7 @@ fn run(cli: Cli, env: &Environment) -> Result<Outcome> {
         notes: &StderrNotes,
         clock: &clock,
     };
-    dispatch(command, &session, &ports)
+    dispatch(command, &session, &ports, env)
 }
 
 fn dispatch_job(command: JobCmd, session: &Session, ports: &Ports) -> Result<Outcome> {
@@ -101,7 +102,12 @@ fn dispatch_job(command: JobCmd, session: &Session, ports: &Ports) -> Result<Out
     }
 }
 
-fn dispatch(command: RemoteCmd, session: &Session, ports: &Ports) -> Result<Outcome> {
+fn dispatch(
+    command: RemoteCmd,
+    session: &Session,
+    ports: &Ports,
+    env: &Environment,
+) -> Result<Outcome> {
     match command {
         RemoteCmd::Job(command) => dispatch_job(command, session, ports),
         RemoteCmd::Q => app::q::run(session, ports),
@@ -123,6 +129,7 @@ fn dispatch(command: RemoteCmd, session: &Session, ports: &Ports) -> Result<Outc
             let args = app::run::Args::new(policy, terminal, cmd, wait.after());
             app::run::run(session, args, ports)
         }
+        RemoteCmd::Fwd(args) => fwd(session, args, ports, env),
         RemoteCmd::Get {
             remote,
             local,
@@ -148,4 +155,15 @@ fn dispatch(command: RemoteCmd, session: &Session, ports: &Ports) -> Result<Outc
             app::put::run(session, args, ports)
         }
     }
+}
+
+/// `rr fwd` is the one command that also needs the local network, clock and runtime directory.
+fn fwd(session: &Session, args: FwdArgs, ports: &Ports, env: &Environment) -> Result<Outcome> {
+    let clock = SystemClock::new();
+    let machine = app::fwd::Machine {
+        net: &OsNet,
+        clock: &clock,
+        runtime_dir: env.xdg_runtime_dir.as_deref(),
+    };
+    app::fwd::run(session, args.into(), ports, &machine)
 }
