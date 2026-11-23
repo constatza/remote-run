@@ -21,6 +21,7 @@ pub mod log;
 pub mod pull;
 pub mod put;
 pub mod q;
+pub mod recipe;
 pub mod run;
 pub mod status;
 pub mod trust;
@@ -117,6 +118,7 @@ mod testing {
                 dir: Some(RemoteDir::parse("proj").unwrap()),
             },
             forwards: Default::default(),
+            recipes: Default::default(),
         }
     }
 

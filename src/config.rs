@@ -9,6 +9,7 @@ use crate::domain::fwd::{ForwardName, ForwardSpec, ForwardTable, ForwardTarget, 
 use crate::domain::host::Host;
 use crate::domain::ids::{Digest, digest};
 use crate::domain::place::{EnvFile, Place, RemoteDir};
+use crate::domain::recipe::{Recipe, RecipeName, RecipePull, RecipeTable};
 use crate::trust::{TrustStore, store_file};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -32,6 +33,9 @@ pub struct Settings {
     /// Forwards by name, for `rr fwd <name>`.
     #[serde(default)]
     pub forward: BTreeMap<String, ForwardEntry>,
+    /// Commands by name, for `rr do <name>`.
+    #[serde(default)]
+    pub recipe: BTreeMap<String, RecipeEntry>,
 }
 
 /// One `[forward.<name>]` table, as written: validated by [`resolve`].
@@ -44,16 +48,30 @@ pub struct ForwardEntry {
     pub local: Option<u16>,
 }
 
+/// One `[recipe.<name>]` table, as written: validated by [`resolve`]. The command is a list of
+/// words, so no shell text can be written here.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeEntry {
+    /// The command's words; `{slot}` is filled by `rr do --set slot=value`.
+    pub run: Vec<String>,
+    /// `"checkout"` (the default) or `"none"`.
+    pub pull: Option<String>,
+}
+
 impl Settings {
-    /// `self` where set, else `lower` (pure); forwards merge by name.
+    /// `self` where set, else `lower` (pure); forwards and recipes merge by name.
     pub fn over(self, lower: Settings) -> Settings {
         let mut forward = lower.forward;
         forward.extend(self.forward);
+        let mut recipe = lower.recipe;
+        recipe.extend(self.recipe);
         Settings {
             host: self.host.or(lower.host),
             dir: self.dir.or(lower.dir),
             env: self.env.or(lower.env),
             forward,
+            recipe,
         }
     }
 }
@@ -110,6 +128,7 @@ pub struct Session {
     pub host: Host,
     pub place: Place,
     pub forwards: ForwardTable,
+    pub recipes: RecipeTable,
 }
 
 /// Validate the merged settings once, at the boundary (pure).
@@ -130,7 +149,25 @@ pub fn resolve(settings: Settings) -> Result<Session> {
             .into_iter()
             .map(|(name, entry)| resolve_forward(&name, entry))
             .collect::<Result<_>>()?,
+        recipes: settings
+            .recipe
+            .into_iter()
+            .map(|(name, entry)| resolve_recipe(&name, &entry))
+            .collect::<Result<_>>()?,
     })
+}
+
+fn resolve_recipe(name: &str, entry: &RecipeEntry) -> Result<(RecipeName, Recipe)> {
+    let name = RecipeName::parse(name)?;
+    let recipe = || -> Result<Recipe> {
+        let pull = entry
+            .pull
+            .as_deref()
+            .map_or(Ok(RecipePull::Checkout), RecipePull::parse)?;
+        Recipe::new(&entry.run, pull)
+    };
+    let recipe = recipe().with_context(|| format!("in recipe.{name}"))?;
+    Ok((name, recipe))
 }
 
 fn resolve_forward(name: &str, entry: ForwardEntry) -> Result<(ForwardName, ForwardSpec)> {
@@ -286,6 +323,7 @@ mod tests {
             dir: dir.map(Into::into),
             env: env.map(Into::into),
             forward: BTreeMap::new(),
+            recipe: BTreeMap::new(),
         }
     }
 
@@ -387,6 +425,49 @@ mod tests {
         let merged = project.over(ok);
         assert_eq!(merged.forward["mlflow"].target, "other:1");
         assert_eq!(merged.forward["mlflow"].local, None);
+    }
+
+    #[test]
+    fn recipes_are_validated_when_resolved_and_merge_by_name() {
+        let ok = forwards("[recipe.train]\nrun = [\"python\", \"{cfg}\"]\npull = \"none\"\n");
+        let table = resolve(ok.clone()).unwrap().recipes;
+        let name = RecipeName::parse("train").unwrap();
+        assert_eq!(table[&name].pull(), RecipePull::Skip);
+        // each of these is well-formed TOML that only `resolve` can refuse
+        for bad in [
+            "[recipe.t]\nrun = []\n",
+            "[recipe.t]\nrun = [\"echo\", \"{a\"]\n",
+            "[recipe.t]\nrun = [\"echo\"]\npull = \"snapshot\"\n",
+            "[recipe.\"../x\"]\nrun = [\"echo\"]\n",
+        ] {
+            let parsed: Result<Settings, _> = toml::from_str(&format!("host = \"h\"\n{bad}"));
+            assert!(parsed.is_ok(), "{bad} must reach resolve");
+            assert!(resolve(parsed.unwrap()).is_err(), "{bad}");
+        }
+        // a shell string is not a list of words, and an unknown key is refused
+        for bad in [
+            "[recipe.t]\nrun = \"echo hi\"\n",
+            "[recipe.t]\nrun = [\"echo\"]\nwait = true\n",
+        ] {
+            assert!(toml::from_str::<Settings>(&format!("host = \"h\"\n{bad}")).is_err());
+        }
+        let project = forwards("[recipe.train]\nrun = [\"other\"]\n");
+        let merged = project.over(ok);
+        assert_eq!(merged.recipe["train"].run, ["other"]);
+        assert_eq!(merged.recipe["train"].pull, None);
+    }
+
+    /// A recipe is a command the cluster runs, so a project file supplies one only after `rr trust`.
+    #[test]
+    fn a_recipe_in_a_project_file_counts_only_once_it_is_trusted() {
+        let root = tempfile::tempdir().unwrap();
+        let text = "host = \"h\"\n[recipe.go]\nrun = [\"curl\", \"evil\"]\n";
+        fs::write(root.path().join(PROJECT_FILE), text).unwrap();
+        let refused = load(root.path(), None, || Ok(TrustStore::default()));
+        assert!(refused.unwrap_err().to_string().contains("not trusted"));
+        let store = trusting(root.path());
+        let loaded = load(root.path(), None, || Ok(store)).unwrap();
+        assert!(loaded.recipe.contains_key("go"));
     }
 
     /// A forward can point `rr fwd` at any host:port of the cluster, so a project file supplies

@@ -8,6 +8,7 @@ use remote_run::app::wait::Limits;
 use remote_run::domain::fwd::{Browser, LoopbackPort, Transport, Ttl, Wanted};
 use remote_run::domain::outcome::Format;
 use remote_run::domain::pull::JobPolicy;
+use remote_run::domain::recipe::{Assignment, RecipeName, Values};
 use remote_run::domain::slurm::{AcctColumns, AcctSelection, Follow, JobId, JobSet};
 use remote_run::domain::transfer::parse_size;
 use remote_run::domain::wait::{DEFAULT_TIMEOUT, PollInterval};
@@ -33,7 +34,7 @@ pub struct Cli {
     pub env_file: Option<String>,
     /// write the result as one JSON object on stdout (for `wait`, `status`, `pull`, `trust`, `fwd`
     /// and `run --wait`, which then shows the command's output on stderr); refused for `q`, `acct`,
-    /// `log`, `x`, `cancel`, `get`, `put` and `run` without `--wait`, which write to stdout
+    /// `log`, `x`, `do`, `cancel`, `get`, `put` and `run` without `--wait`, which write to stdout
     /// themselves
     #[arg(long = "json", num_args = 0, default_value = "text", default_missing_value = "json", value_parser = parse_format, global = true)]
     pub format: Format,
@@ -133,6 +134,7 @@ impl RemoteCmd {
             | RemoteCmd::Put { .. }
             | RemoteCmd::Q
             | RemoteCmd::Acct(_)
+            | RemoteCmd::Do(_)
             | RemoteCmd::Log { .. }
             | RemoteCmd::X { .. } => StdoutUse::ProgramOutput,
         }
@@ -229,6 +231,8 @@ pub enum RemoteCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Run a recipe: a named command from the config, with `{slot}` values given by --set
+    Do(DoArgs),
     /// Forward a cluster port to localhost over ssh (127.0.0.1 only; closes after --ttl)
     Fwd(FwdArgs),
     /// Copy from the remote (rsync); relative remote paths are inside the project directory
@@ -273,6 +277,39 @@ impl From<AcctArgs> for app::acct::Args {
             selection,
             columns: args.columns,
         }
+    }
+}
+
+/// `rr do`'s arguments.
+#[derive(clap::Args)]
+pub struct DoArgs {
+    /// the recipe's name in the config (`[recipe.<name>]`)
+    #[arg(value_parser = RecipeName::parse)]
+    name: RecipeName,
+    /// the value of a {slot} of the recipe's command; repeat it for several slots
+    #[arg(long = "set", value_name = "SLOT=VALUE", value_parser = Assignment::parse)]
+    set: Vec<Assignment>,
+    /// fast-forward even while jobs submitted from the checkout are active
+    #[arg(long = "force", num_args = 0, default_value = "respect", default_missing_value = "override", value_parser = parse_policy)]
+    policy: JobPolicy,
+    #[arg(short, long = "tty", num_args = 0, default_value = "plain", default_missing_value = "attached", value_parser = parse_terminal)]
+    terminal: Terminal,
+    /// words added after the recipe's command (after `--`)
+    #[arg(last = true)]
+    extra: Vec<String>,
+}
+
+impl TryFrom<DoArgs> for app::recipe::Args {
+    type Error = anyhow::Error;
+
+    fn try_from(args: DoArgs) -> anyhow::Result<Self> {
+        Ok(Self {
+            name: args.name,
+            values: Values::new(args.set)?,
+            extra: args.extra,
+            policy: args.policy,
+            terminal: args.terminal,
+        })
     }
 }
 
@@ -519,6 +556,29 @@ mod tests {
             refused(&["x", "--tty=attached", "ls"]),
             "a flag takes no value"
         );
+    }
+
+    #[test]
+    fn do_takes_a_recipe_values_and_the_words_after_the_double_dash() {
+        let argv = [
+            "do", "train", "--set", "a=1", "--set", "b=x=y", "-t", "--", "--fast", "-n",
+        ];
+        let Cmd::Remote(RemoteCmd::Do(args)) = command_of(&argv) else {
+            panic!("not a do");
+        };
+        let args = app::recipe::Args::try_from(args).unwrap();
+        assert_eq!(args.name.to_string(), "train");
+        assert_eq!(args.extra, ["--fast", "-n"]);
+        assert_eq!(args.terminal, Terminal::Attached);
+        assert_eq!(args.policy, JobPolicy::Respect);
+        assert!(refused(&["do"]));
+        assert!(refused(&["do", "../x"]));
+        assert!(refused(&["do", "train", "--set", "novalue"]));
+        let twice = command_of(&["do", "t", "--set", "a=1", "--set", "a=2"]);
+        let Cmd::Remote(RemoteCmd::Do(twice)) = twice else {
+            panic!("not a do");
+        };
+        assert!(app::recipe::Args::try_from(twice).is_err());
     }
 
     fn acct_of(args: &[&str]) -> app::acct::Args {

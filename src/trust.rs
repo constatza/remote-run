@@ -1,6 +1,7 @@
 //! Which project files (`.rr.toml`) the user has reviewed.
 //!
-//! A project file can name the host, the remote directory and a shell file the remote sources, so
+//! A project file can name the host, the remote directory, a shell file the remote sources and the
+//! commands of recipes, so
 //! a file from a cloned repository must not apply on its own. `rr trust` records the SHA-256 of the
 //! reviewed bytes next to the file's canonical path; any change makes the file untrusted again.
 
@@ -68,8 +69,8 @@ impl TrustStore {
             return Ok(());
         }
         bail!(
-            "{} is not trusted (a project file can choose the host, the remote directory and a \
-             shell file the remote sources): review it with `rr trust`, then run `rr trust --yes`",
+            "{} is not trusted (a project file can choose the host, the remote directory, a \
+             shell file the remote sources and the commands of recipes): review it with `rr trust`, then run `rr trust --yes`",
             path.display()
         )
     }

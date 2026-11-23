@@ -15,6 +15,7 @@ pub mod logpath;
 pub mod outcome;
 pub mod place;
 pub mod pull;
+pub mod recipe;
 pub mod sanitize;
 pub mod shell;
 pub mod slurm;
