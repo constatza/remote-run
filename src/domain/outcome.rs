@@ -2,6 +2,7 @@
 //! code. Commands never print and never pick an exit code; `main` prints what [`render`] returns.
 
 use crate::domain::exit::{Exit, RemoteExit, RrCode};
+use crate::domain::fwd::Closed;
 use crate::domain::ids::Digest;
 use crate::domain::json;
 use crate::domain::pull::{Next, PullOutcome, next};
@@ -26,6 +27,8 @@ pub enum Outcome {
     Waited(WaitOutcome),
     /// One job's status, from `rr status`.
     Status(StatusReport),
+    /// A forward that `rr` closed (`rr fwd`): its time to live ran out, or `rr` was interrupted.
+    Forwarded(Closed),
 }
 
 /// What `rr trust` did with a project file.
@@ -124,6 +127,8 @@ fn render_text(outcome: &Outcome) -> Rendered {
             stdout: lines(&status_report(report)),
             stderr: String::new(),
         },
+        Outcome::Forwarded(Closed::Expired) => Rendered::exiting(Exit::Success),
+        Outcome::Forwarded(Closed::Interrupted) => Rendered::exiting(Exit::Rr(RrCode::Interrupted)),
     }
 }
 
@@ -159,8 +164,13 @@ pub fn wait_report(outcome: &WaitOutcome) -> Vec<String> {
     };
     match outcome {
         WaitOutcome::Completed(rows) | WaitOutcome::Failed(rows) => states(rows),
-        WaitOutcome::TimedOut(rows) => {
+        WaitOutcome::TimedOut { rows, unlisted } => {
             let mut report = states(rows);
+            report.extend(
+                unlisted
+                    .iter()
+                    .map(|job| format!("rr: {} not listed by sacct", sanitize(job.as_str()))),
+            );
             report.push("rr: timed out; the jobs are still active".to_string());
             report
         }
@@ -194,7 +204,13 @@ fn render_trust(report: &TrustReport) -> Rendered {
 /// text, so it passes through [`sanitize`] whole. In text, one line on stderr; in JSON, one error
 /// document on stdout (and nothing on stderr), so a script that reads stdout always gets a document.
 pub fn render_error(err: &anyhow::Error, format: Format) -> Rendered {
-    let exit = Exit::Rr(RrCode::Failure);
+    render_error_as(err, format, RrCode::Failure)
+}
+
+/// [`render_error`] with the code `rr` exits with given, for an error that is not a plain failure
+/// (a command line clap refused is [`RrCode::Usage`]).
+pub fn render_error_as(err: &anyhow::Error, format: Format, code: RrCode) -> Rendered {
+    let exit = Exit::Rr(code);
     match format {
         Format::Text => Rendered {
             exit,
@@ -413,8 +429,21 @@ mod tests {
     }
 
     #[test]
+    fn a_usage_error_keeps_clap_s_code_in_both_formats() {
+        let err = anyhow::anyhow!("unexpected argument '--bogus'");
+        let text = render_error_as(&err, Format::Text, RrCode::Usage);
+        assert_eq!(text.exit.code(), 2);
+        let json = render_error_as(&err, Format::Json, RrCode::Usage);
+        assert_eq!(json.exit.code(), 2);
+        let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+        assert_eq!(value["exit"], 2);
+        assert_eq!(value["kind"], "error");
+        assert_eq!(value["source"], "rr");
+    }
+
+    #[test]
     fn a_wait_prints_one_line_per_job_and_exits_with_its_own_code() {
-        use crate::domain::slurm::{JobState, SqueueId};
+        use crate::domain::slurm::{JobId, JobState, SqueueId};
         let row = |id: &str, state: &str| JobStatus {
             id: SqueueId::parse(id).unwrap(),
             state: JobState::parse(state),
@@ -429,11 +458,14 @@ mod tests {
             failed.stderr,
             "rr: 7 COMPLETED\nrr: 8 ?[2J\n".replace("?[2J", "FAILED?[2J")
         );
-        let late = waited(WaitOutcome::TimedOut(rows));
+        let late = waited(WaitOutcome::TimedOut {
+            rows,
+            unlisted: vec![JobId::parse("9").unwrap()],
+        });
         assert_eq!(late.exit, Exit::Rr(RrCode::Timeout));
         assert!(
             late.stderr
-                .ends_with("rr: timed out; the jobs are still active\n")
+                .ends_with("rr: 9 not listed by sacct\nrr: timed out; the jobs are still active\n")
         );
         let unknown = waited(WaitOutcome::Unknown {
             why: "no\u{1b}[2J".into(),
@@ -444,6 +476,21 @@ mod tests {
             "rr: could not tell how the jobs ended: no?[2J\n"
         );
         assert_eq!(unknown.stdout, "");
+    }
+
+    #[test]
+    fn a_forward_that_rr_closed_is_an_rr_exit_not_a_remote_one() {
+        let expired = text(&Outcome::Forwarded(Closed::Expired));
+        assert_eq!(expired.exit, Exit::Success);
+        let interrupted = text(&Outcome::Forwarded(Closed::Interrupted));
+        assert_eq!(interrupted.exit, Exit::Rr(RrCode::Interrupted));
+        assert_ne!(interrupted.exit, Exit::remote(130));
+        assert_eq!(interrupted.exit.code(), 130);
+        // the notes port already said why; nothing is written twice
+        assert_eq!(
+            (interrupted.stdout, interrupted.stderr),
+            (String::new(), String::new())
+        );
     }
 
     #[test]

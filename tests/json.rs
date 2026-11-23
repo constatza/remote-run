@@ -92,7 +92,8 @@ fn an_error_under_json_is_one_error_document_and_exit_1() {
     assert_eq!(ran.stderr, "", "the error is in the document");
 }
 
-/// `x`, `q` and the like print a program's text: `--json` is refused before anything starts.
+/// `x`, `q`, `cancel`, `get`, `put` and the like write to stdout themselves: `--json` is refused
+/// before anything starts.
 #[test]
 fn a_streaming_command_refuses_json_before_it_touches_ssh() {
     for args in [
@@ -102,6 +103,9 @@ fn a_streaming_command_refuses_json_before_it_touches_ssh() {
         &["--json", "x", "ls"],
         &["--json", "run", "--", "ls"],
         &["--json", "fwd", "gpu-01:5000"],
+        &["--json", "cancel", "7"],
+        &["--json", "get", "out.txt"],
+        &["--json", "put", "in.txt"],
     ] {
         let (ran, dir) = rr("touch \"$STUB_DIR/ssh-was-run\"", args);
         assert_eq!(ran.code, Some(1), "{args:?}");
@@ -136,4 +140,25 @@ esac"#,
         "{}",
         ran.stderr
     );
+}
+
+/// clap's usage error keeps its exit code 2; under `--json` it is the one document, on stdout.
+#[test]
+fn a_usage_error_under_json_is_one_document_with_exit_2() {
+    let (ran, _dir) = rr("true", &["--json", "--bogus"]);
+    assert_eq!(ran.code, Some(2));
+    let document = ran.document();
+    assert_eq!(
+        (&document["source"], &document["exit"], &document["kind"]),
+        (&json!("rr"), &json!(2), &json!("error"))
+    );
+    assert!(document["message"].as_str().unwrap().contains("--bogus"));
+    assert_eq!(ran.stderr, "");
+    // without --json clap prints its own text, and --help is still a success
+    let (ran, _dir) = rr("true", &["--bogus"]);
+    assert_eq!((ran.code, ran.stdout.as_str()), (Some(2), ""));
+    assert!(ran.stderr.contains("--bogus"));
+    let (ran, _dir) = rr("true", &["--json", "--help"]);
+    assert_eq!(ran.code, Some(0));
+    assert!(ran.stdout.contains("Usage"));
 }

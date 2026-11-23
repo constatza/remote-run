@@ -3,10 +3,12 @@
 //! the forward at its deadline, and an interrupt or the death of `rr` ends ssh.
 
 use super::Ports;
-use super::tunnel::{End, ListeningForward, Started, StartingForward};
+use super::tunnel::{End, ListeningForward, NotStopped, Started, StartingForward};
 use crate::config::Session;
 use crate::domain::exit::RemoteExit;
-use crate::domain::fwd::{Browser, Endpoint, Listener, LoopbackPort, OpenUrl, Plan, SocketPath};
+use crate::domain::fwd::{
+    Browser, Closed, Endpoint, Listener, LoopbackPort, OpenUrl, Plan, SocketPath,
+};
 use crate::domain::fwd::{Transport, Ttl, Wanted};
 use crate::domain::outcome::Outcome;
 use crate::ports::{Deadline, Net};
@@ -27,26 +29,46 @@ pub struct Machine<'a> {
     pub runtime_dir: Option<&'a str>,
 }
 
-/// The code of a forward that `rr` closed on an interrupt: 128 plus SIGINT, as a shell reports
-/// Ctrl-C.
-const INTERRUPTED_EXIT: i32 = 130;
-
 pub fn run(session: &Session, args: Args, ports: &Ports, machine: &Machine) -> Result<Outcome> {
     let plan = session
         .forwards
         .plan(args.wanted, args.local, args.transport, args.browser)?;
     let endpoint = endpoint(&plan, machine)?;
     let served = serve(session, &plan, &endpoint, args.ttl, (ports, machine));
-    // ssh is reaped by now however `served` ended. The path was free before ssh started (a taken
-    // one is refused above), so a file there is ssh's: a SIGKILLed ssh leaves it behind and the
-    // next `rr fwd` of this name would be refused. (Two `rr fwd` of the same name at once is not
-    // supported: the one that fails to bind would remove the other's socket.)
-    if let Endpoint::Unix(path) = &endpoint
-        && let Err(err) = machine.net.remove_socket(path)
-    {
-        ports.notes.note(&format!("rr: {err:#}"));
+    // The path was free before ssh started (a taken one is refused above), so a file there is
+    // ssh's: a SIGKILLed ssh leaves it behind and the next `rr fwd` of this name would be
+    // refused. A socket file is removed only once ssh is known to be gone: one that could not be
+    // stopped may still own it. (Two `rr fwd` of the same name at once is not supported: the one
+    // that fails to bind would remove the other's socket.)
+    if let Endpoint::Unix(path) = &endpoint {
+        match ssh_after(&served) {
+            SshAfter::Gone => {
+                if let Err(err) = machine.net.remove_socket(path) {
+                    ports.notes.note(&format!("rr: {err:#}"));
+                }
+            }
+            SshAfter::MayRun => ports.notes.note(&format!(
+                "rr: ssh could not be stopped, so {} is left in place",
+                path.as_str()
+            )),
+        }
     }
     served
+}
+
+/// Whether ssh is known to have ended once `serve` has returned.
+enum SshAfter {
+    /// Ended and reaped, however `serve` ended (the handle also ends it when dropped).
+    Gone,
+    /// Stopping it failed.
+    MayRun,
+}
+
+fn ssh_after(served: &Result<Outcome>) -> SshAfter {
+    match served {
+        Err(err) if err.downcast_ref::<NotStopped>().is_some() => SshAfter::MayRun,
+        Ok(_) | Err(_) => SshAfter::Gone,
+    }
 }
 
 fn serve(
@@ -68,26 +90,26 @@ fn serve(
 }
 
 /// What the forward's end means for the exit code. ssh ending by itself with 0 is a lost forward,
-/// not a success: nothing asked it to stop.
+/// not a success: nothing asked it to stop. A forward `rr` closed is `rr`'s own outcome; only a
+/// code ssh ended with is a remote one.
 fn closed(end: End, ports: &Ports) -> Result<Outcome> {
-    let code = match end {
+    match end {
         End::Expired => {
             ports.notes.note("rr: time to live reached, forward closed");
-            0
+            Ok(Outcome::Forwarded(Closed::Expired))
         }
         End::Interrupted => {
             ports.notes.note("rr: interrupted, forward closed");
-            INTERRUPTED_EXIT
+            Ok(Outcome::Forwarded(Closed::Interrupted))
         }
         End::Exited(0) => bail!("ssh ended by itself before the time to live: the forward is gone"),
         End::Exited(code) => {
             ports
                 .notes
                 .note(&format!("rr: ssh ended ({code}), forward closed"));
-            code
+            Ok(Outcome::Remote(RemoteExit::new(code)))
         }
-    };
-    Ok(Outcome::Remote(RemoteExit::new(code)))
+    }
 }
 
 /// The local end to listen on, checked free before ssh is started.
@@ -136,7 +158,7 @@ fn announce(listening: &ListeningForward, plan: &Plan, ttl: Ttl, ports: &Ports) 
 mod tests {
     use super::super::testing::{Fakes, session};
     use super::*;
-    use crate::domain::exit::Exit;
+    use crate::domain::exit::{Exit, RrCode};
     use crate::domain::fwd::{ForwardName, ForwardSpec, ForwardTarget};
     use crate::domain::outcome::{Format, render};
     use crate::ports::Ended;
@@ -250,6 +272,7 @@ mod tests {
         let ttl = Duration::from_secs(30 * 60);
         assert!(slept(&w) >= ttl && slept(&w) < ttl + Duration::from_secs(2));
         assert_eq!(exit(&outcome), Exit::Success);
+        assert!(matches!(outcome, Outcome::Forwarded(Closed::Expired)));
     }
 
     #[test]
@@ -286,13 +309,14 @@ mod tests {
         let (child, killed) = FakeChild::scripted(vec![None, None, None, Some(Ended::Interrupted)]);
         let w = world_of(child, killed, vec![true]);
         let outcome = go(&w, &session(), args("n:1"), None).unwrap();
-        assert_eq!(exit(&outcome), Exit::remote(130));
+        assert_eq!(exit(&outcome), Exit::Rr(RrCode::Interrupted));
+        assert!(matches!(outcome, Outcome::Forwarded(Closed::Interrupted)));
         assert_eq!(notes(&w).pop().unwrap(), "rr: interrupted, forward closed");
         // an interrupt before the forward listens is an interrupt too, and prints no URL
         let (child, killed) = FakeChild::scripted(vec![Some(Ended::Interrupted)]);
         let w = world_of(child, killed, vec![false]);
         let outcome = go(&w, &session(), args("n:1"), None).unwrap();
-        assert_eq!(exit(&outcome), Exit::remote(130));
+        assert_eq!(exit(&outcome), Exit::Rr(RrCode::Interrupted));
         assert_eq!(notes(&w), ["rr: interrupted, forward closed"]);
     }
 
@@ -419,6 +443,29 @@ mod tests {
             path,
             "ssh failed to start"
         );
+    }
+
+    /// ssh that could not be stopped may still own its socket: the file stays, and the user is
+    /// told. Both places a stop can fail are covered: a failed start and the end of the ttl.
+    #[test]
+    fn a_socket_file_stays_when_ssh_could_not_be_stopped() {
+        let stuck = |waits: Vec<Option<i32>>, accepts: Vec<bool>| {
+            let (child, killed) = FakeChild::new(waits);
+            let w = world_of(child.with_failing_kill(), killed, accepts);
+            let err = go(&w, &session(), socket_args(), Some(RUNTIME)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("could not be stopped"),
+                "{err:#}"
+            );
+            assert!(removed(&w).is_empty(), "the socket may be ssh's still");
+            assert!(
+                notes(&w).pop().unwrap().contains("left in place"),
+                "{:?}",
+                notes(&w)
+            );
+        };
+        stuck(vec![None], vec![false]); // never listened
+        stuck(vec![None], vec![true]); // ttl reached
     }
 
     #[test]

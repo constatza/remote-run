@@ -262,6 +262,16 @@ pub enum Browser {
     Open,
 }
 
+/// A forward that `rr` itself closed, as opposed to one whose ssh ended by itself (that is a
+/// remote exit code). Both are decisions of `rr`, so neither is reported as a remote result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closed {
+    /// Its time to live ran out: the planned end, exit 0.
+    Expired,
+    /// `rr` was interrupted: exit 130.
+    Interrupted,
+}
+
 /// How long a forward may live, 1 s up to [`MAX_TTL`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ttl(Duration);

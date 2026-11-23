@@ -5,7 +5,7 @@ use crate::domain::argv::{Argv, Captured, Stdin};
 use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath};
 use crate::domain::host::Host;
 use crate::domain::shell::Script;
-use crate::domain::ssh::{Terminal, ssh_argv};
+use crate::domain::ssh::{Liveness, Terminal, ssh_argv};
 use crate::ports::{
     Child as PortChild, Clock, Echo, Ended, Exec, Instant, Net, Remote, Teed, tee_lines,
     write_sanitized,
@@ -62,30 +62,10 @@ impl Exec for OsExec {
     }
 
     fn stream_tee(&self, argv: &Argv, prefix: &str, echo: Echo) -> Result<Teed> {
-        let mut child = command(argv)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("could not start {}", argv.program()))?;
-        let Some(output) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(anyhow!("{} has no output pipe", argv.program()));
-        };
-        let copied = match echo {
-            Echo::Stdout => tee_lines(output, &mut io::stdout(), prefix),
-            Echo::Stderr => tee_lines(output, &mut io::stderr(), prefix),
-        };
-        // a child that is still writing into a pipe nobody reads would never end
-        if copied.is_err() {
-            let _ = child.kill();
+        match echo {
+            Echo::Stdout => stream_tee_to(argv, prefix, &mut io::stdout()),
+            Echo::Stderr => stream_tee_to(argv, prefix, &mut io::stderr()),
         }
-        let status = child.wait().context("could not wait for the child")?;
-        let matched = copied.context("could not copy the output")?;
-        Ok(Teed {
-            code: exit_code(status),
-            matched,
-        })
     }
 
     fn spawn(&self, argv: &Argv) -> Result<Box<dyn PortChild>> {
@@ -108,6 +88,49 @@ impl Exec for OsExec {
     }
 }
 
+/// [`Exec::stream_tee`] with the echo writer given. When the copy fails the child is stopped like
+/// any other (SIGTERM, then SIGKILL after [`STOP_GRACE`]), so an `ssh -t` leaves the local terminal
+/// as it found it, and the lines that matched before the failure go into the error: they may be the
+/// job ids of work that is already running on the cluster.
+fn stream_tee_to(argv: &Argv, prefix: &str, echo: &mut impl Write) -> Result<Teed> {
+    let mut child = command(argv)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("could not start {}", argv.program()))?;
+    let Some(output) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(anyhow!("{} has no output pipe", argv.program()));
+    };
+    let copied = tee_lines(output, echo, prefix);
+    // a child that is still writing into a pipe nobody reads would never end
+    let stopped = match copied {
+        Ok(_) => Ok(()),
+        Err(_) => stop_child(&mut child),
+    };
+    let status = child.wait().context("could not wait for the child")?;
+    match copied {
+        Ok(matched) => {
+            stopped?;
+            Ok(Teed {
+                code: exit_code(status),
+                matched,
+            })
+        }
+        Err(failed) => {
+            let seen = failed.matched.join("; ");
+            let err = anyhow::Error::new(failed.source).context(format!(
+                "could not copy the output (lines matched before it: [{seen}])"
+            ));
+            Err(match stopped {
+                Ok(()) => err,
+                Err(kill) => err.context(format!("the child could not be stopped: {kill:#}")),
+            })
+        }
+    }
+}
+
 /// Put the child in its own process group: a Ctrl-C is sent to the terminal's foreground group, so
 /// it would otherwise reach the program `rr` launched for the user.
 #[cfg(unix)]
@@ -127,6 +150,20 @@ struct OsChild {
     /// Set by a SIGINT, SIGTERM or SIGHUP to `rr`: the signal handler only sets a flag, and the
     /// owner of the handle sees it on its next `try_wait`.
     interrupted: Arc<AtomicBool>,
+    /// The thread that copies the child's stderr to the user's. It is joined once the child has
+    /// been reaped, so the last words of a child that ends at once (ssh's "Permission denied")
+    /// are written before the owner of the handle goes on and exits.
+    stderr_copy: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+
+impl OsChild {
+    /// Wait for the stderr copy to finish; it ends when the child (and any process that kept its
+    /// stderr) is gone.
+    fn finish_stderr(&mut self) {
+        if let Some(copy) = self.stderr_copy.take() {
+            let _ = copy.join();
+        }
+    }
 }
 
 impl PortChild for OsChild {
@@ -136,6 +173,9 @@ impl PortChild for OsChild {
             return Ok(Some(Ended::Interrupted));
         }
         let status = self.child.try_wait().context("could not poll the child")?;
+        if status.is_some() {
+            self.finish_stderr();
+        }
         Ok(status.map(|status| Ended::Exited(exit_code(status))))
     }
 
@@ -143,29 +183,8 @@ impl PortChild for OsChild {
     /// ends cleanly, and a SIGKILL leaves the file behind. A child that has ended is not signalled,
     /// because its pid may belong to another process by now.
     fn kill(&mut self) -> Result<()> {
-        if self
-            .child
-            .try_wait()
-            .context("could not poll the child")?
-            .is_some()
-        {
-            return Ok(());
-        }
-        send_term(self.child.id());
-        let deadline = WallClock::now() + STOP_GRACE;
-        while WallClock::now() < deadline {
-            if self
-                .child
-                .try_wait()
-                .context("could not poll the child")?
-                .is_some()
-            {
-                return Ok(());
-            }
-            std::thread::sleep(STOP_POLL);
-        }
-        self.child.kill().context("could not kill the child")?;
-        self.child.wait().context("could not wait for the child")?;
+        stop_child(&mut self.child)?;
+        self.finish_stderr();
         Ok(())
     }
 }
@@ -176,7 +195,39 @@ impl Drop for OsChild {
     }
 }
 
+/// End `child` and reap it: SIGTERM, then SIGKILL when it is still there after [`STOP_GRACE`]. A
+/// child that has ended already is left alone.
+fn stop_child(child: &mut Child) -> Result<()> {
+    if child
+        .try_wait()
+        .context("could not poll the child")?
+        .is_some()
+    {
+        return Ok(());
+    }
+    send_term(child.id());
+    let deadline = WallClock::now() + STOP_GRACE;
+    while WallClock::now() < deadline {
+        if child
+            .try_wait()
+            .context("could not poll the child")?
+            .is_some()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(STOP_POLL);
+    }
+    child.kill().context("could not kill the child")?;
+    child.wait().context("could not wait for the child")?;
+    Ok(())
+}
+
 fn spawn_child(argv: &Argv) -> Result<OsChild> {
+    spawn_child_with(argv, io::stderr())
+}
+
+/// [`spawn_child`] with the writer for the child's stderr given.
+fn spawn_child_with(argv: &Argv, err: impl Write + Send + 'static) -> Result<OsChild> {
     let interrupted = Arc::new(AtomicBool::new(false));
     flag_interrupts(&interrupted)?;
     let mut command = command(argv);
@@ -188,11 +239,18 @@ fn spawn_child(argv: &Argv) -> Result<OsChild> {
     let mut child = command
         .spawn()
         .with_context(|| format!("could not start {}", argv.program()))?;
-    if let Some(stderr) = child.stderr.take() {
-        // ends by itself when the child closes its stderr
-        std::thread::spawn(move || write_sanitized(stderr, &mut io::stderr()));
-    }
-    Ok(OsChild { child, interrupted })
+    // ends by itself when the child closes its stderr
+    let stderr_copy = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            let mut err = err;
+            write_sanitized(stderr, &mut err)
+        })
+    });
+    Ok(OsChild {
+        child,
+        interrupted,
+        stderr_copy,
+    })
 }
 
 /// Set `flag` on SIGINT, SIGTERM or SIGHUP, so `rr` can end its child instead of dying with it
@@ -239,6 +297,18 @@ fn die_with_parent(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn die_with_parent(_: &mut Command) {}
 
+#[cfg(unix)]
+fn is_socket(file_type: std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file_type.is_socket()
+}
+
+/// A forward's socket is a Unix socket; without them there is none to be found.
+#[cfg(not(unix))]
+fn is_socket(_: std::fs::FileType) -> bool {
+    false
+}
+
 /// The real local network: loopback sockets and the file system.
 pub struct OsNet;
 
@@ -265,11 +335,15 @@ impl Net for OsNet {
         }
     }
 
+    /// Removes `path` only when it is a socket: a file or a link that took its place is not ssh's
+    /// and not `rr`'s to delete.
     fn remove_socket(&self, path: &SocketPath) -> Result<()> {
-        match std::fs::remove_file(path.as_str()) {
-            Ok(()) => Ok(()),
+        match std::fs::symlink_metadata(path.as_str()) {
+            Ok(meta) if is_socket(meta.file_type()) => std::fs::remove_file(path.as_str())
+                .with_context(|| format!("removing {}", path.as_str())),
+            Ok(_) => bail!("{} is not a socket: left in place", path.as_str()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err).with_context(|| format!("removing {}", path.as_str())),
+            Err(err) => Err(err).with_context(|| format!("checking {}", path.as_str())),
         }
     }
 
@@ -312,8 +386,21 @@ fn ended(child: &Mutex<Child>) -> bool {
         .map_or(true, |mut child| !matches!(child.try_wait(), Ok(None)))
 }
 
-/// Send SIGTERM to `pid`. Std has no SIGTERM, so the `kill` program sends it; when that cannot
-/// run, the caller's kill after its grace period still ends the child.
+/// Send SIGTERM to `pid`. Where `libc` is a dependency this is `kill(2)`, with no process to start
+/// and no `kill` program to find; elsewhere std has no SIGTERM, so the `kill` program sends it.
+/// When neither can run, the caller's kill after its grace period still ends the child.
+#[cfg(target_os = "linux")]
+fn send_term(pid: u32) {
+    // a pid of 0 or below would address a process group
+    if let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0) {
+        // SAFETY: `kill` takes two integers and reads or writes no memory of ours.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn send_term(pid: u32) {
     let _ = Command::new("kill")
         .args(["-TERM", "--", &pid.to_string()])
@@ -441,18 +528,43 @@ impl<'a> Ssh<'a> {
 
 impl Remote for Ssh<'_> {
     fn capture(&self, script: &Script) -> Result<Captured> {
-        let argv = ssh_argv(self.host, &script.to_string(), Terminal::Plain);
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            Terminal::Plain,
+            Liveness::Configured,
+        );
+        self.exec.capture(&argv, Stdin::Null)
+    }
+
+    fn poll(&self, script: &Script) -> Result<Captured> {
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            Terminal::Plain,
+            Liveness::Bounded,
+        );
         self.exec.capture(&argv, Stdin::Null)
     }
 
     fn stream(&self, script: &Script, terminal: Terminal) -> Result<i32> {
-        self.exec
-            .stream(&ssh_argv(self.host, &script.to_string(), terminal))
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            terminal,
+            Liveness::Configured,
+        );
+        self.exec.stream(&argv)
     }
 
     fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32> {
-        self.exec
-            .stream_filtered(&ssh_argv(self.host, &script.to_string(), terminal))
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            terminal,
+            Liveness::Configured,
+        );
+        self.exec.stream_filtered(&argv)
     }
 
     fn stream_tee(
@@ -462,7 +574,12 @@ impl Remote for Ssh<'_> {
         prefix: &str,
         echo: Echo,
     ) -> Result<Teed> {
-        let argv = ssh_argv(self.host, &script.to_string(), terminal);
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            terminal,
+            Liveness::Configured,
+        );
         self.exec.stream_tee(&argv, prefix, echo)
     }
 }
@@ -787,9 +904,9 @@ mod tests {
         assert_eq!(attached.unwrap(), 9);
         let calls = exec.calls.borrow();
         assert_eq!(calls[0].1, How::StreamFiltered);
-        assert_eq!(calls[0].0.args()[10..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
         assert_eq!(
-            calls[1].0.args()[10..],
+            calls[1].0.args()[4..],
             ["-t", "--", "cluster", "bash -c 'true'"]
         );
     }
@@ -802,8 +919,23 @@ mod tests {
         let calls = exec.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0.program(), "ssh");
-        assert_eq!(calls[0].0.args()[10..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
         assert_eq!(calls[0].1, How::Capture(Stdin::Null));
+    }
+
+    /// Only the poll is bounded: the user's own ssh configuration decides for everything else.
+    #[test]
+    fn a_poll_carries_the_liveness_options_and_a_capture_does_not() {
+        let exec = FakeExec::new(vec![output(0, "", ""), output(0, "", "")], vec![]);
+        let cluster = host();
+        let ssh = Ssh::new(&cluster, &exec);
+        ssh.capture(&lit("true")).unwrap();
+        ssh.poll(&lit("true")).unwrap();
+        let calls = exec.calls.borrow();
+        let has = |call: usize, option: &str| calls[call].0.args().iter().any(|a| a == option);
+        assert!(!has(0, "ServerAliveInterval=15") && !has(0, "ConnectTimeout=10"));
+        assert!(has(1, "ServerAliveInterval=15") && has(1, "ConnectTimeout=10"));
+        assert_eq!(calls[1].1, How::Capture(Stdin::Null));
     }
 
     #[test]
@@ -815,10 +947,10 @@ mod tests {
         assert_eq!(ssh.stream(&lit("true"), Terminal::Attached).unwrap(), 9);
         let calls = exec.calls.borrow();
         assert_eq!(calls[0].1, How::Stream);
-        assert_eq!(calls[0].0.args()[10..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
         assert_eq!(calls[1].1, How::Stream);
         assert_eq!(
-            calls[1].0.args()[10..],
+            calls[1].0.args()[4..],
             ["-t", "--", "cluster", "bash -c 'true'"]
         );
     }
@@ -954,6 +1086,101 @@ mod tests {
         );
         OsNet.remove_socket(&path).unwrap();
         OsNet.socket_unused(&path).unwrap();
+    }
+
+    /// A file or a link that took the socket's place is not `rr`'s to delete.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_socket_is_removed() {
+        use crate::domain::fwd::ForwardName;
+        let dir = tempfile::tempdir().unwrap();
+        let name = ForwardName::parse("t").unwrap();
+        let path = SocketPath::new(dir.path().to_str().unwrap(), &name).unwrap();
+        std::fs::write(path.as_str(), "mine").unwrap();
+        assert!(OsNet.remove_socket(&path).is_err());
+        assert_eq!(std::fs::read_to_string(path.as_str()).unwrap(), "mine");
+        std::fs::remove_file(path.as_str()).unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "mine").unwrap();
+        std::os::unix::fs::symlink(&target, path.as_str()).unwrap();
+        assert!(OsNet.remove_socket(&path).is_err());
+        assert!(target.exists() && std::fs::symlink_metadata(path.as_str()).is_ok());
+    }
+
+    /// What `spawn_child_with` copied from the child's stderr.
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    #[cfg(unix)]
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// ssh's "Permission denied" arrives just before it exits; once `try_wait` says the child
+    /// ended, its stderr must be written, or `rr` could exit first and the reason would be lost.
+    #[cfg(unix)]
+    #[test]
+    fn the_stderr_of_a_child_that_ended_at_once_is_written_before_try_wait_says_so() {
+        for _ in 0..20 {
+            let seen = Shared::default();
+            let argv = sh("echo 'Permission denied' >&2; exit 255");
+            let mut child = spawn_child_with(&argv, seen.clone()).unwrap();
+            assert_eq!(ended_with(&mut child), 255);
+            let text = String::from_utf8(seen.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(text, "Permission denied\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stderr_of_a_child_that_is_killed_is_written_when_kill_returns() {
+        let seen = Shared::default();
+        let argv = sh("echo 'last words' >&2; exec sleep 30");
+        let mut child = spawn_child_with(&argv, seen.clone()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        child.kill().unwrap();
+        let text = String::from_utf8(seen.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text, "last words\n");
+    }
+
+    /// A failing echo ends the child the polite way and keeps the job ids already seen.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_tee_stops_the_child_and_names_the_lines_matched_before_it() {
+        struct FailsOnSecondWrite(u32);
+        impl Write for FailsOnSecondWrite {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0 += 1;
+                if self.0 > 1 {
+                    return Err(io::Error::other("closed"));
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let script = "echo 'Submitted batch job 9'; echo noise; exec sleep 30";
+        let started = WallClock::now();
+        let err = within(move || {
+            stream_tee_to(
+                &sh(script),
+                "Submitted batch job ",
+                &mut FailsOnSecondWrite(0),
+            )
+            .unwrap_err()
+        });
+        let shown = format!("{err:#}");
+        assert!(shown.contains("Submitted batch job 9"), "{shown}");
+        assert!(shown.contains("closed"), "{shown}");
+        assert!(started.elapsed() < Duration::from_secs(20), "child stopped");
     }
 
     #[test]

@@ -8,6 +8,9 @@ use std::num::NonZeroU8;
 /// The failures `rr` itself reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RrCode {
+    /// The command line was not understood. clap's own code, kept so a usage error reads the same
+    /// with and without `--json`.
+    Usage,
     /// `rr` could not do what was asked (an error, not a guard).
     Failure,
     /// A guard said no (or the remote environment is stale): nothing was done.
@@ -19,16 +22,21 @@ pub enum RrCode {
     /// `rr` could not learn how a job ended (ssh or sacct unreachable, no job found). Never read
     /// as a failure of the job.
     Unknown,
+    /// `rr` was interrupted (Ctrl-C, SIGTERM, SIGHUP) and ended what it had started. 128 plus
+    /// SIGINT, the code a shell reports for Ctrl-C.
+    Interrupted,
 }
 
 impl RrCode {
     pub const fn code(self) -> u8 {
         match self {
+            RrCode::Usage => 2,
             RrCode::Failure => 1,
             RrCode::Refused => 3,
             RrCode::Timeout => 4,
             RrCode::JobFailed => 5,
             RrCode::Unknown => 6,
+            RrCode::Interrupted => 130,
         }
     }
 }
@@ -101,11 +109,17 @@ mod tests {
         assert_eq!((RrCode::Failure.code(), RrCode::Refused.code()), (1, 3));
     }
 
-    /// 2 is clap's usage error; 126, 127, 128+n and 255 belong to shells and ssh.
+    /// 2 is clap's usage error (`RrCode::Usage`); 126, 127, 128+n and 255 belong to shells and ssh.
     #[test]
     fn the_wait_codes_avoid_every_other_meaning() {
         let codes = [RrCode::Timeout, RrCode::JobFailed, RrCode::Unknown].map(RrCode::code);
         assert_eq!(codes, [4, 5, 6]);
+    }
+
+    #[test]
+    fn an_interrupt_is_an_rr_code_that_shares_the_number_with_a_remote_130() {
+        assert_eq!(Exit::Rr(RrCode::Interrupted).code(), 130);
+        assert_ne!(Exit::Rr(RrCode::Interrupted), Exit::remote(130));
     }
 
     #[test]

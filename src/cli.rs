@@ -31,10 +31,10 @@ pub struct Cli {
     /// remote shell file sourced before every command (PATH, uv, Slurm settings)
     #[arg(long = "env", env = "RR_ENV", global = true)]
     pub env_file: Option<String>,
-    /// write the result as one JSON object on stdout (for `wait`, `status`, `pull`, `get`, `put`,
-    /// `cancel`, `trust` and `run --wait`, which then shows the command's output on stderr);
-    /// refused for `q`, `acct`, `log`, `x`, `fwd` and `run` without `--wait`, whose output is
-    /// a program's text
+    /// write the result as one JSON object on stdout (for `wait`, `status`, `pull`, `trust` and
+    /// `run --wait`, which then shows the command's output on stderr); refused for `q`, `acct`,
+    /// `log`, `x`, `fwd`, `cancel`, `get`, `put` and `run` without `--wait`, which write to stdout
+    /// themselves
     #[arg(long = "json", num_args = 0, default_value = "text", default_missing_value = "json", value_parser = parse_format, global = true)]
     pub format: Format,
     #[command(subcommand)]
@@ -119,17 +119,18 @@ impl RemoteCmd {
     /// Matched without a wildcard, so a new command must say which it is.
     pub fn stdout_use(&self) -> StdoutUse {
         match self {
-            RemoteCmd::Job(_)
-            | RemoteCmd::Cancel { .. }
-            | RemoteCmd::Pull { .. }
-            | RemoteCmd::Get { .. }
-            | RemoteCmd::Put { .. } => StdoutUse::Result,
+            RemoteCmd::Job(_) | RemoteCmd::Pull { .. } => StdoutUse::Result,
             // `--wait` shows the command's output on stderr under `--json`
             RemoteCmd::Run { wait, .. } => match wait.completion {
                 Completion::Wait => StdoutUse::Result,
                 Completion::Return => StdoutUse::ProgramOutput,
             },
-            RemoteCmd::Q
+            // `cancel` shows what `scancel` prints, `get` and `put` leave rsync's stdout inherited:
+            // all three write to the user's stdout before the result
+            RemoteCmd::Cancel { .. }
+            | RemoteCmd::Get { .. }
+            | RemoteCmd::Put { .. }
+            | RemoteCmd::Q
             | RemoteCmd::Acct { .. }
             | RemoteCmd::Log { .. }
             | RemoteCmd::X { .. }
@@ -333,6 +334,18 @@ fn parse_completion(text: &str) -> Result<Completion, String> {
         ("return", Completion::Return),
         ("wait", Completion::Wait),
     )
+}
+
+/// Whether `--json` is among `args` before a `--`. Read from the raw arguments for the one case
+/// where clap has refused the line and so gave no [`Cli`]: the usage error is then written in the
+/// format the caller asked for.
+pub fn format_of_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Format {
+    let mut words = args.into_iter().skip(1).take_while(|arg| arg != "--");
+    if words.any(|arg| arg == "--json") {
+        Format::Json
+    } else {
+        Format::Text
+    }
 }
 
 /// `--json` is `json`; absent it is `text`.
@@ -605,6 +618,9 @@ mod tests {
             &["x", "ls"],
             &["run", "--", "ls"],
             &["fwd", "gpu-01:5000"],
+            &["cancel", "1"],
+            &["get", "a"],
+            &["put", "a"],
         ] {
             assert_eq!(stdout(streaming), StdoutUse::ProgramOutput, "{streaming:?}");
         }
@@ -612,9 +628,6 @@ mod tests {
             &["wait", "1"][..],
             &["status", "1"],
             &["pull"],
-            &["cancel", "1"],
-            &["get", "a"],
-            &["put", "a"],
             &["run", "--wait", "--", "ls"],
         ] {
             assert_eq!(stdout(result), StdoutUse::Result, "{result:?}");
@@ -623,6 +636,16 @@ mod tests {
         assert_eq!(Cli::try_parse_from(argv).unwrap().echo(), Echo::Stderr);
         let argv = ["rr", "--host", "h", "wait", "1"];
         assert_eq!(Cli::try_parse_from(argv).unwrap().echo(), Echo::Stdout);
+    }
+
+    #[test]
+    fn the_format_of_a_refused_line_is_read_from_its_arguments() {
+        let of = |args: &[&str]| format_of_args(args.iter().map(std::ffi::OsString::from));
+        assert_eq!(of(&["rr", "--json", "--bogus"]), Format::Json);
+        assert_eq!(of(&["rr", "wait", "--json"]), Format::Json);
+        assert_eq!(of(&["rr", "--bogus"]), Format::Text);
+        assert_eq!(of(&["rr", "x", "--", "--json"]), Format::Text, "after --");
+        assert_eq!(of(&["--json"]), Format::Text, "the program name is skipped");
     }
 
     #[test]

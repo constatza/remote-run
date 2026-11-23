@@ -323,8 +323,12 @@ pub enum WaitOutcome {
     Completed(Vec<JobStatus>),
     /// A job ended in a state other than COMPLETED (the others may still be active).
     Failed(Vec<JobStatus>),
-    /// `--timeout` passed with jobs still active; these are the states last read.
-    TimedOut(Vec<JobStatus>),
+    /// `--timeout` passed with a job read as active. `rows` are the states last read;
+    /// `unlisted` are requested jobs that `sacct` never listed, which the report names.
+    TimedOut {
+        rows: Vec<JobStatus>,
+        unlisted: Vec<JobId>,
+    },
     /// `rr` could not learn how the jobs ended; `why` is remote or program text.
     Unknown { why: String },
 }
@@ -336,17 +340,25 @@ impl WaitOutcome {
         match self {
             WaitOutcome::Completed(_) => Exit::Success,
             WaitOutcome::Failed(_) => Exit::Rr(RrCode::JobFailed),
-            WaitOutcome::TimedOut(_) => Exit::Rr(RrCode::Timeout),
+            WaitOutcome::TimedOut { .. } => Exit::Rr(RrCode::Timeout),
             WaitOutcome::Unknown { .. } => Exit::Rr(RrCode::Unknown),
         }
     }
 }
 
+/// How long one poll's `sacct` may run. ssh's keepalive only notices a dead link; a live link with
+/// a stalled `slurmdbd` would leave `sacct` waiting, and `rr wait` with it, past `--timeout`.
+const SACCT_POLL_LIMIT_SECS: u32 = 60;
+
 /// One `JobID,State` line per job (`-X`), for
 /// [`parse_states`](crate::domain::wait::parse_states). The comma-joined ids are one quoted word.
+/// `timeout` ends a stalled `sacct` with exit 124, which the wait reads as an unreadable poll,
+/// never as a job that failed.
 pub fn states_script(jobs: &JobSet) -> Script {
     let ids: Vec<&str> = jobs.as_slice().iter().map(JobId::as_str).collect();
-    lit("sacct -n -X ")
+    lit("timeout ")
+        .word(number(SACCT_POLL_LIMIT_SECS))
+        .lit(" sacct -n -X ")
         .lit(SACCT_PARSABLE)
         .lit(" -j ")
         .word(quote(&ids.join(",")))
@@ -531,7 +543,7 @@ mod tests {
         let jobs = JobSet::new(vec![id("1"), id("2_3")]).unwrap();
         assert_eq!(
             states_script(&jobs).to_string(),
-            r#"sacct -n -X -P --delimiter=$'\x1f' -j '1,2_3' -o JobID,State"#
+            r#"timeout 60 sacct -n -X -P --delimiter=$'\x1f' -j '1,2_3' -o JobID,State"#
         );
         assert!(JobSet::new(vec![]).is_err());
     }
@@ -608,6 +620,17 @@ mod tests {
             .lines()
             .map(String::from)
             .collect()
+    }
+
+    /// `timeout` stands in front of `sacct` with the limit as its first word, so a stalled
+    /// `slurmdbd` ends the call (exit 124) instead of hanging `rr wait`.
+    #[cfg(unix)]
+    #[test]
+    fn the_poll_runs_sacct_under_a_time_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = JobSet::new(vec![id("7")]).unwrap();
+        let seen = arguments_seen_by("timeout", &states_script(&jobs).to_string(), dir.path());
+        assert_eq!(seen[..3], ["60", "sacct", "-n"]);
     }
 
     #[cfg(unix)]

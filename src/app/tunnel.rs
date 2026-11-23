@@ -34,6 +34,25 @@ const START_LIMIT: Duration = Duration::from_secs(30);
 /// and ssh then exits (`ExitOnForwardFailure`).
 const SETTLE: Duration = Duration::from_millis(500);
 
+/// ssh could not be stopped: it may still be running and may still own its socket file. A value
+/// in the error's chain, so the caller can tell this failure from the others by type.
+#[derive(Debug)]
+pub struct NotStopped(String);
+
+impl NotStopped {
+    fn new(kill: &anyhow::Error) -> Self {
+        Self(format!("{kill:#}"))
+    }
+}
+
+impl std::fmt::Display for NotStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ssh could not be stopped ({})", self.0)
+    }
+}
+
+impl std::error::Error for NotStopped {}
+
 /// How a held forward ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum End {
@@ -98,7 +117,7 @@ impl StartingForward {
             Ok(Look::Interrupted) => Ok(Started::Interrupted),
             Err(err) => Err(match self.child.kill() {
                 Ok(()) => err,
-                Err(kill) => err.context(format!("ssh could not be stopped either: {kill:#}")),
+                Err(kill) => err.context(NotStopped::new(&kill)),
             }),
         }
     }
@@ -141,7 +160,7 @@ impl ListeningForward {
     }
 
     /// Keep the forward until ssh ends or `until` passes; then kill ssh. When this returns ssh has
-    /// been reaped (also on an error, as the handle is dropped), so a socket file can be removed.
+    /// been reaped, except in an error that has [`NotStopped`] in its chain.
     pub fn hold(mut self, until: Deadline, clock: &dyn Clock) -> Result<End> {
         loop {
             match self.child.try_wait()? {
@@ -150,7 +169,9 @@ impl ListeningForward {
                 None => {}
             }
             if until.expired(clock.now()) {
-                self.child.kill()?;
+                self.child
+                    .kill()
+                    .map_err(|kill| anyhow::Error::new(NotStopped::new(&kill)))?;
                 return Ok(End::Expired);
             }
             clock.sleep(POLL);

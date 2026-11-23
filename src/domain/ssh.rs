@@ -8,11 +8,14 @@ use crate::domain::shell::{lit, quote};
 /// ssh options every call uses: never prompt (a prompt nobody sees would hang), no banner.
 pub const SSH_OPTIONS: [&str; 4] = ["-o", "BatchMode=yes", "-o", "LogLevel=ERROR"];
 
-/// Bounds on a link that has gone silent, for the calls `rr` makes itself (not the forwards, which
-/// set their own keepalive). Without them one black-holed poll blocks `rr wait` for ever, so neither
-/// `--timeout` nor the bounded retry of unreadable polls ever fires: a connect gives up after
-/// `ConnectTimeout` seconds, and an established link that answers no keepalive for
-/// `ServerAliveInterval * ServerAliveCountMax` (60) seconds is closed.
+/// Bounds on a link that has gone silent, for the polls `rr wait` and `rr status` make (not the
+/// forwards, which set their own keepalive). Without them one black-holed poll blocks `rr wait` for
+/// ever, so neither `--timeout` nor the bounded retry of unreadable polls ever fires: a connect
+/// gives up after `ConnectTimeout` seconds, and an established link that answers no keepalive for
+/// `ServerAliveInterval * ServerAliveCountMax` (60) seconds is closed. They are not put on a
+/// command the user runs (`rr x`, `run`, `log -f`): those may sit silent for longer than that over
+/// a healthy link, and the user's own `~/.ssh/config` values must apply to them. The copy through
+/// rsync is not covered either.
 pub const SSH_LIVENESS_OPTIONS: [&str; 6] = [
     "-o",
     "ConnectTimeout=10",
@@ -31,10 +34,22 @@ pub enum Terminal {
     Attached,
 }
 
+/// Whether ssh gives up on a silent link by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Liveness {
+    /// The user's own ssh configuration decides: for commands that may be quiet for long.
+    Configured,
+    /// [`SSH_LIVENESS_OPTIONS`] apply: for the short polls that must come back.
+    Bounded,
+}
+
 /// The `ssh` argv that runs `script` under bash on `host` (pure).
-pub fn ssh_argv(host: &Host, script: &str, terminal: Terminal) -> Argv {
-    let options = SSH_OPTIONS.iter().chain(&SSH_LIVENESS_OPTIONS);
-    let mut args: Vec<String> = options.map(|s| s.to_string()).collect();
+pub fn ssh_argv(host: &Host, script: &str, terminal: Terminal, liveness: Liveness) -> Argv {
+    let mut args: Vec<String> = SSH_OPTIONS.iter().map(|s| s.to_string()).collect();
+    match liveness {
+        Liveness::Configured => {}
+        Liveness::Bounded => args.extend(SSH_LIVENESS_OPTIONS.iter().map(|s| s.to_string())),
+    }
     match terminal {
         Terminal::Attached => args.push("-t".into()),
         Terminal::Plain => {}
@@ -60,7 +75,8 @@ mod tests {
     }
 
     /// Spelled out, so a change to either option list shows up here.
-    const OPTIONS: [&str; 10] = [
+    const OPTIONS: [&str; 4] = ["-o", "BatchMode=yes", "-o", "LogLevel=ERROR"];
+    const BOUNDED: [&str; 10] = [
         "-o",
         "BatchMode=yes",
         "-o",
@@ -77,14 +93,14 @@ mod tests {
     /// that starts with `bash -c `.
     #[test]
     fn the_host_follows_the_options_and_a_double_dash() {
-        let argv = ssh_argv(&host(), "true", Terminal::Plain);
+        let argv = ssh_argv(&host(), "true", Terminal::Plain, Liveness::Configured);
         assert_eq!(argv.program(), "ssh");
         let expected: Vec<&str> = OPTIONS
             .into_iter()
             .chain(["--", "cluster", "bash -c 'true'"])
             .collect();
         assert_eq!(argv.args(), expected);
-        let tty = ssh_argv(&host(), "true", Terminal::Attached);
+        let tty = ssh_argv(&host(), "true", Terminal::Attached, Liveness::Configured);
         let expected: Vec<&str> = OPTIONS
             .into_iter()
             .chain(["-t", "--", "cluster", "bash -c 'true'"])
@@ -92,10 +108,28 @@ mod tests {
         assert_eq!(tty.args(), expected);
     }
 
+    /// A streamed command must keep the user's own `ServerAlive*` and `ConnectTimeout`: a stall of
+    /// more than a minute on a healthy link must not kill `rr x` or `rr log -f`. Only a poll is
+    /// bounded.
+    #[test]
+    fn only_a_bounded_call_carries_the_liveness_options() {
+        for terminal in [Terminal::Plain, Terminal::Attached] {
+            let free = ssh_argv(&host(), "true", terminal, Liveness::Configured);
+            assert!(!free.args().iter().any(|a| a.contains("ServerAlive")));
+            assert!(!free.args().iter().any(|a| a.contains("ConnectTimeout")));
+        }
+        let bounded = ssh_argv(&host(), "true", Terminal::Plain, Liveness::Bounded);
+        let expected: Vec<&str> = BOUNDED
+            .into_iter()
+            .chain(["--", "cluster", "bash -c 'true'"])
+            .collect();
+        assert_eq!(bounded.args(), expected);
+    }
+
     #[test]
     fn the_remote_command_is_always_one_word_starting_with_bash_c() {
         for script in ["true", "echo 'a b'", "a\nb", ""] {
-            let argv = ssh_argv(&host(), script, Terminal::Plain);
+            let argv = ssh_argv(&host(), script, Terminal::Plain, Liveness::Configured);
             let last = argv.args().last().unwrap();
             assert!(last.starts_with("bash -c '"), "{last}");
             assert_eq!(argv.args().len(), OPTIONS.len() + 3);
@@ -108,7 +142,7 @@ mod tests {
     fn the_script_reaches_bash_as_one_unevaluated_word() {
         let marker = tempfile::tempdir().unwrap().keep().join("pwned");
         let script = format!("echo '$(touch {0})' `touch {0}`; it's", marker.display());
-        let argv = ssh_argv(&host(), &script, Terminal::Plain);
+        let argv = ssh_argv(&host(), &script, Terminal::Plain, Liveness::Configured);
         let remote_line = argv.args().last().unwrap();
         let shell = Argv::new(
             "sh",
