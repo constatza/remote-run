@@ -65,9 +65,9 @@ pub fn run_then_wait(
         return Ok(Outcome::Remote(RemoteExit::new(teed.code)));
     }
     match submitted_jobs(&teed.matched) {
-        Some(jobs) => run(session, Args { jobs, limits }, ports),
-        None => Ok(Outcome::Waited(WaitOutcome::Unknown {
-            why: format!("the command printed no {SUBMITTED_PREFIX:?}<id> line"),
+        Ok(jobs) => run(session, Args { jobs, limits }, ports),
+        Err(err) => Ok(Outcome::Waited(WaitOutcome::Unknown {
+            why: format!("{err:#}"),
         })),
     }
 }
@@ -268,6 +268,20 @@ mod tests {
             b"Submitted batch job 7\nSubmitted batch job 8\n",
             "the command's output is shown as it is"
         );
+    }
+
+    /// A submit line that cannot be read must not shrink the wait to the jobs that can.
+    #[test]
+    fn a_malformed_submit_line_is_unknown_and_nothing_is_polled() {
+        let fakes = Fakes::remote_streaming(vec![0]);
+        fakes
+            .remote
+            .emit(b"Submitted batch job 7\nSubmitted batch job 1abc\n");
+        let outcome = run_then_wait(&session(), command(), limits(HOUR), &fakes.ports()).unwrap();
+        let rendered = render(&outcome, Format::Text);
+        assert_eq!(rendered.exit, Exit::Rr(RrCode::Unknown));
+        assert!(rendered.stderr.contains("1abc"), "{}", rendered.stderr);
+        assert_eq!(fakes.remote.calls.borrow().len(), 1);
     }
 
     /// No match is unknown, never success; and a command's own failure is its own code.

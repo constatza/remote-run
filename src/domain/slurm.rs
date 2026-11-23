@@ -3,7 +3,7 @@
 
 use crate::domain::exit::{Exit, RrCode};
 use crate::domain::shell::{Script, lit, number, quote};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 /// The `squeue` columns `rr q` shows.
 pub const QUEUE_FORMAT: &str = "%.12i %.40j %.9T %.10M %.6D %R";
@@ -294,17 +294,26 @@ impl JobSet {
 }
 
 /// The jobs `sbatch` reported in `lines` (the output lines that start with
-/// [`SUBMITTED_PREFIX`]); `None` when there are none. The text is a program's output, so only a
-/// token that is a valid [`JobId`] counts: `Submitted batch job 12 on cluster x` is job 12.
-pub fn submitted_jobs(lines: &[String]) -> Option<JobSet> {
-    let jobs = lines
-        .iter()
-        .filter_map(|line| {
-            let rest = line.strip_prefix(SUBMITTED_PREFIX)?;
-            JobId::parse(rest.split_whitespace().next()?).ok()
-        })
-        .collect();
-    JobSet::new(jobs).ok()
+/// [`SUBMITTED_PREFIX`]), each once. The text is a program's output: the id is the first word after
+/// the prefix and must be a valid [`JobId`] (`Submitted batch job 12 on cluster x` is job 12). A
+/// prefixed line with a bad id is an error, never skipped: waiting for the other jobs only would
+/// report success for a submission that is not fully known. No such line is an error too.
+pub fn submitted_jobs(lines: &[String]) -> Result<JobSet> {
+    let mut jobs: Vec<JobId> = Vec::new();
+    for line in lines {
+        let Some(rest) = line.strip_prefix(SUBMITTED_PREFIX) else {
+            continue;
+        };
+        let word = rest.split_whitespace().next().unwrap_or_default();
+        let id = JobId::parse(word).with_context(|| format!("unexpected sbatch line: {line:?}"))?;
+        if !jobs.contains(&id) {
+            jobs.push(id);
+        }
+    }
+    if jobs.is_empty() {
+        bail!("the command printed no {SUBMITTED_PREFIX:?}<id> line");
+    }
+    JobSet::new(jobs)
 }
 
 /// How a wait ended.
@@ -554,8 +563,29 @@ mod tests {
             &["Submitted batch job $(id)"],
             &[" Submitted batch job 1"],
         ] {
-            assert_eq!(submitted_jobs(&lines(bad)), None, "{bad:?}");
+            assert!(submitted_jobs(&lines(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    /// One bad prefixed line among good ones must not shrink the set: the wait would end without
+    /// ever looking at that job.
+    #[test]
+    fn a_malformed_submit_line_among_good_ones_is_an_error_and_a_repeat_counts_once() {
+        let lines = |text: &[&str]| text.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        for bad in ["1abc", "-u", "$(id)", ""] {
+            let line = format!("Submitted batch job {bad}");
+            let err = submitted_jobs(&lines(&["Submitted batch job 12", &line]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unexpected sbatch line"), "{bad:?}: {err}");
+        }
+        let twice = submitted_jobs(&lines(&[
+            "Submitted batch job 12",
+            "noise",
+            "Submitted batch job 12",
+        ]))
+        .unwrap();
+        assert_eq!(twice.as_slice(), [id("12")]);
     }
 
     /// Run `command` under bash with a stand-in for `program` that prints its arguments one per
