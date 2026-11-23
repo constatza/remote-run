@@ -52,7 +52,7 @@ impl fmt::Display for Reason {
             }
             Reason::StateChanged { stderr } => {
                 f.write_str(
-                    "the remote checkout changed while rr was working (a commit or an edit \
+                    "the remote checkout changed while rr was working (a commit, an edit or a job \
                      landed); nothing was merged, run the command again",
                 )?;
                 match stderr.trim() {
@@ -78,6 +78,7 @@ impl fmt::Display for Reason {
 pub struct Permit {
     from: Commit,
     to: Commit,
+    policy: JobPolicy,
 }
 
 impl Permit {
@@ -89,10 +90,16 @@ impl Permit {
         &self.to
     }
 
+    /// Whether the merge script must look at the queue again: [`decide`] judged the jobs under
+    /// this policy, and the script has to hold the same line when it runs.
+    pub fn policy(&self) -> JobPolicy {
+        self.policy
+    }
+
     /// A permit for a test's expected value; production code gets one only from [`decide`].
     #[cfg(test)]
-    pub(super) fn between(from: Commit, to: Commit) -> Self {
-        Self { from, to }
+    pub(super) fn between(from: Commit, to: Commit, policy: JobPolicy) -> Self {
+        Self { from, to, policy }
     }
 }
 
@@ -125,6 +132,7 @@ pub fn decide(target: &Target, state: &RemoteState, policy: JobPolicy) -> PullDe
         (true, _) | (false, JobPolicy::Override) => PullDecision::FastForward(Permit {
             from: state.head.clone(),
             to: to.clone(),
+            policy,
         }),
     }
 }
@@ -158,8 +166,8 @@ mod tests {
         }
     }
 
-    fn ff() -> PullDecision {
-        PullDecision::FastForward(Permit::between(commit(A), commit(B)))
+    fn ff(policy: JobPolicy) -> PullDecision {
+        PullDecision::FastForward(Permit::between(commit(A), commit(B), policy))
     }
 
     #[test]
@@ -179,19 +187,19 @@ mod tests {
                 "fast-forward",
                 state(A, Some(B), &[], vec![]),
                 Respect,
-                ff(),
+                ff(Respect),
             ),
             (
                 "jobs elsewhere",
                 state(A, Some(B), &[], elsewhere()),
                 Respect,
-                ff(),
+                ff(Respect),
             ),
             (
                 "overridden jobs",
                 state(A, Some(B), &[], here()),
                 Override,
-                ff(),
+                ff(Override),
             ),
         ];
         for (name, remote, policy, expected) in cases {
