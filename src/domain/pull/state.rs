@@ -611,9 +611,11 @@ esac
                 return None;
             }
             let (origin, work) = (repos.origin(), repos.work());
+            // `init -b` needs git >= 2.28; naming the unborn branch afterwards works everywhere.
+            repos.git(&repos.root, &["init", "-q", "--bare", &origin]);
             repos.git(
                 &repos.root,
-                &["init", "-q", "--bare", "-b", "main", &origin],
+                &["-C", &origin, "symbolic-ref", "HEAD", "refs/heads/main"],
             );
             repos.git(&repos.root, &["clone", "-q", &origin, &work]);
             repos.commit("pushed");

@@ -33,10 +33,10 @@ pub struct Ports<'a> {
 /// How a streamed command's output reaches the user.
 #[derive(Clone, Copy)]
 enum Output {
-    /// The child's own bytes: `x` and `cancel`. The user chose that program, and a terminal session
+    /// The child's own bytes: `x` and `run`. The user chose that program, and a terminal session
     /// needs its raw bytes.
     Raw,
-    /// The remote's own text (`q`, `acct`, `log`): it comes back line by line through `sanitize`
+    /// The remote's own text (`q`, `acct`, `log`, `cancel`): it comes back line by line through `sanitize`
     /// and cannot carry a terminal control sequence.
     Filtered,
 }
