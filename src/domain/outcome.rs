@@ -144,23 +144,36 @@ fn render_text(outcome: &Outcome) -> Rendered {
     }
 }
 
-/// A clean-up prints its report on stdout; entries left half removed make it a failure, and a
-/// refusal is a refusal like any other (nothing was deleted).
+/// The line that says some entries were set aside but their removal did not finish.
+const GC_HALF_REMOVED: &str =
+    "rr: some entries were set aside but not fully removed; run `rr gc` again";
+/// The line that says some entries could not be set aside, or put back after a job appeared.
+const GC_NOT_SET_ASIDE: &str = "rr: some entries could not be set aside or put back and were left as they are; run `rr gc` again";
+
+/// A clean-up prints its report on stdout. Entries left half removed, or that a step could not
+/// move, make it a failure (the clean-up did not do what it was asked), and a refusal is a refusal
+/// like any other (nothing was deleted).
 fn render_gc(outcome: &GcOutcome) -> Rendered {
     match outcome {
-        GcOutcome::Cleaned(report) if report.failed.is_empty() => Rendered {
-            exit: Exit::Success,
-            stdout: lines(&gc_lines(report)),
-            stderr: String::new(),
-        },
-        GcOutcome::Cleaned(report) => Rendered {
-            exit: Exit::Rr(RrCode::Failure),
-            stdout: lines(&gc_lines(report)),
-            stderr: lines(&[
-                "rr: some entries were set aside but not fully removed; run `rr gc` again"
-                    .to_string(),
-            ]),
-        },
+        GcOutcome::Cleaned(report) => {
+            let mut notes = Vec::new();
+            if !report.failed.is_empty() {
+                notes.push(GC_HALF_REMOVED.to_string());
+            }
+            if report.errored().next().is_some() {
+                notes.push(GC_NOT_SET_ASIDE.to_string());
+            }
+            let exit = if notes.is_empty() {
+                Exit::Success
+            } else {
+                Exit::Rr(RrCode::Failure)
+            };
+            Rendered {
+                exit,
+                stdout: lines(&gc_lines(report)),
+                stderr: lines(&notes),
+            }
+        }
         GcOutcome::Refused(why) => Rendered {
             exit: Exit::Rr(RrCode::Refused),
             stdout: String::new(),
@@ -332,6 +345,34 @@ mod tests {
             stderr: "\u{1b}[2Jnot yours\n".into(),
         }));
         assert!(remote.stderr.contains("?[2Jnot yours"), "{}", remote.stderr);
+    }
+
+    #[test]
+    fn a_clean_up_that_could_not_move_an_entry_fails() {
+        use crate::domain::snapshot::{GcReport, Kept, RootEntry, Why};
+        let stuck = GcReport {
+            kept: vec![Kept {
+                entry: RootEntry::parse(A).unwrap(),
+                why: Why::Error,
+            }],
+            ..GcReport::default()
+        };
+        let stuck = text(&Outcome::Gc(GcOutcome::Cleaned(stuck)));
+        assert_eq!(
+            stuck.exit,
+            Exit::Rr(RrCode::Failure),
+            "an entry that could not be moved"
+        );
+        assert!(
+            stuck.stdout.contains(&format!("kept {A}")),
+            "{}",
+            stuck.stdout
+        );
+        assert!(
+            stuck.stderr.contains("could not be set aside"),
+            "{}",
+            stuck.stderr
+        );
     }
 
     #[test]

@@ -185,6 +185,17 @@ pub struct GcReport {
     pub failed: Vec<RootEntry>,
 }
 
+impl GcReport {
+    /// The entries a step of removal failed for before anything was deleted: they could not be set
+    /// aside (or put back), and stay where they are.
+    pub fn errored(&self) -> impl Iterator<Item = &RootEntry> {
+        self.kept
+            .iter()
+            .filter(|kept| kept.why == Why::Error)
+            .map(|kept| &kept.entry)
+    }
+}
+
 /// Why `rr gc` deleted nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GcRefusal {

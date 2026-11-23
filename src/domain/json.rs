@@ -537,6 +537,23 @@ mod tests {
             (value["failed"][0].as_str(), exit),
             (Some(A), Exit::Rr(RrCode::Failure))
         );
+        let stuck = GcReport {
+            kept: vec![crate::domain::snapshot::Kept {
+                entry: entry(B),
+                why: crate::domain::snapshot::Why::Error,
+            }],
+            ..GcReport::default()
+        };
+        let (value, exit) = json_of(&Outcome::Gc(GcOutcome::Cleaned(stuck)));
+        assert_eq!(
+            (
+                value["kept"][0]["why"].as_str(),
+                value["exit"].as_i64(),
+                exit
+            ),
+            (Some("error"), Some(1), Exit::Rr(RrCode::Failure)),
+            "an entry that could not be moved fails the clean-up in JSON too"
+        );
         for (why, name) in [
             (GcRefusal::RootNotSafe, "root_not_safe"),
             (GcRefusal::QueueUnreadable, "queue_unreadable"),
