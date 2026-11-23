@@ -2,15 +2,18 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::domain::argv::{Argv, Captured, Stdin};
+use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath};
 use crate::domain::host::Host;
 use crate::domain::shell::Script;
 use crate::domain::ssh::{Terminal, ssh_argv};
-use crate::ports::{Clock, Exec, Instant, Remote, write_sanitized};
-use anyhow::{Context, Result, anyhow};
+use crate::ports::{Child as PortChild, Clock, Exec, Instant, Net, Remote, write_sanitized};
+use anyhow::{Context, Result, anyhow, bail};
 use std::io::{self, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as WallClock};
 
 /// Runs programs with `std::process`.
@@ -53,6 +56,150 @@ impl Exec for OsExec {
 
     fn stream_filtered(&self, argv: &Argv) -> Result<i32> {
         stream_filtered_to(argv, io::stdout(), io::stderr())
+    }
+
+    fn spawn(&self, argv: &Argv) -> Result<Box<dyn PortChild>> {
+        spawn_child(argv).map(|child| Box::new(child) as Box<dyn PortChild>)
+    }
+}
+
+/// The exit code a child reads as after `rr` was interrupted (SIGINT, SIGTERM or SIGHUP): 128 plus
+/// SIGINT, the shell's convention for Ctrl-C.
+const INTERRUPTED_EXIT: i32 = 130;
+
+/// A child started by [`OsExec::spawn`]. Dropping it ends the child, because dropping a
+/// `std::process::Child` leaves the process running, and an orphaned tunnel is the failure `rr fwd`
+/// exists to prevent.
+struct OsChild {
+    child: Child,
+    /// Set by a SIGINT, SIGTERM or SIGHUP to `rr`: the signal handler only sets a flag, and the
+    /// owner of the handle sees it on its next `try_wait`.
+    interrupted: Arc<AtomicBool>,
+}
+
+impl PortChild for OsChild {
+    fn try_wait(&mut self) -> Result<Option<i32>> {
+        if self.interrupted.load(Ordering::SeqCst) {
+            self.kill()?;
+            return Ok(Some(INTERRUPTED_EXIT));
+        }
+        let status = self.child.try_wait().context("could not poll the child")?;
+        Ok(status.map(exit_code))
+    }
+
+    fn kill(&mut self) -> Result<()> {
+        // `kill` on a child that has already been reaped is `Ok`; only a real failure is an error
+        self.child.kill().context("could not kill the child")?;
+        self.child.wait().context("could not wait for the child")?;
+        Ok(())
+    }
+}
+
+impl Drop for OsChild {
+    fn drop(&mut self) {
+        let _ = self.kill();
+    }
+}
+
+fn spawn_child(argv: &Argv) -> Result<OsChild> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    flag_interrupts(&interrupted)?;
+    let mut command = command(argv);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    die_with_parent(&mut command);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("could not start {}", argv.program()))?;
+    if let Some(stderr) = child.stderr.take() {
+        // ends by itself when the child closes its stderr
+        std::thread::spawn(move || write_sanitized(stderr, &mut io::stderr()));
+    }
+    Ok(OsChild { child, interrupted })
+}
+
+/// Set `flag` on SIGINT, SIGTERM or SIGHUP, so `rr` can end its child instead of dying with it
+/// still running. Without Unix signals there is nothing to install.
+#[cfg(unix)]
+fn flag_interrupts(flag: &Arc<AtomicBool>) -> Result<()> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    for signal in [SIGINT, SIGTERM, SIGHUP] {
+        signal_hook::flag::register(signal, Arc::clone(flag))
+            .context("could not install a signal handler")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn flag_interrupts(_: &Arc<AtomicBool>) -> Result<()> {
+    Ok(())
+}
+
+/// Have the kernel send the child SIGTERM when `rr` dies, however it dies (SIGKILL included, where
+/// no handler and no `Drop` runs). The signal is tied to the thread that started the child, so
+/// `spawn` must run on the thread that lives as long as `rr` does: the main thread.
+#[cfg(target_os = "linux")]
+fn die_with_parent(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs between fork and exec and calls only `prctl` and `getppid`, which
+    // are async-signal-safe, and allocates nothing.
+    unsafe {
+        let parent = libc::getpid();
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // `rr` may have died between fork and prctl, when the signal is no longer coming
+            if libc::getppid() != parent {
+                return Err(io::Error::other("rr ended while its child was starting"));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_: &mut Command) {}
+
+/// The real local network: loopback sockets and the file system.
+pub struct OsNet;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+const LOOPBACK_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+impl Net for OsNet {
+    fn free_port(&self, want: Option<LoopbackPort>) -> Result<LoopbackPort> {
+        let port = want.map_or(0, LoopbackPort::get);
+        let listener = TcpListener::bind((LOOPBACK_ADDR, port))
+            .with_context(|| format!("cannot listen on 127.0.0.1:{port}"))?;
+        let bound = listener.local_addr().context("no local address")?.port();
+        LoopbackPort::from_u16(bound)
+    }
+
+    fn socket_unused(&self, path: &SocketPath) -> Result<()> {
+        match std::fs::symlink_metadata(path.as_str()) {
+            Ok(_) => bail!(
+                "{} already exists; remove it if no rr fwd is using it",
+                path.as_str()
+            ),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("checking {}", path.as_str())),
+        }
+    }
+
+    fn accepts(&self, endpoint: &Endpoint) -> bool {
+        match endpoint {
+            Endpoint::Tcp(port) => {
+                let addr = SocketAddr::from((LOOPBACK_ADDR, port.get()));
+                TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).is_ok()
+            }
+            #[cfg(unix)]
+            Endpoint::Unix(path) => std::os::unix::net::UnixStream::connect(path.as_str()).is_ok(),
+            #[cfg(not(unix))]
+            Endpoint::Unix(_) => false,
+        }
     }
 }
 
@@ -563,5 +710,78 @@ mod tests {
         let after = clock.now();
         assert!(after >= before);
         assert!(after.since(before) >= Duration::from_millis(20));
+    }
+
+    /// Poll `child` until it has ended, failing the test after [`WATCHDOG`].
+    #[cfg(unix)]
+    fn ended_with(child: &mut dyn PortChild) -> i32 {
+        let deadline = WallClock::now() + WATCHDOG;
+        loop {
+            if let Some(code) = child.try_wait().unwrap() {
+                return code;
+            }
+            assert!(WallClock::now() < deadline, "the child never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_child_reports_its_code_and_a_killed_one_is_never_success() {
+        assert_eq!(ended_with(&mut spawn_child(&sh("exit 3")).unwrap()), 3);
+        let mut sleeper = spawn_child(&sh("sleep 30")).unwrap();
+        assert_eq!(sleeper.try_wait().unwrap(), None);
+        sleeper.kill().unwrap();
+        assert_ne!(sleeper.try_wait().unwrap(), Some(0));
+        sleeper.kill().unwrap();
+        let missing = Argv::new("rr-no-such-program", vec![]);
+        assert!(OsExec.spawn(&missing).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_spawned_child_ends_it() {
+        let child = spawn_child(&sh("sleep 30")).unwrap();
+        let pid = child.child.id().to_string();
+        drop(child);
+        let alive = Command::new("kill").args(["-0", &pid]).output().unwrap();
+        assert!(!alive.status.success(), "the child outlived its handle");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_ends_the_child_and_reads_as_interrupted() {
+        let mut child = spawn_child(&sh("sleep 30")).unwrap();
+        child.interrupted.store(true, Ordering::SeqCst);
+        assert_eq!(child.try_wait().unwrap(), Some(INTERRUPTED_EXIT));
+    }
+
+    #[test]
+    fn the_net_hands_out_loopback_ports_and_sees_who_listens() {
+        let port = OsNet.free_port(None).unwrap();
+        let endpoint = Endpoint::Tcp(port);
+        let listener = TcpListener::bind((LOOPBACK_ADDR, port.get())).unwrap();
+        assert!(OsNet.accepts(&endpoint));
+        assert!(
+            OsNet.free_port(Some(port)).is_err(),
+            "a taken port is refused"
+        );
+        drop(listener);
+        assert_eq!(OsNet.free_port(Some(port)).unwrap(), port);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_that_exists_is_refused() {
+        use crate::domain::fwd::ForwardName;
+        let dir = tempfile::tempdir().unwrap();
+        let name = ForwardName::parse("t").unwrap();
+        let path = SocketPath::new(dir.path().to_str().unwrap(), &name).unwrap();
+        OsNet.socket_unused(&path).unwrap();
+        assert!(!OsNet.accepts(&Endpoint::Unix(path.clone())));
+        let listener = std::os::unix::net::UnixListener::bind(path.as_str()).unwrap();
+        assert!(OsNet.socket_unused(&path).is_err());
+        assert!(OsNet.accepts(&Endpoint::Unix(path)));
+        drop(listener);
     }
 }
