@@ -233,14 +233,14 @@ impl Ttl {
     /// `90s`, `30m`, `8h` or `2d`.
     pub fn parse(text: &str) -> Result<Self> {
         let bad = || format!("not a time to live: {text:?} (use 90s, 30m, 8h or 2d, at most 7d)");
-        let (digits, unit) = text.split_at(text.len().saturating_sub(1));
-        let seconds: u64 = match unit {
-            "s" => 1,
-            "m" => 60,
-            "h" => 3600,
-            "d" => 86_400,
-            _ => bail!(bad()),
-        };
+        let (digits, seconds) = [("s", 1_u64), ("m", 60), ("h", 3600), ("d", 86_400)]
+            .into_iter()
+            .find_map(|(unit, seconds)| Some((text.strip_suffix(unit)?, seconds)))
+            .with_context(bad)?;
+        // digits only: `u64::from_str` would also take a leading `+`
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            bail!(bad());
+        }
         let count: u64 = digits.parse().with_context(bad)?;
         let ttl = Duration::from_secs(count.saturating_mul(seconds));
         if ttl.is_zero() || ttl > MAX_TTL {
@@ -468,7 +468,11 @@ mod tests {
             "8H",
             "8d1h",
             "8d ",
+            "+5m",
             "8d",
+            "8é",
+            "é",
+            "8\u{661}h",
             "169h",
             "99999999999999999999h",
         ] {
@@ -498,6 +502,19 @@ mod tests {
         }
         let long = format!("/{}", "d".repeat(100));
         assert!(SocketPath::new(&long, &name).is_err());
+    }
+
+    /// `sun_path` is 108 bytes with its NUL: 107 bind, 108 do not.
+    #[test]
+    fn a_socket_path_of_107_bytes_is_the_longest() {
+        let name = ForwardName::parse("m").unwrap();
+        // "/rr-m.sock" is 10 bytes
+        let dir = |len: usize| format!("/{}", "d".repeat(len - 1));
+        assert_eq!(
+            SocketPath::new(&dir(97), &name).unwrap().as_str().len(),
+            107
+        );
+        assert!(SocketPath::new(&dir(98), &name).is_err());
     }
 
     fn argv_of(endpoint: &Endpoint) -> Vec<String> {
