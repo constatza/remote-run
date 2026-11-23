@@ -81,11 +81,11 @@ fn stop_after(child: &mut dyn Child, err: &anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Kill `child`, then report `end`; a kill that fails is [`NotStopped`].
-fn stop_for(child: &mut dyn Child, end: End) -> Result<End> {
+/// Kill `child`, then report `then`; a kill that fails is [`NotStopped`].
+fn stop_then<T>(child: &mut dyn Child, then: T) -> Result<T> {
     child
         .kill()
-        .map(|()| end)
+        .map(|()| then)
         .map_err(|kill| anyhow::Error::new(NotStopped::new(&kill)))
 }
 
@@ -141,7 +141,8 @@ impl StartingForward {
         Ok(Self { child, endpoint })
     }
 
-    /// Wait until `endpoint` accepts and ssh is still alive after [`SETTLE`]. On any failure ssh
+    /// Wait until `endpoint` accepts and ssh is still alive after [`SETTLE`] and, for a TCP
+    /// endpoint, its listener is held by ssh's pid. On any failure ssh
     /// is killed first, so an error never leaves a tunnel behind; a kill that fails is part of the
     /// error returned.
     pub fn wait_listening(mut self, net: &dyn Net, clock: &dyn Clock) -> Result<Started> {
@@ -152,9 +153,7 @@ impl StartingForward {
             })),
             // an interrupt has ended ssh through the child's own handler, but only a kill that
             // succeeds here says it is gone
-            Ok(Look::Interrupted) => {
-                stop_for(&mut *self.child, End::Interrupted).map(|_| Started::Interrupted)
-            }
+            Ok(Look::Interrupted) => stop_then(&mut *self.child, Started::Interrupted),
             Err(err) => Err(stop_after(&mut *self.child, &err)),
         }
     }
@@ -223,13 +222,13 @@ impl ListeningForward {
             match self.child.try_wait() {
                 Ok(Some(Ended::Exited(code))) => return Ok(End::Exited(code)),
                 Ok(Some(Ended::Interrupted)) => {
-                    return stop_for(&mut *self.child, End::Interrupted);
+                    return stop_then(&mut *self.child, End::Interrupted);
                 }
                 Ok(None) => {}
                 Err(err) => return Err(stop_after(&mut *self.child, &err)),
             }
             if until.expired(clock.now()) {
-                return stop_for(&mut *self.child, End::Expired);
+                return stop_then(&mut *self.child, End::Expired);
             }
             clock.sleep(POLL);
         }

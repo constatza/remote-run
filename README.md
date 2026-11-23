@@ -134,6 +134,7 @@ target = "gpu-01:5000"
 local = 5051                  # optional; without it a free port is picked on every run
 ```
 
+- TCP forwards, and so `--open`, need Linux: `rr` proves the listener on the port is ssh's through `/proc`, and on other systems it cannot, so it refuses them. There, use `--socket`.
 - It listens on `127.0.0.1` only; there is no way to bind another address. The URL is printed only when the listener on the port is ssh's own: on Linux `rr` matches the listening socket in `/proc/net/tcp` to the sockets of the ssh process it started, so a process that took the port after `rr` chose it is never announced, whatever it answers (nothing is printed, no browser is opened, ssh is stopped and the exit code is not 0). The same holds if the port is taken, or ssh ends right after binding. Off Linux `rr` cannot prove that, so it refuses a TCP forward and asks for `--socket`.
 - The forward ends after `--ttl` (default 8h, at most 7d), when ssh ends, on Ctrl-C, SIGTERM or SIGHUP, and, on Linux, when `rr` is killed with SIGKILL (the kernel signals ssh; other systems have no such guarantee). It runs with `ControlMaster=no`, so ending ssh really closes the tunnel.
 - A fixed `--local` port is checked free before ssh starts. By default each run picks a random port, because a browser shares the cookies of `127.0.0.1` across ports, so two forwards you keep open on fixed ports can see each other's login.
