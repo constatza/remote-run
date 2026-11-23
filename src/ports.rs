@@ -2,7 +2,7 @@
 //! tests can record the argv and replay output instead of starting anything.
 
 // the vocabulary the ports speak is the core's
-pub use crate::domain::argv::{Argv, Captured, Payload, Stdin};
+pub use crate::domain::argv::{Argv, Captured, CapturedBytes, Payload, Stdin};
 use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath};
 use crate::domain::sanitize::sanitize_bytes;
 use crate::domain::shell::Script;
@@ -130,6 +130,13 @@ fn tee_into(
 pub trait Exec {
     /// Run `argv` to the end, collecting its output.
     fn capture(&self, argv: &Argv, stdin: Stdin) -> Result<Captured>;
+    /// Like [`Exec::capture`] with a closed stdin, but stdout is kept as the bytes it is: for a
+    /// program whose output is data (`git archive`), which text decoding would corrupt.
+    fn capture_bytes(&self, argv: &Argv) -> Result<CapturedBytes>;
+    /// Like [`Exec::stream_input`], but the child's stdout and stderr are collected instead of
+    /// inherited: its input is `input`, then end of file, and nothing it prints reaches the
+    /// terminal unread.
+    fn capture_input(&self, argv: &Argv, input: &Payload) -> Result<Captured>;
     /// Run `argv` with the terminal attached (stdin, stdout and stderr inherited).
     fn stream(&self, argv: &Argv) -> Result<i32>;
     /// Like [`Exec::stream`], but the child reads `input` on stdin, then end of file, instead of
@@ -231,6 +238,10 @@ pub trait Remote {
     /// Run `script` with `input` on its stdin (no remote terminal: the input is not one). For a
     /// program or archive that is data, so it needs no quoting into the script.
     fn send(&self, script: &Script, input: &Payload) -> Result<i32>;
+    /// Like [`Remote::send`], but the script's output is collected, not shown: `send` leaves the
+    /// remote's stderr on the terminal, and text from the remote reaches the user only through
+    /// `sanitize`. For the snapshot archive, whose script answers in words `rr` reads.
+    fn upload(&self, script: &Script, input: &Payload) -> Result<Captured>;
     /// Like [`Remote::stream`], with the output filtered as in [`Exec::stream_filtered`]. For
     /// commands whose output is the remote's text rather than a program the user chose to run.
     fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32>;
@@ -335,6 +346,8 @@ pub mod fake {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum How {
         Capture(Stdin),
+        CaptureBytes,
+        CaptureInput,
         Stream,
         StreamInput,
         StreamFiltered,
@@ -365,6 +378,7 @@ pub mod fake {
         Poll,
         Stream(Terminal),
         Send,
+        Upload,
         StreamFiltered(Terminal),
         StreamTee(Terminal, Echo),
     }
@@ -464,6 +478,18 @@ pub mod fake {
                 .borrow_mut()
                 .pop_front()
                 .expect("an unexpected remote send"))
+        }
+
+        fn upload(&self, script: &Script, input: &Payload) -> Result<Captured> {
+            self.calls
+                .borrow_mut()
+                .push((script.to_string(), RemoteCall::Upload));
+            self.sent.borrow_mut().push(input.as_bytes().to_vec());
+            Ok(self
+                .captures
+                .borrow_mut()
+                .pop_front()
+                .expect("an unexpected remote upload"))
         }
 
         fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32> {
@@ -710,6 +736,7 @@ pub mod fake {
     pub struct FakeExec {
         captures: RefCell<VecDeque<Reply>>,
         streams: RefCell<VecDeque<i32>>,
+        bytes: RefCell<VecDeque<CapturedBytes>>,
         children: RefCell<VecDeque<FakeChild>>,
         launch_fails: bool,
         pub calls: RefCell<Vec<(Argv, How)>>,
@@ -722,11 +749,25 @@ pub mod fake {
             Self {
                 captures: RefCell::new(captures.into()),
                 streams: RefCell::new(streams.into()),
+                bytes: RefCell::default(),
                 children: RefCell::default(),
                 launch_fails: false,
                 calls: RefCell::default(),
                 inputs: RefCell::default(),
             }
+        }
+
+        /// The answers of `capture_bytes`, in order, as `(code, stdout, stderr)`.
+        pub fn with_bytes(self, answers: Vec<(i32, Vec<u8>, &str)>) -> Self {
+            *self.bytes.borrow_mut() = answers
+                .into_iter()
+                .map(|(code, stdout, stderr)| CapturedBytes {
+                    code,
+                    stdout,
+                    stderr: stderr.into(),
+                })
+                .collect();
+            self
         }
 
         /// The children that `spawn` hands out, in order.
@@ -760,6 +801,29 @@ pub mod fake {
             self.calls
                 .borrow_mut()
                 .push((argv.clone(), How::Capture(stdin)));
+            match self.captures.borrow_mut().pop_front() {
+                Some(Reply::Output(captured)) => Ok(captured),
+                Some(Reply::WontStart) => anyhow::bail!("could not start {}", argv.program()),
+                None => panic!("an unexpected capture of {}", argv.program()),
+            }
+        }
+
+        fn capture_bytes(&self, argv: &Argv) -> Result<CapturedBytes> {
+            self.calls
+                .borrow_mut()
+                .push((argv.clone(), How::CaptureBytes));
+            Ok(self
+                .bytes
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| panic!("an unexpected byte capture of {}", argv.program())))
+        }
+
+        fn capture_input(&self, argv: &Argv, input: &Payload) -> Result<Captured> {
+            self.calls
+                .borrow_mut()
+                .push((argv.clone(), How::CaptureInput));
+            self.inputs.borrow_mut().push(input.as_bytes().to_vec());
             match self.captures.borrow_mut().pop_front() {
                 Some(Reply::Output(captured)) => Ok(captured),
                 Some(Reply::WontStart) => anyhow::bail!("could not start {}", argv.program()),

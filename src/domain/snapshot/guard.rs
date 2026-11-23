@@ -366,6 +366,36 @@ impl ClearedTree {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// The tree is on the remote host. Only the upload step calls this, once the remote says so;
+    /// outside the crate nothing can claim a tree was shipped:
+    ///
+    /// ```compile_fail,E0624
+    /// use remote_run::domain::snapshot::ClearedTree;
+    /// fn claim(tree: ClearedTree) {
+    ///     let _ = tree.shipped();
+    /// }
+    /// ```
+    pub(crate) fn shipped(self) -> ShippedSnapshot {
+        ShippedSnapshot {
+            id: self.id,
+            base: self.base,
+            cleanliness: self.cleanliness,
+        }
+    }
+
+    /// A cleared tree for the tests of the layers above, which cannot reach the private fields.
+    #[cfg(test)]
+    pub(crate) fn fake(tree: &str, files: usize) -> Self {
+        Self {
+            id: TreeId::parse(tree).unwrap(),
+            base: Commit::parse("cccccccccccccccccccccccccccccccccccccccc").unwrap(),
+            cleanliness: Cleanliness::Clean,
+            lock: LockFile::Absent,
+            files,
+            bytes: 0,
+        }
+    }
 }
 
 impl ShippedSnapshot {

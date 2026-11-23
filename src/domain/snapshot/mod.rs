@@ -10,15 +10,23 @@ mod archive;
 mod git;
 mod guard;
 mod names;
+mod provenance;
+mod remote;
 mod tree;
 
 pub use archive::count_files;
+#[cfg(test)]
+pub use archive::tar_of;
 pub use git::{IndexFile, Repo, toplevel};
 pub use guard::{
     BuiltTree, Cleanliness, ClearedTree, DirtyPolicy, Facts, Inclusion, Link, LockFile, Policy,
     Refusal, ShippedSnapshot, SubmodulePolicy, UnsafeLink,
 };
 pub use names::AllowedPath;
+pub use remote::{
+    Presence, ROOT, UNSAFE_EXIT, parse_presence, probe_script, run_prelude, stale_script,
+    upload_script,
+};
 pub use tree::{
     Entry, EntryKind, ObjectId, TreeId, lfs_pointer_paths, may_be_lfs_pointer, parse_ls_tree,
     parse_names, parse_not_in_head,

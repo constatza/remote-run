@@ -1,7 +1,7 @@
 //! The real [`Exec`] and [`Remote`]: the only place that starts a process.
 #![allow(clippy::disallowed_methods)]
 
-use crate::domain::argv::{Argv, Captured, Payload, Stdin};
+use crate::domain::argv::{Argv, Captured, CapturedBytes, Payload, Stdin};
 use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath, listener_held};
 use crate::domain::host::Host;
 use crate::domain::shell::Script;
@@ -61,30 +61,46 @@ impl Exec for OsExec {
         Ok(exit_code(status))
     }
 
+    fn capture_bytes(&self, argv: &Argv) -> Result<CapturedBytes> {
+        let out = command(argv)
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("could not start {}", argv.program()))?;
+        Ok(CapturedBytes {
+            code: exit_code(out.status),
+            stdout: out.stdout,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
+    fn capture_input(&self, argv: &Argv, input: &Payload) -> Result<Captured> {
+        let mut child = command(argv)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("could not start {}", argv.program()))?;
+        let writer = feed(&mut child, argv, input)?;
+        let out = child
+            .wait_with_output()
+            .context("could not wait for the child")?;
+        joined(writer)?;
+        Ok(Captured {
+            code: exit_code(out.status),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
     fn stream_input(&self, argv: &Argv, input: &Payload) -> Result<i32> {
         let mut child = command(argv)
             .stdin(Stdio::piped())
             .spawn()
             .with_context(|| format!("could not start {}", argv.program()))?;
-        let Some(mut stdin) = child.stdin.take() else {
-            let _ = stop_child(&mut child);
-            return Err(anyhow!("{} has no input pipe", argv.program()));
-        };
-        let bytes = input.as_bytes().to_vec();
-        // written on its own thread: a child that prints before it has read everything would
-        // otherwise block on a full output pipe while `rr` blocks on a full input pipe. The child
-        // ending or closing its stdin early (a broken pipe) is its business, its exit code says how
-        // it went; any other write error means it ran on partial input, which is an error here.
-        let writer = std::thread::spawn(move || match stdin.write_all(&bytes) {
-            Err(err) if err.kind() != io::ErrorKind::BrokenPipe => Err(err),
-            _ => Ok(()),
-        });
+        let writer = feed(&mut child, argv, input)?;
         let status = child.wait().context("could not wait for the child")?;
-        match writer.join() {
-            Ok(Ok(())) => Ok(exit_code(status)),
-            Ok(Err(err)) => Err(err).context("could not send the input to the child"),
-            Err(_) => Err(anyhow!("the thread that sends the input panicked")),
-        }
+        joined(writer)?;
+        Ok(exit_code(status))
     }
 
     fn stream_filtered(&self, argv: &Argv) -> Result<i32> {
@@ -115,6 +131,35 @@ impl Exec for OsExec {
         // reaped in the background, so a launcher that ends while `rr` runs on leaves no zombie
         std::thread::spawn(move || child.wait());
         Ok(())
+    }
+}
+
+/// Give `child` its stdin from `input`, written on its own thread: a child that prints before it
+/// has read everything would otherwise block on a full output pipe while `rr` blocks on a full
+/// input pipe. The child ending or closing its stdin early (a broken pipe) is its business, its exit
+/// code says how it went; any other write error means it ran on partial input, which is an error
+/// ([`joined`]).
+fn feed(
+    child: &mut Child,
+    argv: &Argv,
+    input: &Payload,
+) -> Result<std::thread::JoinHandle<io::Result<()>>> {
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = stop_child(child);
+        return Err(anyhow!("{} has no input pipe", argv.program()));
+    };
+    let bytes = input.as_bytes().to_vec();
+    Ok(std::thread::spawn(move || match stdin.write_all(&bytes) {
+        Err(err) if err.kind() != io::ErrorKind::BrokenPipe => Err(err),
+        _ => Ok(()),
+    }))
+}
+
+fn joined(writer: std::thread::JoinHandle<io::Result<()>>) -> Result<()> {
+    match writer.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err).context("could not send the input to the child"),
+        Err(_) => Err(anyhow!("the thread that sends the input panicked")),
     }
 }
 
@@ -670,6 +715,16 @@ impl Remote for Ssh<'_> {
         self.exec.stream_input(&argv, input)
     }
 
+    fn upload(&self, script: &Script, input: &Payload) -> Result<Captured> {
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            Terminal::Refused,
+            Liveness::Configured,
+        );
+        self.exec.capture_input(&argv, input)
+    }
+
     fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32> {
         let argv = ssh_argv(
             self.host,
@@ -767,6 +822,66 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_bytes_keeps_every_byte_and_a_signal_is_never_success() {
+        let out = OsExec
+            .capture_bytes(&sh("printf '\\377\\000\\200'; printf err >&2; exit 4"))
+            .unwrap();
+        assert_eq!(
+            (out.code, out.stdout, out.stderr.as_str()),
+            (4, vec![0xff, 0, 0x80], "err")
+        );
+        assert_ne!(OsExec.capture_bytes(&sh("kill -9 $$")).unwrap().code, 0);
+        assert!(
+            OsExec
+                .capture_bytes(&Argv::new("rr-no-such-program", vec![]))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_input_feeds_stdin_and_collects_both_streams() {
+        let input = Payload::new(b"one\ntwo\n".to_vec());
+        let out = OsExec
+            .capture_input(&sh("cat; echo err >&2; exit 3"), &input)
+            .unwrap();
+        assert_eq!(
+            (out.code, out.stdout.as_str(), out.stderr.as_str()),
+            (3, "one\ntwo\n", "err\n")
+        );
+    }
+
+    /// More input than a pipe holds, to a child that prints as much before it reads: neither side
+    /// may block on the other.
+    #[cfg(unix)]
+    #[test]
+    fn capture_input_with_a_lot_of_data_in_both_directions_does_not_deadlock() {
+        let input = Payload::new(vec![b'x'; 1 << 20]);
+        let out = within(move || {
+            OsExec
+                .capture_input(
+                    &sh("head -c 1048576 /dev/zero | tr '\\0' y; cat >/dev/null"),
+                    &input,
+                )
+                .unwrap()
+        });
+        assert_eq!((out.code, out.stdout.len()), (0, 1 << 20));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_input_survives_a_child_that_never_reads() {
+        let input = Payload::new(vec![b'x'; 4 << 20]);
+        let out = within(move || {
+            OsExec
+                .capture_input(&sh("echo done; exit 5"), &input)
+                .unwrap()
+        });
+        assert_eq!((out.code, out.stdout.as_str()), (5, "done\n"));
     }
 
     #[cfg(unix)]
@@ -1086,6 +1201,23 @@ mod tests {
             ["-T", "--", "cluster", "bash -c 'true'"]
         );
         assert_eq!(*exec.inputs.borrow(), [b"print(1)\n".to_vec()]);
+    }
+
+    #[test]
+    fn upload_hands_the_archive_to_ssh_without_a_terminal_and_collects_the_answer() {
+        let exec = FakeExec::new(vec![output(0, "rr-snapshot published\n", "")], vec![]);
+        let input = Payload::new(b"tar".to_vec());
+        let out = Ssh::new(&host(), &exec)
+            .upload(&lit("true"), &input)
+            .unwrap();
+        assert_eq!(out.stdout, "rr-snapshot published\n");
+        let calls = exec.calls.borrow();
+        assert_eq!(calls[0].1, How::CaptureInput);
+        assert_eq!(
+            calls[0].0.args()[4..],
+            ["-T", "--", "cluster", "bash -c 'true'"]
+        );
+        assert_eq!(*exec.inputs.borrow(), [b"tar".to_vec()]);
     }
 
     #[test]
