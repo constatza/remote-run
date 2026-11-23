@@ -98,7 +98,7 @@ A `.rr.toml` can choose the host, the remote directory, a shell file the remote 
 
 ### Faster repeated calls (optional)
 
-Each `rr` call opens one or two ssh connections. With connection sharing, later calls reuse the first one. This works on Linux and macOS, not on Windows. Add to `~/.ssh/config`:
+Each `rr` call opens one or two ssh connections. With connection sharing, later calls reuse the first one. This works on Linux, not on Windows. Add to `~/.ssh/config`:
 
 ```
 Host mycluster
@@ -579,6 +579,18 @@ By command:
 
 ## Development
 
+The gate is the same three commands locally and in CI:
+
 ```sh
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
+
+Pre-commit hooks run them for you. Install [pre-commit](https://pre-commit.com) (or `prek`), then once per clone:
+
+```sh
+pre-commit install --install-hooks --hook-type pre-commit --hook-type pre-push
+```
+
+- On commit: whitespace and file checks, `cargo fmt --check` and `cargo clippy`.
+- On push: `cargo test`.
+- The tests need `git` and `python3` on `PATH`.

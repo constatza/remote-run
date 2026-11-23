@@ -15,9 +15,9 @@ Setup: a project `main/` with `src/pkg` (`WHERE = "main"`), a top-level `topmod.
 
 Consequence for the design: the stale check of a snapshot is `uv sync --frozen --check --inexact --no-install-project`, not the `uv sync --frozen --check` that `rr pull` runs in the checkout. `--inexact` means a package the environment has and the lock no longer lists is not reported; the check answers "does the environment hold what this lock needs", which is what a snapshot run depends on.
 
-## Host (the test cluster), 2026-11-23 (uv 0.13.1, venv Python 3.15.0, CephFS home)
+## Cluster host, 2026-11-23 (uv 0.13.1, venv Python 3.15.0, CephFS home)
 
-Run through `ssh the test cluster 'bash -l -s'` from a script, in one `mktemp -d` directory under `$HOME` that a trap removes (checked afterwards: nothing left). The system `python3` is 3.6.8, so `uv sync` used a uv-managed Python 3.15.0 and could fetch `uv_build`; the host has outbound access for uv. Same project layout as on the workstation, `UV_PROJECT_ENVIRONMENT` pointing at the main checkout's `.venv`.
+Run through `ssh <cluster> 'bash -l -s'` from a script, in one `mktemp -d` directory under `$HOME` that a trap removes (checked afterwards: nothing left). The system `python3` is 3.6.8, so `uv sync` used a uv-managed Python 3.15.0 and could fetch `uv_build`; the host has outbound access for uv. Same project layout as on the workstation, `UV_PROJECT_ENVIRONMENT` pointing at the main checkout's `.venv`.
 
 | # | Check | Result |
 |---|---|---|

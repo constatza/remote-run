@@ -43,7 +43,7 @@ The tree passes `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
 - **Terminal text:** a bare `\r` (a progress bar) in `rr log` shows as `?`, not as an updating line. `rr log -f` over `ssh -t` still needs a check on the real host.
 - **`uv` on the test cluster** is only on the PATH of a login shell, so `rr pull` there needs `--env` or `RR_ENV` that sets it.
 
-## Checked on the test cluster
+## Checked on a real cluster
 
 2026-11-23, Slurm 26.05.4, uv 0.13.1, GNU coreutils 8.30, git 2.43, bash 4.4. Every check ran in a throwaway directory in the home that was removed afterwards.
 
@@ -60,4 +60,4 @@ The tree passes `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
 
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` must pass before any commit.
 - Tests use `FakeExec` and `FakeRemote`, real `bash` with stub programs on `PATH`, and a stub `ssh` with a real temporary git repository (`tests/snapshot.rs`, `tests/json.rs`, `tests/fwd.rs`). None touches the network, `~/.ssh` or the real `HOME`.
-- Manual checks on the test cluster stay read-only unless the user approves a throwaway job; record what a check confirmed in "Checked on the test cluster" above.
+- Manual checks on the test cluster stay read-only unless the user approves a throwaway job; record what a check confirmed in "Checked on a real cluster" above.
