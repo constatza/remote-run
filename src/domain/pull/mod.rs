@@ -10,8 +10,8 @@
 mod decide;
 mod state;
 
-pub use decide::{JobPolicy, Permit, PullDecision, Reason, decide};
-use state::no_job_inside_script;
+pub use decide::{JobPolicy, Permit, PullDecision, Reason, decide, merge_refusal};
+use state::read_blocking_jobs_script;
 pub use state::{Job, RemoteState, Workdir, parse_state, state_script};
 
 use crate::domain::exit::RrCode;
@@ -57,6 +57,14 @@ pub const UV_MISSING_EXIT: i32 = 127;
 /// codes `git` itself exits with (1, 128), so a failed merge cannot be read as this refusal.
 pub const STATE_CHANGED_EXIT: i32 = 76;
 
+/// The line the merge script prints, before it exits [`STATE_CHANGED_EXIT`], when it could not
+/// read the queue at all (`squeue`, `realpath` or `pwd` failed), as opposed to having found a job.
+/// [`merge_refusal`] tells the two apart by it.
+pub const QUEUE_UNREADABLE_MARKER: &str = "rr: could not re-check the queue";
+
+/// The note the merge script prints when the checkout or its jobs are not what was read.
+const CHANGED_NOTE: &str = "the remote checkout or its jobs changed since it was read";
+
 /// Check a uv project's environment without changing it.
 pub(crate) fn verify_script() -> Script {
     lit("if [ -f uv.lock ]; then\n  if ! command -v uv >/dev/null 2>&1; then echo 'uv is not on the remote PATH' >&2; exit ")
@@ -72,9 +80,11 @@ pub(crate) fn verify_script() -> Script {
 /// The state was read by an earlier ssh call, so the script first re-asserts, on the remote, that
 /// `HEAD` is still `from`, the tree is still clean and, unless the permit's policy is
 /// [`JobPolicy::Override`], that no job was submitted from the checkout since (the same query and
-/// path test as [`state_script`]). Any mismatch exits [`STATE_CHANGED_EXIT`]. A `git`, `squeue` or
+/// path normalisation as [`state_script`], with an equivalent shell form of its "inside" test). Any mismatch exits [`STATE_CHANGED_EXIT`]. A `git`, `squeue` or
 /// `realpath` that fails inside the check fails the check: the merge only runs on a positive
-/// answer. What remains is the time between this check and `git merge`, inside one script.
+/// answer. A queue that could not be read prints [`QUEUE_UNREADABLE_MARKER`] first, so it is not
+/// told as a job that landed. What remains is the time between this check and `git merge`, inside
+/// one script.
 ///
 /// ```compile_fail,E0603
 /// let _ = remote_run::domain::pull::apply_script;
@@ -84,17 +94,30 @@ pub(crate) fn apply_script(permit: &Permit) -> Script {
         lit(r#"head=$(git rev-parse HEAD) && dirty=$(git status --porcelain) && [ "$head" = "#)
             .word(quote(permit.from().as_str()))
             .lit(r#" ] && [ -z "$dirty" ]"#);
+    let checks = checks.then(refuse_unless(CHANGED_NOTE));
     let checks = match permit.policy() {
-        JobPolicy::Respect => checks.lit(" && ").then(no_job_inside_script()),
+        JobPolicy::Respect => checks
+            .then(read_blocking_jobs_script())
+            .then(refuse_unless(QUEUE_UNREADABLE_MARKER))
+            .lit(r#"[ -z "$blocked" ]"#)
+            .then(refuse_unless(CHANGED_NOTE)),
         JobPolicy::Override => checks,
     };
     checks
-        .lit(" || { echo 'the remote checkout or its jobs changed since it was read' >&2; exit ")
-        .word(number(STATE_CHANGED_EXIT))
-        .lit("; }\ngit merge -q --ff-only ")
+        .lit("git merge -q --ff-only ")
         .word(quote(permit.to().as_str()))
         .lit("\n")
         .then(verify_script())
+}
+
+/// The tail that ends a check line: when the check before it failed, say `note` on stderr and
+/// exit [`STATE_CHANGED_EXIT`], so the merge that follows never runs.
+fn refuse_unless(note: &'static str) -> Script {
+    lit(" || { echo '")
+        .lit(note)
+        .lit("' >&2; exit ")
+        .word(number(STATE_CHANGED_EXIT))
+        .lit("; }\n")
 }
 
 /// How a pull ended.
@@ -323,6 +346,11 @@ mod tests {
             assert_eq!(merge.code, STATE_CHANGED_EXIT, "{name}: {}", merge.stderr);
             assert!(!merge.merged, "{name}: merged under a job");
             assert!(merge.stderr.contains("job"), "{name}: {}", merge.stderr);
+            assert!(
+                matches!(merge_refusal(&merge.stderr), Reason::StateChanged { .. }),
+                "{name}: a found job is not an unreadable queue: {}",
+                merge.stderr
+            );
         }
     }
 
@@ -391,8 +419,41 @@ mod tests {
         }
     }
 
-    /// The merge-time check and the state read build the query and the path test from the same
-    /// pieces, so the squeue format and `realpath -m` cannot differ between them.
+    /// A query that failed says so, apart from a job that was found: `squeue` itself failing or
+    /// `pwd` failing is "could not re-check", a job inside the checkout or a line that cannot be
+    /// placed is a change.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_queue_query_is_told_apart_from_a_job_that_landed() {
+        for squeue in [
+            "echo 'squeue: down' >&2; exit 1",
+            "echo '6 /elsewhere'; exit 1",
+        ] {
+            let merge = merge_with_queue(&Queue::printing(squeue));
+            assert_eq!(merge.code, STATE_CHANGED_EXIT, "{}", merge.stderr);
+            assert!(!merge.merged);
+            let Reason::QueueUnreadable { stderr } = merge_refusal(&merge.stderr) else {
+                panic!("not marked as an unreadable queue: {}", merge.stderr);
+            };
+            assert!(!stderr.contains(QUEUE_UNREADABLE_MARKER), "{stderr}");
+        }
+        let down = merge_with_queue(&Queue::printing("echo 'squeue: down' >&2; exit 1"));
+        let shown = merge_refusal(&down.stderr).to_string();
+        assert!(shown.contains("squeue: down"), "{shown}");
+        assert!(!shown.contains("landed"), "{shown}");
+        let unplaced = Queue {
+            realpath: Some("exit 1"),
+            ..Queue::printing("echo '7 /elsewhere'")
+        };
+        let found = merge_with_queue(&unplaced);
+        assert!(matches!(
+            merge_refusal(&found.stderr),
+            Reason::StateChanged { .. }
+        ));
+    }
+
+    /// The merge-time check and the state read build the query and the path normalisation from
+    /// the same loop, so the squeue format and `realpath -m` cannot differ between them.
     #[test]
     fn the_merge_script_asks_the_same_job_question_as_the_state_script() {
         let permit = Permit::between(commit(A), commit(B), JobPolicy::Respect);

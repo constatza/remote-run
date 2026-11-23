@@ -1,7 +1,7 @@
 //! The pure judgement of a remote state, and the permit that is the only way to a merge.
 
-use super::Target;
 use super::state::RemoteState;
+use super::{QUEUE_UNREADABLE_MARKER, Target};
 use crate::domain::ids::Commit;
 use crate::domain::sanitize::sanitize;
 use crate::domain::slurm::SqueueId;
@@ -27,6 +27,31 @@ pub enum Reason {
     StateChanged {
         stderr: String,
     },
+    /// The merge script could not read the queue (`squeue`, `realpath` or `pwd` failed), so it
+    /// could not tell whether a job landed, and did not merge. `stderr` is what those printed.
+    QueueUnreadable {
+        stderr: String,
+    },
+}
+
+/// The refusal for a merge script that exited [`STATE_CHANGED_EXIT`](super::STATE_CHANGED_EXIT),
+/// from what it printed: [`QUEUE_UNREADABLE_MARKER`] means the queue could not be read, anything
+/// else that something changed. The marker line itself is not part of what the remote said.
+pub fn merge_refusal(stderr: &str) -> Reason {
+    let (marked, said): (Vec<&str>, Vec<&str>) = stderr
+        .lines()
+        .partition(|line| *line == QUEUE_UNREADABLE_MARKER);
+    let stderr = if marked.is_empty() {
+        stderr
+    } else {
+        &said.join("\n")
+    };
+    let stderr = stderr.trim().to_string();
+    if marked.is_empty() {
+        Reason::StateChanged { stderr }
+    } else {
+        Reason::QueueUnreadable { stderr }
+    }
 }
 
 impl fmt::Display for Reason {
@@ -50,6 +75,13 @@ impl fmt::Display for Reason {
                     ids.join(", ")
                 )
             }
+            Reason::QueueUnreadable { stderr } => {
+                f.write_str("could not re-check the queue, so nothing was merged")?;
+                match stderr.trim() {
+                    "" => Ok(()),
+                    said => write!(f, ": {}", sanitize(said)),
+                }
+            }
             Reason::StateChanged { stderr } => {
                 f.write_str(
                     "the remote checkout changed while rr was working (a commit, an edit or a job \
@@ -61,6 +93,39 @@ impl fmt::Display for Reason {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    #[test]
+    fn the_marker_line_tells_an_unreadable_queue_from_a_landed_job() {
+        let landed = merge_refusal("job 7\nthe remote checkout or its jobs changed\n");
+        assert!(matches!(landed, Reason::StateChanged { .. }), "{landed:?}");
+        let said = format!("squeue: down\n{QUEUE_UNREADABLE_MARKER}\n");
+        assert_eq!(
+            merge_refusal(&said),
+            Reason::QueueUnreadable {
+                stderr: "squeue: down".into()
+            }
+        );
+        let shown = merge_refusal(&said).to_string();
+        assert_eq!(
+            shown,
+            "could not re-check the queue, so nothing was merged: squeue: down"
+        );
+        assert!(!shown.contains("landed"), "{shown}");
+        assert!(!shown.contains(QUEUE_UNREADABLE_MARKER), "{shown}");
+    }
+
+    #[test]
+    fn what_the_remote_said_about_the_queue_is_sanitized() {
+        let said = format!("down\u{1b}[2J\n{QUEUE_UNREADABLE_MARKER}");
+        let shown = merge_refusal(&said).to_string();
+        assert!(shown.contains("down?[2J"), "{shown:?}");
+        assert!(!shown.contains('\u{1b}'));
     }
 }
 

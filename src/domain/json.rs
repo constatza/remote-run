@@ -84,6 +84,7 @@ enum RefusalReason {
     RemoteDirty,
     JobsFromCheckout,
     StateChanged,
+    QueueUnreadable,
 }
 
 #[derive(Serialize)]
@@ -169,6 +170,7 @@ fn pull(outcome: &PullOutcome) -> PullBody {
                 Reason::RemoteDirty(_) => RefusalReason::RemoteDirty,
                 Reason::JobsFromCheckout(_) => RefusalReason::JobsFromCheckout,
                 Reason::StateChanged { .. } => RefusalReason::StateChanged,
+                Reason::QueueUnreadable { .. } => RefusalReason::QueueUnreadable,
             },
             detail: clean(&reason.to_string()),
         },
@@ -344,6 +346,12 @@ mod tests {
                     stderr: String::new(),
                 },
                 "state_changed",
+            ),
+            (
+                Reason::QueueUnreadable {
+                    stderr: String::new(),
+                },
+                "queue_unreadable",
             ),
             (Reason::NotOnOrigin(Target::OriginHead), "not_on_origin"),
         ];
