@@ -81,9 +81,9 @@ fn each_line(command: Script, key: &'static str) -> Script {
 /// The loop over the active jobs, `<id> <submit directory>` lines of [`job_workdirs_command`].
 /// `resolved` runs with `$id` and the `realpath -m` result `$resolved` set, `unresolved` when
 /// `realpath -m` cannot normalise the directory, and `malformed` for a line with no directory
-/// (`$line`). The state read and the merge-time check both build on this loop, so the query and
-/// the normalisation cannot differ between them.
-fn job_loop(resolved: Script, unresolved: Script, malformed: Script) -> Script {
+/// (`$line`). The state read, the merge-time check and `rr gc` all build on this loop, so the query
+/// and the normalisation cannot differ between them.
+pub(crate) fn job_loop(resolved: Script, unresolved: Script, malformed: Script) -> Script {
     job_workdirs_command()
         .lit(
             r#" | while IFS= read -r line || [ -n "$line" ]; do

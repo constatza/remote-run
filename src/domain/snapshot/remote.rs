@@ -26,11 +26,11 @@ const PUBLISHED: &str = "rr-snapshot published";
 
 /// The owner and mode of a directory must be the user's and `$2`, and it must not be a symlink.
 /// `stat -c` is GNU coreutils, as `realpath -m` already is for the pull guard.
-const SAFE_FN: &str = r#"safe() { [ ! -L "$1" ] && [ -d "$1" ] && [ "$(stat -c '%u %a' -- "$1")" = "$(id -u) $2" ]; }"#;
+pub(super) const SAFE_FN: &str = r#"safe() { [ ! -L "$1" ] && [ -d "$1" ] && [ "$(stat -c '%u %a' -- "$1")" = "$(id -u) $2" ]; }"#;
 
 /// The mode of the snapshot root (`mkdir -m`), and of a published snapshot: the same minus the
 /// write bits that `chmod -R a-w` removes.
-const ROOT_MODE: &str = "700";
+pub(super) const ROOT_MODE: &str = "700";
 const SNAPSHOT_MODE: &str = "500";
 
 /// The names `rr` keeps in a snapshot. A tree that holds one (a file, or a symlink that would send

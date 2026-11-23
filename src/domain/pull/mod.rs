@@ -11,6 +11,7 @@ mod decide;
 mod state;
 
 pub use decide::{JobPolicy, Permit, PullDecision, Reason, decide, merge_refusal};
+pub(crate) use state::job_loop;
 use state::read_blocking_jobs_script;
 pub use state::{Job, RemoteState, Workdir, parse_state, state_script};
 

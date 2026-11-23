@@ -7,6 +7,8 @@
 //! and a command cannot run in a snapshot that was never shipped.
 
 mod archive;
+mod gc;
+mod gc_script;
 mod git;
 mod guard;
 mod names;
@@ -17,6 +19,11 @@ mod tree;
 pub use archive::count_files;
 #[cfg(test)]
 pub use archive::tar_of;
+pub use gc::{
+    AGE_FLOOR_SECONDS, Age, GC_REFUSED_EXIT, GcOutcome, GcRefusal, GcReport, Keep, Kept, Leftover,
+    RootEntry, Why, gc_lines, parse_report,
+};
+pub use gc_script::{Listed, Rechecked, Trashed, gc_script};
 pub use git::{IndexFile, Repo, toplevel};
 pub use guard::{
     BuiltTree, Cleanliness, ClearedTree, DirtyPolicy, Facts, Inclusion, Link, LockFile, Policy,

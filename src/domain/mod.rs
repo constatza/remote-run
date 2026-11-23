@@ -22,6 +22,7 @@ pub mod sanitize;
 pub mod shell;
 pub mod slurm;
 pub mod snapshot;
+pub mod span;
 pub mod ssh;
 pub mod status;
 pub mod transfer;

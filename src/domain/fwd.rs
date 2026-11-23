@@ -6,6 +6,7 @@ use crate::domain::argv::Argv;
 use crate::domain::exit::RemoteExit;
 use crate::domain::host::Host;
 use crate::domain::name::plain_name;
+use crate::domain::span::{parse_seconds, show_seconds};
 use crate::domain::ssh::SSH_OPTIONS;
 use anyhow::{Context, Result, anyhow, bail};
 use core::time::Duration;
@@ -280,16 +281,7 @@ impl Ttl {
     /// `90s`, `30m`, `8h` or `2d`.
     pub fn parse(text: &str) -> Result<Self> {
         let bad = || format!("not a time to live: {text:?} (use 90s, 30m, 8h or 2d, at most 7d)");
-        let (digits, seconds) = [("s", 1_u64), ("m", 60), ("h", 3600), ("d", 86_400)]
-            .into_iter()
-            .find_map(|(unit, seconds)| Some((text.strip_suffix(unit)?, seconds)))
-            .with_context(bad)?;
-        // digits only: `u64::from_str` would also take a leading `+`
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            bail!(bad());
-        }
-        let count: u64 = digits.parse().with_context(bad)?;
-        let ttl = Duration::from_secs(count.saturating_mul(seconds));
+        let ttl = Duration::from_secs(parse_seconds(text).with_context(bad)?);
         if ttl.is_zero() || ttl > MAX_TTL {
             bail!(bad());
         }
@@ -303,13 +295,7 @@ impl Ttl {
 
 impl fmt::Display for Ttl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = self.0.as_secs();
-        match () {
-            () if s.is_multiple_of(86_400) => write!(f, "{}d", s / 86_400),
-            () if s.is_multiple_of(3600) => write!(f, "{}h", s / 3600),
-            () if s.is_multiple_of(60) => write!(f, "{}m", s / 60),
-            () => write!(f, "{s}s"),
-        }
+        f.write_str(&show_seconds(self.0.as_secs()))
     }
 }
 
