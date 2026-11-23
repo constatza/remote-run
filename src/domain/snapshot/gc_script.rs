@@ -288,6 +288,10 @@ mod tests {
         let text = script("2h", 0);
         let squeue = &job_workdirs_command().to_string();
         assert_eq!(text.matches(squeue).count(), 1, "one function reads it");
+        assert!(
+            text.contains(crate::domain::slurm::ACTIVE_JOB_STATES),
+            "{text}"
+        );
         assert!(text.contains("realpath -m -- \"${line#* }\""), "{text}");
         assert_eq!(
             text.matches("read_queue").count(),

@@ -444,6 +444,10 @@ mod tests {
         assert!(text.contains("git fetch -q --prune origin"), "{text}");
         let query = format!("{} | while", job_workdirs_command());
         assert!(text.contains(&query), "{text}");
+        assert!(
+            text.contains(crate::domain::slurm::ACTIVE_JOB_STATES),
+            "{text}"
+        );
         assert!(text.contains("realpath -m -- "), "{text}");
         assert!(
             text.contains(r#"git branch -r --contains "$target" --list 'origin/*'"#),
