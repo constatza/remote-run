@@ -607,3 +607,22 @@ fn an_lfs_pointer_with_crlf_line_ends_is_refused() {
     assert!(stderr.contains("model.bin"), "{stderr}");
     assert!(!stderr.contains("note.txt"), "{stderr}");
 }
+
+#[test]
+fn wait_follows_the_job_the_snapshot_command_submitted() {
+    if !git_available() {
+        return;
+    }
+    let world = World::new();
+    // The remote's `sacct` says the submitted job completed; the unit separator is sacct's field split.
+    let sacct = world.path("bin/sacct");
+    fs::write(&sacct, "#!/bin/sh\nprintf '7\\037COMPLETED\\n'\n").unwrap();
+    fs::set_permissions(&sacct, fs::Permissions::from_mode(0o755)).unwrap();
+    let run = world.snapshot_run(
+        &["--wait"],
+        &["sh", "-c", "echo 'Submitted batch job 7'; exit 0"],
+    );
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
+    assert!(text(&run.stdout).contains("Submitted batch job 7"));
+    assert_eq!(world.snapshots().len(), 1, "the command ran in a snapshot");
+}
