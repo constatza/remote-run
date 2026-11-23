@@ -148,6 +148,9 @@ fn render_text(outcome: &Outcome) -> Rendered {
 const GC_HALF_REMOVED: &str =
     "rr: some entries were set aside but not fully removed; run `rr gc` again";
 /// The line that says some entries could not be set aside, or put back after a job appeared.
+/// After a refusal: nothing was deleted, but an entry set aside could not be put back.
+const GC_STRANDED: &str = "rr: nothing was deleted, but an entry could not be put back and may exist only as `.trash-<id>`; run `rr gc` again";
+
 const GC_NOT_SET_ASIDE: &str = "rr: some entries could not be set aside or put back and were left as they are; run `rr gc` again";
 
 /// A clean-up prints its report on stdout. Entries left half removed, or that a step could not
@@ -183,7 +186,7 @@ fn render_gc(outcome: &GcOutcome) -> Rendered {
         GcOutcome::Stranded { why, report } => Rendered {
             exit: Exit::Rr(RrCode::Failure),
             stdout: lines(&gc_lines(report)),
-            stderr: lines(&[format!("rr: refused: {why}"), GC_NOT_SET_ASIDE.to_string()]),
+            stderr: lines(&[format!("rr: refused: {why}"), GC_STRANDED.to_string()]),
         },
     }
 }

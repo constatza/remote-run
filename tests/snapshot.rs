@@ -625,4 +625,11 @@ fn wait_follows_the_job_the_snapshot_command_submitted() {
     assert_eq!(run.status.code(), Some(0), "{}", text(&run.stderr));
     assert!(text(&run.stdout).contains("Submitted batch job 7"));
     assert_eq!(world.snapshots().len(), 1, "the command ran in a snapshot");
+    assert!(
+        world
+            .scripts()
+            .iter()
+            .any(|script| script.contains("sacct")),
+        "the wait polled sacct"
+    );
 }

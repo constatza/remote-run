@@ -61,8 +61,9 @@ fn head(id: &TreeId) -> Script {
 }
 
 /// Refuse a snapshot directory that exists and is not safe, else mark it used and say it is
-/// present. The mark is made here, not only in `run_prelude`, so `rr gc --older-than` cannot remove
-/// the snapshot between this answer and the run's `cd`. `.rr-used` exists from the upload, so
+/// present. The mark is made here, not only in `run_prelude`, so the window in which `rr gc
+/// --older-than` can still take the snapshot between this answer and the run's `cd` is the few
+/// moments between its read of `.rr-used` and this touch (it never reads it again). `.rr-used` exists from the upload, so
 /// `touch` needs no write access to the read-only directory; a failure (a snapshot without the
 /// file, a read-only filesystem) is an error, never a `present` the run could not rely on.
 fn present_lines() -> Script {
@@ -123,8 +124,9 @@ pub fn upload_script(tree: &ClearedTree) -> Result<Script> {
         lit("chmod g-s -- \"$tmp\""),
         lit("tar -x --no-same-owner --no-same-permissions -C \"$tmp\" -f - <&3"),
         // GNU tar exits 0 on an archive cut between two members, so a link that died mid-transfer
-        // would publish a partial tree under the final name for good; the count is the proof
-        lit("found=$(find \"$tmp\" ! -type d | wc -l)"),
+        // would publish a partial tree under the final name for good; the count is the proof. One
+        // dot per file, because a name with a newline would be several lines of `find` output.
+        lit("found=$(find \"$tmp\" ! -type d -printf . | wc -c)"),
         lit("if [ \"$found\" -ne ")
             .word(number(i64::try_from(tree.files())?))
             .lit(" ]; then echo \"rr: the archive arrived incomplete\" >&2; exit 1; fi"),
@@ -549,7 +551,7 @@ mod tests {
     #[test]
     fn an_archive_cut_short_is_never_published_even_when_tar_exits_zero() {
         let full = archive();
-        let mut cuts_tested = 0;
+        let (mut cuts_tested, mut refused) = (0, 0);
         for cut in (512..full.len()).step_by(512) {
             let remote = Remote::new();
             let run = remote.upload(&full[..cut]);
@@ -558,9 +560,34 @@ mod tests {
                     assert!(remote.snap().join(name).is_file(), "cut {cut} lost {name}");
                 }
             }
+            if run.stderr.contains("incomplete") {
+                refused += 1;
+            }
             cuts_tested += 1;
         }
         assert!(cuts_tested > 3);
+        assert!(
+            refused > 0,
+            "no cut reached the count check, so the test proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_file_name_with_a_newline_counts_as_one_file() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a\nb"), "x").unwrap();
+        std::fs::write(src.path().join("ok"), "x").unwrap();
+        let tar = Argv::new(
+            "tar",
+            ["-cf", "-", "-C", src.path().to_str().unwrap(), "."]
+                .map(String::from)
+                .into(),
+        );
+        let bytes = OsExec.capture_bytes(&tar).unwrap().stdout;
+        let remote = Remote::new();
+        let script = upload_script(&ClearedTree::fake(TREE, 2)).unwrap();
+        let run = remote.run(script, &bytes);
+        assert_eq!(said(&run), PUBLISHED, "{}", run.stderr);
     }
 
     #[test]
