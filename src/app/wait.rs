@@ -28,7 +28,7 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     let start = ports.clock.now();
     let mut unreadable_polls = 0;
     loop {
-        let reading = Reading::from_capture(ports.remote.capture(&poll));
+        let reading = Reading::from_capture(ports.remote.capture(&poll))?;
         let progress = Progress {
             elapsed: ports.clock.now().since(start),
             timeout: args.limits.timeout,
@@ -136,12 +136,18 @@ mod tests {
 
     #[test]
     fn a_job_that_ended_in_any_other_state_exits_5() {
-        for state in ["FAILED", "TIMEOUT", "CANCELLED by 9", "OUT_OF_MEMORY"] {
+        let cases = [
+            ("FAILED", "FAILED"),
+            ("TIMEOUT", "TIMEOUT"),
+            ("CANCELLED by 9", "CANCELLED"),
+            ("OUT_OF_MEMORY", "OUT_OF_MEMORY"),
+        ];
+        for (state, shown) in cases {
             let text = reply("7", state);
             let (exit, report, slept) = wait(&[(0, &text, "")]);
             assert_eq!(exit, Exit::Rr(RrCode::JobFailed), "{state}");
             assert_eq!(exit.code(), 5);
-            assert!(report.starts_with("rr: 7 "), "{report}");
+            assert_eq!(report, format!("rr: 7 {shown}\n"));
             assert!(slept.is_empty());
         }
     }
