@@ -1,6 +1,6 @@
 //! `rr cancel`: cancel jobs.
 
-use super::{Ports, stream};
+use super::{Output, Ports, stream};
 use crate::config::Session;
 use crate::domain::outcome::Outcome;
 use crate::domain::slurm::{JobId, cancel_script};
@@ -13,7 +13,13 @@ pub struct Args {
 
 pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     let body = cancel_script(&args.jobs);
-    stream(ports, &session.place.at_home(), body, Terminal::Plain)
+    stream(
+        ports,
+        &session.place.at_home(),
+        body,
+        Terminal::Plain,
+        Output::Raw,
+    )
 }
 
 #[cfg(test)]

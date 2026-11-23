@@ -1,6 +1,6 @@
 //! `rr acct`: your recent jobs.
 
-use super::{Ports, stream_filtered};
+use super::{Output, Ports, stream};
 use crate::config::Session;
 use crate::domain::outcome::Outcome;
 use crate::domain::slurm::acct_script;
@@ -14,7 +14,13 @@ pub struct Args {
 
 pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     let body = acct_script(&args.since);
-    stream_filtered(ports, &session.place.at_home(), body, Terminal::Plain)
+    stream(
+        ports,
+        &session.place.at_home(),
+        body,
+        Terminal::Plain,
+        Output::Filtered,
+    )
 }
 
 #[cfg(test)]

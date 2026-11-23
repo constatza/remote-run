@@ -53,7 +53,7 @@ fn sync(
     let stderr = applied.stderr.trim().to_string();
     match (applied.code, permit) {
         (STALE_EXIT, _) => Ok(PullOutcome::Stale { stderr }),
-        (STATE_CHANGED_EXIT, Some(_)) => Ok(PullOutcome::Refused(Reason::StateChanged)),
+        (STATE_CHANGED_EXIT, Some(_)) => Ok(PullOutcome::Refused(Reason::StateChanged { stderr })),
         (UV_MISSING_EXIT, _) => bail!(
             "cannot check the remote environment: uv is not on the remote PATH (set `env` to a \
              file that puts it there):\n{stderr}"
@@ -211,7 +211,11 @@ mod tests {
             ),
         ]);
         let outcome = stub.pull(JobPolicy::Respect).unwrap();
-        assert_eq!(outcome, PullOutcome::Refused(Reason::StateChanged));
+        let said = "the remote checkout changed since it was read".to_string();
+        assert_eq!(
+            outcome,
+            PullOutcome::Refused(Reason::StateChanged { stderr: said })
+        );
         assert_eq!(next(&outcome), Next::Stop(RrCode::Refused));
     }
 

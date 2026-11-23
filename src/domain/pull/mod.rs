@@ -174,10 +174,11 @@ mod tests {
         assert!(stderr.contains("lock out of date"), "{stderr}");
     }
 
-    /// The merge script run by bash, as `place::script` wraps it, against a stand-in `git` that
-    /// reports `head`, a `status` output and an exit code for `git status`, and records merges.
+    /// The merge script run by bash, as `place::script` wraps it, against a stand-in `git` whose
+    /// `rev-parse` and `status` run the shell snippets `head` and `status`, and which records
+    /// merges. `HOME` is the temporary directory, so no real git configuration is read.
     #[cfg(unix)]
-    fn run_merge(head: &str, status: &str, status_code: i32) -> (i32, bool) {
+    fn run_merge(head: &str, status: &str) -> (i32, bool) {
         use crate::adapters::OsExec;
         use crate::domain::place::{Place, script};
         use crate::ports::{Argv, Exec, Stdin};
@@ -185,7 +186,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("merged");
         let git = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  rev-parse) echo {head} ;;\n  status) printf '{status}'; exit {status_code} ;;\n  merge) echo \"$@\" > {} ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  rev-parse) {head} ;;\n  status) {status} ;;\n  merge) echo \"$@\" > {} ;;\nesac\n",
             quote(&log.display().to_string())
         );
         let path = dir.path().join("git");
@@ -197,6 +198,7 @@ mod tests {
         let cwd = format!("cd {} && {body}", quote(&dir.path().display().to_string()));
         let args = vec![
             format!("PATH={}:/usr/bin:/bin", dir.path().display()),
+            format!("HOME={}", dir.path().display()),
             "bash".into(),
             "-c".into(),
             cwd,
@@ -211,16 +213,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_merge_script_reasserts_the_state_it_was_judged_on() {
-        assert_eq!(run_merge(A, "", 0), (0, true), "unchanged: merges");
-        for (name, head, status, status_code) in [
-            ("head moved", B, "", 0),
-            ("head unreadable", "", "", 0),
-            ("dirty tracked file", A, " M x.py\\n", 0),
-            ("untracked file", A, "?? new\\n", 0),
-            ("status fails", A, "", 128),
-            ("status fails after output", A, " M x\\n", 1),
+        let at = |sha: &str| format!("echo {sha}");
+        assert_eq!(run_merge(&at(A), "true"), (0, true), "unchanged: merges");
+        for (name, head, status) in [
+            ("head moved", at(B), "true"),
+            ("head unreadable", "echo".to_string(), "true"),
+            ("git rev-parse fails", "exit 128".to_string(), "true"),
+            (
+                "git rev-parse fails after output",
+                format!("echo {A}; exit 128"),
+                "true",
+            ),
+            ("dirty tracked file", at(A), "printf ' M x.py\\n'"),
+            ("untracked file", at(A), "printf '?? new\\n'"),
+            ("status fails", at(A), "exit 128"),
+            (
+                "status fails after output",
+                at(A),
+                "printf ' M x\\n'; exit 1",
+            ),
         ] {
-            let (code, merged) = run_merge(head, status, status_code);
+            let (code, merged) = run_merge(&head, status);
             assert_eq!(code, STATE_CHANGED_EXIT, "{name}");
             assert!(!merged, "{name}: a changed checkout must not be merged");
         }

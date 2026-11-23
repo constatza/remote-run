@@ -121,7 +121,8 @@ pub fn state_script(target: &Target) -> Script {
     Script::lines([
         field("dir", lit(r#""$(pwd -P)""#)),
         field("head", lit(r#""$(git rev-parse HEAD)""#)),
-        lit("git fetch -q origin"),
+        // --prune: a branch deleted on origin must stop counting as "on origin"
+        lit("git fetch -q --prune origin"),
         resolved,
         field("target", lit(r#""$target""#)),
         origin_branches_script(),
@@ -142,6 +143,7 @@ pub fn parse_state(text: &str) -> Result<RemoteState> {
             .split_once('\t')
             .with_context(|| format!("remote state line without a value: {line:?}"))?;
         match key {
+            "dir" if value.is_empty() => bail!("the remote state has an empty dir"),
             "dir" => set_once(&mut dir, key, value.to_string())?,
             "head" => set_once(&mut head, key, Commit::parse(value)?)?,
             "target" => set_once(&mut target, key, parse_target(value)?)?,
@@ -269,6 +271,29 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_dir_is_an_error_like_an_empty_head() {
+        for (name, text) in [
+            (
+                "dir",
+                format!("rr-state\tdir\t\nrr-state\thead\t{A}\nrr-state\ttarget\t\n"),
+            ),
+            (
+                "head",
+                "rr-state\tdir\t/d\nrr-state\thead\t\nrr-state\ttarget\t\n".to_string(),
+            ),
+        ] {
+            assert!(
+                parse_state(&text).is_err(),
+                "an empty {name} must not parse"
+            );
+        }
+        let err = parse_state(&format!(
+            "rr-state\tdir\t\nrr-state\thead\t{A}\nrr-state\ttarget\t\n"
+        ));
+        assert!(err.unwrap_err().to_string().contains("empty dir"));
+    }
+
+    #[test]
     fn a_target_no_origin_branch_contains_is_not_on_origin() {
         let none = format!("rr-state\tdir\t/d\nrr-state\thead\t{A}\nrr-state\ttarget\t{B}\n");
         assert_eq!(parse_state(&none).unwrap().target, None);
@@ -378,6 +403,7 @@ mod tests {
     #[test]
     fn the_state_script_uses_printf_only_and_one_squeue() {
         let text = state_script(&Target::OriginHead).to_string();
+        assert!(text.contains("git fetch -q --prune origin"), "{text}");
         assert!(text.contains("squeue --me -h -o '%i %Z' | while"), "{text}");
         assert!(text.contains("realpath -m -- "), "{text}");
         assert!(
@@ -408,14 +434,17 @@ mod shell_tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::Path;
 
-    /// A stand-in `git` with a head, a resolvable target and a dirty tree; `branch_body` is what
-    /// `git branch` does.
-    fn git_stub(branch_body: &str) -> String {
+    /// What the stand-in `git` prints for the target `rev-parse -q`.
+    const TARGET_IS_B: &str = "echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A stand-in `git` with a head, a dirty tree, a target that `target_body` resolves (a shell
+    /// snippet; nothing printed means unresolvable) and `branch_body` for what `git branch` does.
+    fn git_stub(target_body: &str, branch_body: &str) -> String {
         format!(
             r#"#!/bin/sh
 case "$1 $2" in
   "rev-parse HEAD") echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
-  "rev-parse -q") echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+  "rev-parse -q") {target_body} ;;
   "status --porcelain") printf ' M a b.py\n?? x\ty\n' ;;
   "branch -r") {branch_body} ;;
 esac
@@ -440,7 +469,12 @@ esac
 
     /// The script's whole result when `git branch` runs `branch_body`.
     fn run_with_git(stubs: &Path, cwd: &Path, queue: &str, branch_body: &str) -> Captured {
-        install(stubs, "git", &git_stub(branch_body));
+        run_with_stub(stubs, cwd, queue, &git_stub(TARGET_IS_B, branch_body))
+    }
+
+    /// The script's whole result when the `git` on `PATH` is the program text `git`.
+    fn run_with_stub(stubs: &Path, cwd: &Path, queue: &str, git: &str) -> Captured {
+        install(stubs, "git", git);
         install(
             stubs,
             "squeue",
@@ -452,8 +486,10 @@ esac
             state_script(&Target::OriginHead)
         );
         let path = format!("PATH={}:/usr/bin:/bin", stubs.display());
+        let home = format!("HOME={}", stubs.display());
         let args = [
             path.as_str(),
+            home.as_str(),
             "bash",
             "-c",
             &format!("set -euo pipefail\n{body}"),
@@ -525,7 +561,24 @@ esac
         let stubs = tempfile::tempdir().unwrap();
         let failing = "echo 'fatal: bad' >&2; exit 129";
         let out = run_with_git(stubs.path(), root.path(), "5 /else", failing);
-        assert_ne!(out.code, 0, "{}", out.stdout);
+        assert_eq!(out.code, 129, "the stub's own code, not just any failure");
+        assert!(out.stderr.contains("fatal: bad"), "{}", out.stderr);
+    }
+
+    /// `rev-parse -q` printing nothing is a target the remote lacks: the branch query must not
+    /// even run, and the report still parses to "not on origin".
+    #[test]
+    fn an_unresolvable_target_asks_no_branch_question() {
+        let root = tempfile::tempdir().unwrap();
+        let stubs = tempfile::tempdir().unwrap();
+        let log = stubs.path().join("branch-calls");
+        let branch = format!("echo called >> {}", quote(&log.display().to_string()));
+        let git = git_stub("true", &branch);
+        let out = run_with_stub(stubs.path(), root.path(), "5 /else", &git);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(!out.stdout.contains("onorigin"), "{}", out.stdout);
+        assert!(!log.exists(), "git branch ran with no target");
+        assert_eq!(parse_state(&out.stdout).unwrap().target, None);
     }
 
     #[test]
@@ -537,5 +590,139 @@ esac
         let state = parse_state(&text).unwrap();
         assert_eq!(state.jobs[0].workdir, Workdir::Unresolved);
         assert!(state.jobs[0].is_inside(&state.dir));
+    }
+
+    /// Real `git` against a bare origin in a temporary directory, with no user or system
+    /// configuration, so the guard is checked against what git does and not against a stand-in.
+    struct Repos {
+        _tmp: tempfile::TempDir,
+        root: std::path::PathBuf,
+    }
+
+    impl Repos {
+        /// A bare `origin.git` and a clone `work` of it, `main` pushed with one commit.
+        /// `None` (with a message) when `git` is not installed.
+        fn new() -> Option<Self> {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let repos = Self { _tmp: tmp, root };
+            if repos.try_git(&repos.root, &["--version"]).is_none() {
+                eprintln!("skipped: `git` is not on PATH");
+                return None;
+            }
+            let (origin, work) = (repos.origin(), repos.work());
+            repos.git(
+                &repos.root,
+                &["init", "-q", "--bare", "-b", "main", &origin],
+            );
+            repos.git(&repos.root, &["clone", "-q", &origin, &work]);
+            repos.commit("pushed");
+            repos.git(&repos.work_path(), &["push", "-q", "origin", "HEAD:main"]);
+            Some(repos)
+        }
+
+        fn origin(&self) -> String {
+            self.root.join("origin.git").display().to_string()
+        }
+
+        fn work(&self) -> String {
+            self.work_path().display().to_string()
+        }
+
+        fn work_path(&self) -> std::path::PathBuf {
+            self.root.join("work")
+        }
+
+        /// `git` run in `cwd` with a fixed identity and no configuration files; `None` when it
+        /// cannot be started at all.
+        fn try_git(&self, cwd: &Path, args: &[&str]) -> Option<Captured> {
+            let fixed = [
+                format!("HOME={}", self.root.display()),
+                "GIT_CONFIG_GLOBAL=/dev/null".into(),
+                "GIT_CONFIG_SYSTEM=/dev/null".into(),
+                "GIT_AUTHOR_NAME=rr".into(),
+                "GIT_AUTHOR_EMAIL=rr@example.invalid".into(),
+                "GIT_COMMITTER_NAME=rr".into(),
+                "GIT_COMMITTER_EMAIL=rr@example.invalid".into(),
+                "git".into(),
+                "-C".into(),
+                cwd.display().to_string(),
+            ];
+            let rest = args.iter().map(ToString::to_string);
+            let argv = Argv::new("env", fixed.into_iter().chain(rest).collect());
+            OsExec
+                .capture(&argv, Stdin::Null)
+                .ok()
+                .filter(|out| out.code != 127)
+        }
+
+        fn git(&self, cwd: &Path, args: &[&str]) -> String {
+            let out = self.try_git(cwd, args).expect("git started a moment ago");
+            assert_eq!(out.code, 0, "git {args:?}: {}", out.stderr);
+            out.stdout.trim().to_string()
+        }
+
+        /// A new empty commit in `work`; returns its id.
+        fn commit(&self, message: &str) -> Commit {
+            let work = self.work_path();
+            self.git(&work, &["commit", "-q", "--allow-empty", "-m", message]);
+            Commit::parse(&self.git(&work, &["rev-parse", "HEAD"])).unwrap()
+        }
+
+        /// The target of the state report of `work` for `target`, using the real `git`.
+        fn target_on_origin(&self, target: &Commit) -> Option<Commit> {
+            let stubs = tempfile::tempdir().unwrap();
+            install(stubs.path(), "squeue", "#!/bin/sh\necho '5 /else'\n");
+            let body = format!(
+                "cd {} && {}",
+                quote(&self.work()),
+                state_script(&Target::Local(target.clone()))
+            );
+            let args = vec![
+                format!("PATH={}:/usr/bin:/bin", stubs.path().display()),
+                format!("HOME={}", self.root.display()),
+                "GIT_CONFIG_GLOBAL=/dev/null".into(),
+                "GIT_CONFIG_SYSTEM=/dev/null".into(),
+                "bash".into(),
+                "-c".into(),
+                format!("set -euo pipefail\n{body}"),
+            ];
+            let out = OsExec
+                .capture(&Argv::new("env", args), Stdin::Null)
+                .unwrap();
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            parse_state(&out.stdout).unwrap().target
+        }
+    }
+
+    #[test]
+    fn with_real_git_only_a_pushed_commit_is_on_origin() {
+        let Some(repos) = Repos::new() else { return };
+        let pushed = Commit::parse(&repos.git(&repos.work_path(), &["rev-parse", "HEAD"])).unwrap();
+        let local_only = repos.commit("local only");
+        assert_eq!(repos.target_on_origin(&pushed), Some(pushed.clone()));
+        assert_eq!(repos.target_on_origin(&local_only), None);
+    }
+
+    /// A commit that only a branch since deleted on origin held: the object is still in the
+    /// clone's store, but the fetch must prune the branch so it no longer counts as on origin.
+    #[test]
+    fn with_real_git_a_commit_on_a_deleted_origin_branch_is_not_on_origin() {
+        let Some(repos) = Repos::new() else { return };
+        let work = repos.work_path();
+        let feature = repos.commit("feature work");
+        repos.git(&work, &["push", "-q", "origin", "HEAD:refs/heads/feature"]);
+        repos.git(&work, &["reset", "-q", "--hard", "HEAD~1"]);
+        assert_eq!(repos.target_on_origin(&feature), Some(feature.clone()));
+        let origin = repos.origin();
+        repos.git(
+            &repos.root,
+            &["--git-dir", &origin, "branch", "-D", "feature"],
+        );
+        assert_eq!(repos.target_on_origin(&feature), None);
+        let kept = repos
+            .try_git(&work, &["cat-file", "-e", feature.as_str()])
+            .unwrap();
+        assert_eq!(kept.code, 0, "the object is still in the store");
     }
 }

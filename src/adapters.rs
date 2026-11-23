@@ -8,7 +8,8 @@ use crate::domain::ssh::{Terminal, ssh_argv};
 use crate::ports::{Clock, Exec, Instant, Remote, write_sanitized};
 use anyhow::{Context, Result, anyhow};
 use std::io::{self, Write};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Runs programs with `std::process`.
@@ -54,10 +55,40 @@ impl Exec for OsExec {
     }
 }
 
+/// The exit code reported when the user's stdout closed early (`rr q | head -1`) and the child
+/// itself had ended with success: the output was cut short, so that is not a success. It is the
+/// shell's code for death by SIGPIPE.
+const OUTPUT_CLOSED_EXIT: i32 = 141;
+
+/// Take both output pipes of `child`.
+fn take_pipes(child: &mut Child) -> Option<(ChildStdout, ChildStderr)> {
+    Some((child.stdout.take()?, child.stderr.take()?))
+}
+
+/// Kill `child`; an error means it had already ended, which is what is wanted.
+fn stop(child: &Mutex<Child>) {
+    if let Ok(mut child) = child.lock() {
+        let _ = child.kill();
+    }
+}
+
+/// `result`, after stopping `child` when it is an error: a child writing into a pipe nobody reads
+/// any more would otherwise run on, or sit idle, and the other pump would wait for it.
+fn stop_on_error(result: io::Result<()>, child: &Mutex<Child>) -> io::Result<()> {
+    if result.is_err() {
+        stop(child);
+    }
+    result
+}
+
 /// Run `argv` with stdin inherited and its stdout and stderr read through [`write_sanitized`] into
 /// `out` and `err`. The two pipes are read at once, so a child that fills one while the other is
-/// idle cannot stall. When a write fails its reader is dropped, which closes the pipe and ends the
-/// child; the error is reported after the child has been waited for, so no zombie is left.
+/// idle cannot stall.
+///
+/// A failed write to either side kills the child (closing the pipe alone would not stop one that
+/// never writes there again) and waits for it, so no zombie is left. A `BrokenPipe` on `out` is how
+/// `rr q | head -1` ends: it is not an error to report, and the result is the child's code, or
+/// [`OUTPUT_CLOSED_EXIT`] when that was success. Any other write error is returned.
 fn stream_filtered_to(
     argv: &Argv,
     mut out: impl Write + Send,
@@ -69,20 +100,34 @@ fn stream_filtered_to(
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("could not start {}", argv.program()))?;
-    let (Some(child_out), Some(child_err)) = (child.stdout.take(), child.stderr.take()) else {
+    let Some((child_out, child_err)) = take_pipes(&mut child) else {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(anyhow!("{} has no output pipes", argv.program()));
     };
+    let child = Mutex::new(child);
     let (out_result, err_result) = std::thread::scope(|scope| {
-        let err_pump = scope.spawn(move || write_sanitized(child_err, &mut err));
-        let out_result = write_sanitized(child_out, &mut out);
+        let child = &child;
+        let err_pump =
+            scope.spawn(move || stop_on_error(write_sanitized(child_err, &mut err), child));
+        let out_result = stop_on_error(write_sanitized(child_out, &mut out), child);
         (out_result, err_pump.join())
     });
-    let status = child.wait().context("could not wait for the child")?;
-    out_result.context("could not write the output")?;
-    err_result
-        .map_err(|_| anyhow!("the stderr filter stopped"))?
-        .context("could not write the error output")?;
-    Ok(exit_code(status))
+    let status = child
+        .into_inner()
+        .map_err(|_| anyhow!("the child handle was poisoned"))?
+        .wait()
+        .context("could not wait for the child")?;
+    let code = exit_code(status);
+    match (out_result, err_result) {
+        (Err(e), _) if e.kind() != io::ErrorKind::BrokenPipe => {
+            Err(e).context("could not write the output")
+        }
+        (_, Err(_)) => Err(anyhow!("the stderr filter stopped")),
+        (_, Ok(Err(e))) => Err(e).context("could not write the error output"),
+        (Err(_), Ok(Ok(()))) if code == 0 => Ok(OUTPUT_CLOSED_EXIT),
+        (Ok(()) | Err(_), Ok(Ok(()))) => Ok(code),
+    }
 }
 
 /// The real host, reached as `ssh <host>`, so `~/.ssh/config` and the agent apply.
@@ -153,11 +198,44 @@ mod tests {
     }
 
     use crate::ports::fake::{FakeExec, How, output};
+    #[cfg(unix)]
+    use std::sync::mpsc;
+    #[cfg(unix)]
+    use std::time::Instant as WallClock;
 
+    /// Longest a stream test may take; a regression that hangs fails instead of stalling the run.
+    #[cfg(unix)]
+    const WATCHDOG: Duration = Duration::from_secs(30);
+
+    #[cfg(unix)]
     fn sh(script: &str) -> Argv {
         Argv::new("sh", vec!["-c".into(), script.into()])
     }
 
+    /// Run `work` on its own thread and fail the test when it does not finish within [`WATCHDOG`].
+    #[cfg(unix)]
+    fn within<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, result) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        result
+            .recv_timeout(WATCHDOG)
+            .expect("the stream did not finish: a deadlock or a child that was not stopped")
+    }
+
+    /// A writer whose every write fails with `kind`.
+    struct Failing(io::ErrorKind);
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn capture_collects_output_and_the_exit_code() {
         let out = OsExec
@@ -169,6 +247,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_null_stdin_is_closed_at_once() {
         let out = OsExec.capture(&sh("cat; echo done"), Stdin::Null).unwrap();
@@ -183,6 +262,7 @@ mod tests {
         assert_ne!(OsExec.stream(&killed).unwrap(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn stream_returns_the_exit_code_and_a_missing_program_is_an_error() {
         assert_eq!(OsExec.stream(&sh("exit 7")).unwrap(), 7);
@@ -192,13 +272,18 @@ mod tests {
     }
 
     /// What the user's terminal would have received from `script`, and the child's exit code.
+    #[cfg(unix)]
     fn filtered(script: &str) -> (i32, String, String) {
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = stream_filtered_to(&sh(script), &mut out, &mut err).unwrap();
-        let text = |bytes| String::from_utf8(bytes).unwrap();
-        (code, text(out), text(err))
+        let script = script.to_owned();
+        within(move || {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = stream_filtered_to(&sh(&script), &mut out, &mut err).unwrap();
+            let text = |bytes| String::from_utf8(bytes).unwrap();
+            (code, text(out), text(err))
+        })
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_child_cannot_put_control_sequences_on_the_terminal_through_either_stream() {
         let (code, out, err) = filtered(
@@ -209,14 +294,16 @@ mod tests {
         assert_eq!(err, "x?y?[2J\n");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn bad_utf8_and_terminal_newlines_are_cleaned_and_a_huge_line_does_not_stall() {
+    fn bad_utf8_is_cleaned_a_terminal_newline_is_kept_and_a_huge_line_does_not_stall() {
         let (_, out, _) = filtered(r"printf 'caf\351\r\n'");
-        assert_eq!(out, "caf\u{FFFD}\n");
+        assert_eq!(out, "caf\u{FFFD}\r\n");
         let (code, out, _) = filtered("head -c 300000 /dev/zero | tr '\\000' a");
         assert_eq!((code, out.len()), (0, 300_000));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_lot_of_output_on_both_streams_at_once_does_not_deadlock() {
         let (code, out, err) = filtered(
@@ -224,6 +311,14 @@ mod tests {
         );
         assert_eq!(code, 0);
         assert_eq!((out.lines().count(), err.lines().count()), (4000, 4000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_fills_stderr_while_stdout_is_idle_does_not_deadlock() {
+        // far more than a 64 KiB pipe holds: stderr must be drained while stdout is still open
+        let (code, out, err) = filtered("head -c 300000 /dev/zero | tr '\\000' e >&2; echo done");
+        assert_eq!((code, out.as_str(), err.len()), (0, "done\n", 300_000));
     }
 
     #[cfg(unix)]
@@ -236,19 +331,64 @@ mod tests {
         assert_eq!(err.to_string(), "could not start rr-no-such-program");
     }
 
+    /// Run `script` filtered into `out` and `err` under the watchdog, with the time it took.
+    #[cfg(unix)]
+    fn filtered_into(
+        script: &'static str,
+        out: impl Write + Send + 'static,
+        err: impl Write + Send + 'static,
+    ) -> (Result<i32>, Duration) {
+        within(move || {
+            let started = WallClock::now();
+            let result = stream_filtered_to(&sh(script), out, err);
+            (result, started.elapsed())
+        })
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn a_failing_output_stops_the_child_and_is_reported() {
-        struct Closed;
-        impl Write for Closed {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                Err(io::ErrorKind::BrokenPipe.into())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let forever = sh("while :; do echo line; done");
-        assert!(stream_filtered_to(&forever, Closed, io::sink()).is_err());
+    fn a_closed_stdout_ends_quietly_and_stops_a_child_that_never_writes_again() {
+        // `head -1` closes the pipe after the first line; this child then just sits there
+        let sits_idle = "echo first; exec sleep 25";
+        let (result, took) =
+            filtered_into(sits_idle, Failing(io::ErrorKind::BrokenPipe), io::sink());
+        assert_ne!(result.unwrap(), 0, "a cut-short run is not a success");
+        assert!(
+            took < Duration::from_secs(20),
+            "the child was waited for, not stopped"
+        );
+        let chatty = "while :; do echo line; done";
+        let (result, _) = filtered_into(chatty, Failing(io::ErrorKind::BrokenPipe), io::sink());
+        assert_ne!(result.unwrap(), 0);
+        // a child that had already succeeded still reports the cut-short output as a failure
+        let (result, _) = filtered_into("echo hi", Failing(io::ErrorKind::BrokenPipe), io::sink());
+        assert_ne!(result.unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn any_other_stdout_error_stops_the_child_and_is_reported() {
+        let chatty = "while :; do echo line; done";
+        let (result, _) = filtered_into(chatty, Failing(io::ErrorKind::Other), io::sink());
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "could not write the output");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_stderr_stops_the_child_and_is_reported() {
+        let noisy = "while :; do echo line >&2; done";
+        let (result, _) = filtered_into(noisy, io::sink(), Failing(io::ErrorKind::BrokenPipe));
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "could not write the error output");
+        // stdout is idle and open: only killing the child lets the stdout reader finish
+        let idle = "echo err >&2; exec sleep 25";
+        let (result, took) = filtered_into(idle, io::sink(), Failing(io::ErrorKind::Other));
+        assert!(result.is_err());
+        assert!(
+            took < Duration::from_secs(20),
+            "the child was waited for, not stopped"
+        );
     }
 
     #[test]
