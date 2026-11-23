@@ -1,4 +1,27 @@
+# build output
 /target
+**/*.rs.bk
+*.pdb
+
+# a binary crate commits Cargo.lock, so it is not listed here
+
+# coverage, profiling and mutation testing
+*.profraw
+*.profdata
+lcov.info
+cobertura.xml
+tarpaulin-report.html
+mutants.out*/
+flamegraph.svg
+perf.data*
+
+# editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# local settings and secrets
 .rr.toml
 .env
 .env.*
