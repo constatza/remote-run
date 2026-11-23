@@ -55,6 +55,7 @@ pub fn tee_lines(
 ) -> io::Result<Vec<String>> {
     let mut reader = io::BufReader::new(reader);
     let (mut line, mut matched) = (Vec::new(), Vec::new());
+    let mut at_line_start = true;
     loop {
         line.clear();
         if (&mut reader)
@@ -66,10 +67,11 @@ pub fn tee_lines(
         }
         writer.write_all(&line)?;
         writer.flush()?;
-        if line.starts_with(prefix.as_bytes()) {
+        if at_line_start && line.starts_with(prefix.as_bytes()) {
             let text = String::from_utf8_lossy(&line);
             matched.push(text.trim_end_matches(['\r', '\n']).to_string());
         }
+        at_line_start = line.ends_with(b"\n");
     }
 }
 
@@ -635,6 +637,21 @@ pub mod fake {
             "the line must start with the prefix"
         );
         assert!(tee_lines(&b""[..], &mut shown, "x").unwrap().is_empty());
+    }
+
+    /// The cap cuts a long line into pieces; only the first piece starts a line, so text that
+    /// merely follows the cut must not read as a submit line.
+    #[test]
+    fn text_after_a_cut_in_a_long_line_is_not_a_line_start() {
+        let prefix = "Submitted batch job ";
+        let mut raw = vec![b'a'; MAX_LINE_BYTES as usize];
+        raw.extend_from_slice(b"Submitted batch job 99\nSubmitted batch job 7\n");
+        let matched = tee_lines(raw.as_slice(), &mut Vec::new(), prefix).unwrap();
+        assert_eq!(
+            matched,
+            ["Submitted batch job 7"],
+            "only after a real newline"
+        );
     }
 
     #[test]
