@@ -59,7 +59,7 @@ pub struct WaitFlags {
     #[arg(long, default_value_t = DEFAULT_TIMEOUT.as_secs())]
     pub timeout: u64,
     /// seconds between asking Slurm, at least 5
-    #[arg(long, default_value = "30", value_parser = parse_poll)]
+    #[arg(long, default_value_t = PollInterval::default(), value_parser = parse_poll)]
     pub poll: PollInterval,
 }
 
@@ -72,21 +72,30 @@ impl WaitFlags {
     }
 }
 
-/// What `rr run` does once its command has ended, and the limits that apply if it waits.
+/// What `rr run` does once its command has ended, and the limits that apply if it waits. The limits
+/// are options here, not defaulted, so that giving one without `--wait` is refused instead of being
+/// ignored; the defaults of `rr wait` fill in the ones not given.
 #[derive(Args, Clone, Copy)]
 pub struct RunWait {
     /// after the command, wait for the jobs it submitted (it must print `Submitted batch job N`)
     #[arg(long = "wait", num_args = 0, default_value = "return", default_missing_value = "wait", value_parser = parse_completion)]
     completion: Completion,
-    #[command(flatten)]
-    limits: WaitFlags,
+    /// with --wait: give up after this many seconds (exit 4); default as for `rr wait`
+    #[arg(long, requires = "completion")]
+    timeout: Option<u64>,
+    /// with --wait: seconds between asking Slurm, at least 5; default as for `rr wait`
+    #[arg(long, requires = "completion", value_parser = parse_poll)]
+    poll: Option<PollInterval>,
 }
 
 impl RunWait {
     pub fn after(self) -> After {
         match self.completion {
             Completion::Return => After::Return,
-            Completion::Wait => After::Wait(self.limits.limits()),
+            Completion::Wait => After::Wait(Limits {
+                timeout: self.timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs),
+                poll: self.poll.unwrap_or_default(),
+            }),
         }
     }
 }
@@ -502,6 +511,15 @@ mod tests {
         assert!(matches!(custom, After::Wait(l) if l.timeout == Duration::from_secs(9)));
         // after the command a flag belongs to the command
         assert!(matches!(after(&["run", "ls", "--wait"]), After::Return));
+        let both = after(&["run", "--wait", "--poll", "5", "--timeout", "9", "ls"]);
+        assert!(matches!(both, After::Wait(l) if l.poll.duration() == Duration::from_secs(5)));
+        let plain = after(&["run", "--wait", "ls"]);
+        assert!(matches!(plain, After::Wait(l)
+            if l.timeout == DEFAULT_TIMEOUT && l.poll == PollInterval::default()));
+        // the limits mean nothing without --wait, so they are not accepted silently
+        assert!(refused(&["run", "--timeout", "9", "--", "ls"]));
+        assert!(refused(&["run", "--poll", "9", "--", "ls"]));
+        assert!(refused(&["run", "--wait", "--poll", "4", "--", "ls"]));
         assert!(!refused(&["status", "12", "-n", "3"]));
         assert!(refused(&["status", "1", "2"]));
     }

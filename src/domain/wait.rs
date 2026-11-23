@@ -45,6 +45,13 @@ impl PollInterval {
     }
 }
 
+impl core::fmt::Display for PollInterval {
+    /// In seconds, the unit of `--poll`; clap prints the default with it.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0.as_secs())
+    }
+}
+
 impl Default for PollInterval {
     fn default() -> Self {
         Self(DEFAULT_POLL)
