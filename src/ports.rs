@@ -53,6 +53,26 @@ pub enum Echo {
     Stderr,
 }
 
+/// A tee that stopped on an I/O error, with the lines that matched before it: they may be job ids
+/// the user needs to find out about.
+#[derive(Debug)]
+pub struct TeeError {
+    pub matched: Vec<String>,
+    pub source: io::Error,
+}
+
+impl std::fmt::Display for TeeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for TeeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Copy `reader` to `writer` unchanged, a line at a time (flushed, like [`write_sanitized`]), and
 /// return the lines that start with `prefix`. A line longer than [`MAX_LINE_BYTES`] is read in
 /// pieces, so its later pieces are not seen as line starts.
@@ -60,9 +80,22 @@ pub fn tee_lines(
     reader: impl Read,
     writer: &mut impl Write,
     prefix: &str,
-) -> io::Result<Vec<String>> {
+) -> Result<Vec<String>, TeeError> {
+    let mut matched = Vec::new();
+    match tee_into(reader, writer, prefix, &mut matched) {
+        Ok(()) => Ok(matched),
+        Err(source) => Err(TeeError { matched, source }),
+    }
+}
+
+fn tee_into(
+    reader: impl Read,
+    writer: &mut impl Write,
+    prefix: &str,
+    matched: &mut Vec<String>,
+) -> io::Result<()> {
     let mut reader = io::BufReader::new(reader);
-    let (mut line, mut matched) = (Vec::new(), Vec::new());
+    let mut line = Vec::new();
     let mut at_line_start = true;
     loop {
         line.clear();
@@ -71,7 +104,7 @@ pub fn tee_lines(
             .read_until(b'\n', &mut line)?
             == 0
         {
-            return Ok(matched);
+            return Ok(());
         }
         writer.write_all(&line)?;
         writer.flush()?;
@@ -757,6 +790,29 @@ pub mod fake {
             }
         }
         assert!(tee_lines(Broken, &mut Vec::new(), "x").is_err());
+    }
+
+    /// A write that fails after a matching line was shown still returns that line.
+    #[test]
+    fn a_write_error_while_teeing_returns_the_lines_matched_so_far() {
+        struct FailsOnSecondWrite(u32);
+        impl Write for FailsOnSecondWrite {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0 += 1;
+                if self.0 > 1 {
+                    return Err(io::Error::other("closed"));
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let raw = b"Submitted batch job 9\nnoise\n";
+        let err =
+            tee_lines(&raw[..], &mut FailsOnSecondWrite(0), "Submitted batch job ").unwrap_err();
+        assert_eq!(err.matched, ["Submitted batch job 9"]);
+        assert_eq!(err.to_string(), "closed");
     }
 
     #[test]
