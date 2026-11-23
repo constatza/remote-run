@@ -90,8 +90,9 @@ impl Exec for OsExec {
 
 /// [`Exec::stream_tee`] with the echo writer given. When the copy fails the child is stopped like
 /// any other (SIGTERM, then SIGKILL after [`STOP_GRACE`]), so an `ssh -t` leaves the local terminal
-/// as it found it, and the lines that matched before the failure go into the error: they may be the
-/// job ids of work that is already running on the cluster.
+/// as it found it. A failing echo does not stop the reading (see [`tee_lines`]), so the child's
+/// output is read to its end first; the lines that matched go into the error: they may be the job
+/// ids of work that is already running on the cluster.
 fn stream_tee_to(argv: &Argv, prefix: &str, echo: &mut impl Write) -> Result<Teed> {
     let mut child = command(argv)
         .stdin(Stdio::inherit())
@@ -103,25 +104,21 @@ fn stream_tee_to(argv: &Argv, prefix: &str, echo: &mut impl Write) -> Result<Tee
         let _ = child.wait();
         return Err(anyhow!("{} has no output pipe", argv.program()));
     };
-    let copied = tee_lines(output, echo, prefix);
-    // a child that is still writing into a pipe nobody reads would never end
-    let stopped = match copied {
-        Ok(_) => Ok(()),
-        Err(_) => stop_child(&mut child),
-    };
-    let status = child.wait().context("could not wait for the child")?;
-    match copied {
+    match tee_lines(output, echo, prefix) {
         Ok(matched) => {
-            stopped?;
+            let status = child.wait().context("could not wait for the child")?;
             Ok(Teed {
                 code: exit_code(status),
                 matched,
             })
         }
         Err(failed) => {
+            // stopping reaps the child, so there is no wait here: one on a child that could not
+            // be stopped would block, and its error would hide the matched ids
+            let stopped = stop_child(&mut child);
             let seen = failed.matched.join("; ");
             let err = anyhow::Error::new(failed.source).context(format!(
-                "could not copy the output (lines matched before it: [{seen}])"
+                "could not copy the output (lines matched: [{seen}])"
             ));
             Err(match stopped {
                 Ok(()) => err,
@@ -1233,7 +1230,8 @@ mod tests {
                 Ok(())
             }
         }
-        let script = "echo 'Submitted batch job 9'; echo noise; exec sleep 30";
+        // stdout is closed before the sleep, so the reading ends while the child still runs
+        let script = "echo 'Submitted batch job 9'; echo noise; echo 'Submitted batch job 10'; exec sleep 30 >&-";
         let started = WallClock::now();
         let err = within(move || {
             stream_tee_to(
@@ -1245,6 +1243,10 @@ mod tests {
         });
         let shown = format!("{err:#}");
         assert!(shown.contains("Submitted batch job 9"), "{shown}");
+        assert!(
+            shown.contains("Submitted batch job 10"),
+            "an id after the failed echo is kept: {shown}"
+        );
         assert!(shown.contains("closed"), "{shown}");
         assert!(started.elapsed() < Duration::from_secs(20), "child stopped");
     }
@@ -1262,7 +1264,7 @@ mod tests {
                 Ok(())
             }
         }
-        let script = "echo 'Submitted batch job 9'; exec sleep 30";
+        let script = "echo 'Submitted batch job 9'; exec sleep 30 >&-";
         let err = within(move || {
             stream_tee_to(&sh(script), "Submitted batch job ", &mut AlwaysFails).unwrap_err()
         });

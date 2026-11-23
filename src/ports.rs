@@ -75,7 +75,9 @@ impl std::error::Error for TeeError {
 
 /// Copy `reader` to `writer` unchanged, a line at a time (flushed, like [`write_sanitized`]), and
 /// return the lines that start with `prefix`. A line longer than [`MAX_LINE_BYTES`] is read in
-/// pieces, so its later pieces are not seen as line starts.
+/// pieces, so its later pieces are not seen as line starts. When the writer fails the reader is
+/// still read to its end and matched, without echoing, so a job id printed after the failure is
+/// not lost; the first write error is returned then, with every matched line.
 pub fn tee_lines(
     reader: impl Read,
     writer: &mut impl Write,
@@ -95,6 +97,7 @@ fn tee_into(
     matched: &mut Vec<String>,
 ) -> io::Result<()> {
     let mut reader = io::BufReader::new(reader);
+    let mut write_failed: Option<io::Error> = None;
     let mut line = Vec::new();
     let mut at_line_start = true;
     loop {
@@ -104,7 +107,7 @@ fn tee_into(
             .read_until(b'\n', &mut line)?
             == 0
         {
-            return Ok(());
+            return write_failed.map_or(Ok(()), Err);
         }
         // recorded before the echo: a failing write on the matching line itself must still hand
         // back its job id
@@ -112,8 +115,11 @@ fn tee_into(
             let text = String::from_utf8_lossy(&line);
             matched.push(text.trim_end_matches(['\r', '\n']).to_string());
         }
-        writer.write_all(&line)?;
-        writer.flush()?;
+        if write_failed.is_none()
+            && let Err(source) = writer.write_all(&line).and_then(|()| writer.flush())
+        {
+            write_failed = Some(source);
+        }
         at_line_start = line.ends_with(b"\n");
     }
 }
@@ -850,10 +856,14 @@ pub mod fake {
                 Ok(())
             }
         }
-        let raw = b"Submitted batch job 9\nnoise\n";
+        let raw = b"Submitted batch job 9\nnoise\nSubmitted batch job 10\n";
         let err =
             tee_lines(&raw[..], &mut FailsOnSecondWrite(0), "Submitted batch job ").unwrap_err();
-        assert_eq!(err.matched, ["Submitted batch job 9"]);
+        assert_eq!(
+            err.matched,
+            ["Submitted batch job 9", "Submitted batch job 10"],
+            "a job id after the failed write is still recorded"
+        );
         assert_eq!(err.to_string(), "closed");
     }
 
