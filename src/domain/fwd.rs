@@ -251,7 +251,7 @@ impl ForwardTable {
 pub enum Transport {
     /// A TCP port on loopback: what a browser can use.
     Tcp,
-    /// A Unix socket only the user can open: for command-line clients.
+    /// A Unix socket in the private runtime directory: for command-line clients.
     Socket,
 }
 
@@ -311,7 +311,8 @@ impl fmt::Display for Ttl {
 pub struct SocketPath(String);
 
 impl SocketPath {
-    /// `rr-<name>.sock` in `dir`, which should be a private directory (the runtime directory).
+    /// `rr-<name>.sock` in `dir`. The socket is private only if `dir` is: `rr` relies on `dir` being
+    /// the runtime directory (`XDG_RUNTIME_DIR`, which the system makes private) and does not check.
     pub fn new(dir: &str, name: &ForwardName) -> Result<Self> {
         let path = format!("{}/rr-{}.sock", dir.trim_end_matches('/'), name.as_str());
         let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-');
@@ -336,7 +337,7 @@ impl SocketPath {
 pub enum Endpoint {
     /// `127.0.0.1:<port>`: what a browser can use.
     Tcp(LoopbackPort),
-    /// A Unix socket, readable only by its owner: for command-line clients.
+    /// A Unix socket, in the private runtime directory: for command-line clients.
     Unix(SocketPath),
 }
 
