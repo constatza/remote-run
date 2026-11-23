@@ -338,7 +338,10 @@ fn parse_completion(text: &str) -> Result<Completion, String> {
 
 /// Whether `--json` is among `args` before a `--`. Read from the raw arguments for the one case
 /// where clap has refused the line and so gave no [`Cli`]: the usage error is then written in the
-/// format the caller asked for.
+/// format the caller asked for. It cannot tell the words of a remote command (`rr run --poll 1
+/// echo --json`) from rr's own flags, because where the command starts depends on which options
+/// take a value; such a line, when it is refused, gets its usage error as JSON. That is a
+/// misformatted error, never a wrong result, and a `--` before the command avoids it.
 pub fn format_of_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Format {
     let mut words = args.into_iter().skip(1).take_while(|arg| arg != "--");
     if words.any(|arg| arg == "--json") {
