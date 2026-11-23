@@ -8,6 +8,9 @@ use std::num::NonZeroU8;
 /// The failures `rr` itself reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RrCode {
+    /// The command line was not understood. clap's own code, kept so a usage error reads the same
+    /// with and without `--json`.
+    Usage,
     /// `rr` could not do what was asked (an error, not a guard).
     Failure,
     /// A guard said no (or the remote environment is stale): nothing was done.
@@ -27,6 +30,7 @@ pub enum RrCode {
 impl RrCode {
     pub const fn code(self) -> u8 {
         match self {
+            RrCode::Usage => 2,
             RrCode::Failure => 1,
             RrCode::Refused => 3,
             RrCode::Timeout => 4,
@@ -105,7 +109,7 @@ mod tests {
         assert_eq!((RrCode::Failure.code(), RrCode::Refused.code()), (1, 3));
     }
 
-    /// 2 is clap's usage error; 126, 127, 128+n and 255 belong to shells and ssh.
+    /// 2 is clap's usage error (`RrCode::Usage`); 126, 127, 128+n and 255 belong to shells and ssh.
     #[test]
     fn the_wait_codes_avoid_every_other_meaning() {
         let codes = [RrCode::Timeout, RrCode::JobFailed, RrCode::Unknown].map(RrCode::code);

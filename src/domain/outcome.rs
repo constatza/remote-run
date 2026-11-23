@@ -204,7 +204,13 @@ fn render_trust(report: &TrustReport) -> Rendered {
 /// text, so it passes through [`sanitize`] whole. In text, one line on stderr; in JSON, one error
 /// document on stdout (and nothing on stderr), so a script that reads stdout always gets a document.
 pub fn render_error(err: &anyhow::Error, format: Format) -> Rendered {
-    let exit = Exit::Rr(RrCode::Failure);
+    render_error_as(err, format, RrCode::Failure)
+}
+
+/// [`render_error`] with the code `rr` exits with given, for an error that is not a plain failure
+/// (a command line clap refused is [`RrCode::Usage`]).
+pub fn render_error_as(err: &anyhow::Error, format: Format, code: RrCode) -> Rendered {
+    let exit = Exit::Rr(code);
     match format {
         Format::Text => Rendered {
             exit,
@@ -420,6 +426,19 @@ mod tests {
                 "message": "sacct failed: remote said ?[2J",
             })
         );
+    }
+
+    #[test]
+    fn a_usage_error_keeps_clap_s_code_in_both_formats() {
+        let err = anyhow::anyhow!("unexpected argument '--bogus'");
+        let text = render_error_as(&err, Format::Text, RrCode::Usage);
+        assert_eq!(text.exit.code(), 2);
+        let json = render_error_as(&err, Format::Json, RrCode::Usage);
+        assert_eq!(json.exit.code(), 2);
+        let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+        assert_eq!(value["exit"], 2);
+        assert_eq!(value["kind"], "error");
+        assert_eq!(value["source"], "rr");
     }
 
     #[test]

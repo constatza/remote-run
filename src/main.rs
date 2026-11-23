@@ -9,26 +9,72 @@ mod cli;
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use cli::{Cli, Cmd, FwdArgs, JobCmd, RemoteCmd, StdoutUse};
+use cli::{Cli, Cmd, FwdArgs, JobCmd, RemoteCmd, StdoutUse, format_of_args};
 use remote_run::adapters::{OsExec, OsNet, Ssh, SystemClock};
 use remote_run::app::{self, Ports};
 use remote_run::config::{Environment, Session, Settings, load, resolve, utf8_var};
-use remote_run::domain::outcome::{Format, Outcome, render, render_error};
+use remote_run::domain::exit::{Exit, RrCode};
+use remote_run::domain::outcome::{
+    Format, Outcome, Rendered, render, render_error, render_error_as,
+};
 use remote_run::domain::slurm::JobSet;
 use remote_run::ports::{Echo, Notes};
 use remote_run::trust;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => return usage_error(err),
+    };
     let format = cli.format;
     let rendered = match environment().and_then(|env| run(cli, &env)) {
         Ok(outcome) => render(&outcome, format),
         Err(err) => render_error(&err, format),
     };
-    print!("{}", rendered.stdout);
-    eprint!("{}", rendered.stderr);
-    ExitCode::from(rendered.exit.code())
+    emit(
+        &rendered,
+        &mut io::stdout().lock(),
+        &mut io::stderr().lock(),
+    )
+}
+
+/// A command line clap refused. `--help` and `--version` are not errors and clap prints them as it
+/// always does; a real usage error is clap's text with exit 2, or, when `--json` was given, one
+/// error document on stdout (and the same exit 2), so a script that asked for JSON gets JSON.
+fn usage_error(err: clap::Error) -> ExitCode {
+    let format = format_of_args(std::env::args_os());
+    if !err.use_stderr() || format == Format::Text {
+        err.exit();
+    }
+    let message = anyhow::anyhow!(err.to_string());
+    let rendered = render_error_as(&message, format, RrCode::Usage);
+    emit(
+        &rendered,
+        &mut io::stdout().lock(),
+        &mut io::stderr().lock(),
+    )
+}
+
+/// Write the result and return the exit code. A closed pipe (`rr --json ... | head -1`) is how a
+/// reader says it has enough, not a failure to report, and `print!` would panic on it. Any other
+/// write error is told on stderr, and turns a success into a failure: the result was not delivered.
+fn emit(rendered: &Rendered, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let wrote = write_all(out, &rendered.stdout).and(write_all(err, &rendered.stderr));
+    match (wrote, rendered.exit) {
+        (Err(failure), Exit::Success) if failure.kind() != io::ErrorKind::BrokenPipe => {
+            // stderr may be what failed; there is nowhere left to say so then
+            let _ = writeln!(err, "rr: could not write the result: {failure}");
+            ExitCode::from(RrCode::Failure.code())
+        }
+        _ => ExitCode::from(rendered.exit.code()),
+    }
+}
+
+fn write_all(sink: &mut dyn Write, text: &str) -> io::Result<()> {
+    sink.write_all(text.as_bytes())?;
+    sink.flush()
 }
 
 /// Prints each note at once, so it precedes the output of a command that runs after it.
@@ -180,4 +226,64 @@ fn fwd(session: &Session, args: FwdArgs, ports: &Ports, env: &Environment) -> Re
         runtime_dir: env.xdg_runtime_dir.as_deref(),
     };
     app::fwd::run(session, args.into(), ports, &machine)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer whose every write fails with `kind`.
+    struct Failing(io::ErrorKind);
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn rendered(exit: Exit) -> Rendered {
+        Rendered {
+            exit,
+            stdout: "{}\n".into(),
+            stderr: "rr: note\n".into(),
+        }
+    }
+
+    #[test]
+    fn a_closed_stdout_keeps_the_computed_exit_code() {
+        let closed = || Failing(io::ErrorKind::BrokenPipe);
+        let mut err = Vec::new();
+        for exit in [Exit::Success, Exit::Rr(RrCode::Refused), Exit::remote(7)] {
+            let code = emit(&rendered(exit), &mut closed(), &mut err);
+            assert_eq!(code, ExitCode::from(exit.code()), "{exit:?}");
+        }
+        let shown = String::from_utf8(err).unwrap();
+        assert!(
+            !shown.contains("could not write"),
+            "a closed pipe is not reported"
+        );
+    }
+
+    #[test]
+    fn a_write_that_failed_for_another_reason_is_no_success() {
+        let mut err = Vec::new();
+        let full = Failing(io::ErrorKind::StorageFull);
+        let code = emit(&rendered(Exit::Success), &mut { full }, &mut err);
+        assert_eq!(code, ExitCode::from(RrCode::Failure.code()));
+        assert!(String::from_utf8(err).unwrap().contains("could not write"));
+        // a result that already says failure keeps its own code
+        let full = Failing(io::ErrorKind::StorageFull);
+        let code = emit(&rendered(Exit::remote(7)), &mut { full }, &mut Vec::new());
+        assert_eq!(code, ExitCode::from(7));
+    }
+
+    #[test]
+    fn what_is_rendered_is_written_in_order_to_its_streams() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = emit(&rendered(Exit::Success), &mut out, &mut err);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!((out, err), (b"{}\n".to_vec(), b"rr: note\n".to_vec()));
+    }
 }
