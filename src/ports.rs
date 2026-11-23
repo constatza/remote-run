@@ -6,6 +6,7 @@ pub use crate::domain::argv::{Argv, Captured, Payload, Stdin};
 use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath};
 use crate::domain::sanitize::sanitize_bytes;
 use crate::domain::shell::Script;
+use crate::domain::snapshot::IndexFile;
 pub use crate::domain::ssh::Terminal;
 use anyhow::Result;
 use std::io::{self, BufRead, Read, Write};
@@ -241,6 +242,33 @@ pub trait Remote {
         prefix: &str,
         echo: Echo,
     ) -> Result<Teed>;
+}
+
+/// A private temporary index file for git, and what removes it. Dropping the value removes the file,
+/// so the user's own index is never the one a snapshot is built in.
+pub struct ScratchIndex {
+    file: IndexFile,
+    // held for its `Drop`: the adapter's temporary directory
+    _removes_on_drop: Box<dyn std::any::Any>,
+}
+
+impl ScratchIndex {
+    pub fn new(file: IndexFile, removes_on_drop: Box<dyn std::any::Any>) -> Self {
+        Self {
+            file,
+            _removes_on_drop: removes_on_drop,
+        }
+    }
+
+    pub fn file(&self) -> &IndexFile {
+        &self.file
+    }
+}
+
+/// Where the temporary files `rr` needs locally come from (the only port that creates files).
+pub trait Scratch {
+    /// A path git may create an index file at, in a directory only the user can use.
+    fn index(&self) -> Result<ScratchIndex>;
 }
 
 /// A point on a monotonic clock: the time since that clock started. Only a [`Clock`] hands one out,
@@ -488,6 +516,35 @@ pub mod fake {
         fn sleep(&self, delay: Duration) {
             self.elapsed.set(self.elapsed.get() + delay);
             self.slept.borrow_mut().push(delay);
+        }
+    }
+
+    /// A [`Scratch`] that hands out the same path and counts how many were taken and dropped.
+    #[derive(Default)]
+    pub struct FakeScratch {
+        pub taken: Cell<u32>,
+        pub dropped: Rc<Cell<u32>>,
+    }
+
+    struct CountsDrop(Rc<Cell<u32>>);
+
+    impl Drop for CountsDrop {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    /// The index path every [`FakeScratch`] hands out.
+    pub const FAKE_INDEX: &str = "/scratch/index";
+
+    impl Scratch for FakeScratch {
+        fn index(&self) -> Result<ScratchIndex> {
+            self.taken.set(self.taken.get() + 1);
+            let file = IndexFile::parse(FAKE_INDEX)?;
+            Ok(ScratchIndex::new(
+                file,
+                Box::new(CountsDrop(Rc::clone(&self.dropped))),
+            ))
         }
     }
 

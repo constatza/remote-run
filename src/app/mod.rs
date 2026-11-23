@@ -7,7 +7,7 @@ use crate::domain::exit::RemoteExit;
 use crate::domain::outcome::Outcome;
 use crate::domain::place::{Place, script};
 use crate::domain::shell::Script;
-use crate::ports::{Clock, Exec, Notes, Remote, Terminal};
+use crate::ports::{Clock, Exec, Notes, Remote, Scratch, Terminal};
 use anyhow::Result;
 
 pub mod acct;
@@ -23,6 +23,7 @@ pub mod put;
 pub mod q;
 pub mod recipe;
 pub mod run;
+pub mod snapshot;
 pub mod status;
 pub mod trust;
 pub mod tunnel;
@@ -34,6 +35,7 @@ pub struct Ports<'a> {
     pub remote: &'a dyn Remote,
     pub notes: &'a dyn Notes,
     pub clock: &'a dyn Clock,
+    pub scratch: &'a dyn Scratch,
 }
 
 /// How a streamed command's output reaches the user.
@@ -70,13 +72,14 @@ mod testing {
     use crate::config::Session;
     use crate::domain::host::Host;
     use crate::domain::place::{EnvFile, RemoteDir};
-    use crate::ports::fake::{FakeClock, FakeExec, FakeRemote, RecordedNotes, Reply};
+    use crate::ports::fake::{FakeClock, FakeExec, FakeRemote, FakeScratch, RecordedNotes, Reply};
 
     pub struct Fakes {
         pub exec: FakeExec,
         pub remote: FakeRemote,
         pub notes: RecordedNotes,
         pub clock: FakeClock,
+        pub scratch: FakeScratch,
     }
 
     impl Fakes {
@@ -91,6 +94,7 @@ mod testing {
                 remote: FakeRemote::new(captures, streams),
                 notes: RecordedNotes::default(),
                 clock: FakeClock::default(),
+                scratch: FakeScratch::default(),
             }
         }
 
@@ -105,6 +109,7 @@ mod testing {
                 remote: &self.remote,
                 notes: &self.notes,
                 clock: &self.clock,
+                scratch: &self.scratch,
             }
         }
     }

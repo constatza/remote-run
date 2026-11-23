@@ -19,7 +19,10 @@ pub use guard::{
     Refusal, ShippedSnapshot, SubmodulePolicy, UnsafeLink,
 };
 pub use names::AllowedPath;
-pub use tree::{Entry, EntryKind, ObjectId, TreeId, parse_ls_tree, parse_names, parse_not_in_head};
+pub use tree::{
+    Entry, EntryKind, ObjectId, TreeId, lfs_pointer_paths, may_be_lfs_pointer, parse_ls_tree,
+    parse_names, parse_not_in_head,
+};
 
 /// Which way `rr run` gets code to the remote host.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -5,10 +5,11 @@ use crate::domain::argv::{Argv, Captured, Payload, Stdin};
 use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath, listener_held};
 use crate::domain::host::Host;
 use crate::domain::shell::Script;
+use crate::domain::snapshot::IndexFile;
 use crate::domain::ssh::{Liveness, Terminal, ssh_argv};
 use crate::ports::{
-    Child as PortChild, Clock, Echo, Ended, Exec, Instant, Net, Ownership, Remote, Teed, tee_lines,
-    write_sanitized,
+    Child as PortChild, Clock, Echo, Ended, Exec, Instant, Net, Ownership, Remote, Scratch,
+    ScratchIndex, Teed, tee_lines, write_sanitized,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::{self, Write};
@@ -25,6 +26,9 @@ pub struct OsExec;
 fn command(argv: &Argv) -> Command {
     let mut command = Command::new(argv.program());
     command.args(argv.args());
+    for var in argv.envs() {
+        command.env(var.name(), var.value());
+    }
     command
 }
 
@@ -588,6 +592,31 @@ fn stream_filtered_with(
     }
 }
 
+/// Temporary files in a fresh directory that only the user can enter, removed when dropped.
+pub struct OsScratch;
+
+impl Scratch for OsScratch {
+    fn index(&self) -> Result<ScratchIndex> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("rr-snapshot-");
+        // the directory holds only the user's index; no one else may enter it
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let dir = builder
+            .tempdir()
+            .context("could not create a temporary directory for the snapshot index")?;
+        let path = dir.path().join("index");
+        let path = path
+            .to_str()
+            .context("the temporary directory is not valid UTF-8")?;
+        let file = IndexFile::parse(path)?;
+        Ok(ScratchIndex::new(file, Box::new(dir)))
+    }
+}
+
 /// The real host, reached as `ssh <host>`, so `~/.ssh/config` and the agent apply.
 pub struct Ssh<'a> {
     host: &'a Host,
@@ -753,6 +782,33 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn the_environment_of_an_argv_reaches_the_child_and_nothing_else_is_added() {
+        use crate::domain::argv::EnvVar;
+        let var = EnvVar::parse("RR_TEST_VALUE", "a b").unwrap();
+        let argv = sh("printf %s \"$RR_TEST_VALUE\"").with_env(var);
+        assert_eq!(OsExec.capture(&argv, Stdin::Null).unwrap().stdout, "a b");
+        let plain = OsExec.capture(&sh("printf %s \"${RR_TEST_VALUE-unset}\""), Stdin::Null);
+        assert_eq!(plain.unwrap().stdout, "unset");
+    }
+
+    #[test]
+    fn the_scratch_index_is_a_fresh_path_in_a_private_directory_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let first = OsScratch.index().unwrap();
+        let second = OsScratch.index().unwrap();
+        let path = |index: &ScratchIndex| index.file().to_string();
+        assert_ne!(path(&first), path(&second));
+        let dir = std::path::Path::new(&path(&first))
+            .parent()
+            .unwrap()
+            .to_owned();
+        assert_eq!(dir.metadata().unwrap().permissions().mode() & 0o077, 0);
+        assert!(dir.is_dir());
+        drop(first);
+        assert!(!dir.exists(), "the directory goes with the value");
+    }
+
     #[test]
     fn a_null_stdin_is_closed_at_once() {
         let out = OsExec.capture(&sh("cat; echo done"), Stdin::Null).unwrap();

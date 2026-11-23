@@ -10,7 +10,7 @@ mod cli;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{Cli, Cmd, FwdArgs, JobCmd, RemoteCmd, StdoutUse, XProgram, format_of_args};
-use remote_run::adapters::{OsExec, OsNet, Ssh, SystemClock};
+use remote_run::adapters::{OsExec, OsNet, OsScratch, Ssh, SystemClock};
 use remote_run::app::{self, Ports};
 use remote_run::config::{Environment, Session, Settings, load, resolve, utf8_var};
 use remote_run::domain::exit::{Exit, RrCode};
@@ -190,6 +190,7 @@ fn run(cli: Cli, env: &Environment, notes: &dyn Notes) -> Result<Outcome> {
         remote: &ssh,
         notes,
         clock: &clock,
+        scratch: &OsScratch,
     };
     dispatch(command, &session, &ports, env, echo)
 }

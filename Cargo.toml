@@ -9,6 +9,7 @@ clap = { version = "4.6.9", features = ["derive", "env"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+tempfile = "3.27.0"
 toml = "1.2.2"
 
 # `rr fwd` must end its ssh when `rr` is killed: prctl(PR_SET_PDEATHSIG) is Linux only, and the
@@ -22,9 +23,6 @@ signal-hook = "0.4.6"
 [[bin]]
 name = "rr"
 path = "src/main.rs"
-
-[dev-dependencies]
-tempfile = "3.27.0"
 
 # The library is the functional core: it neither prints nor panics on a bad value. `main.rs` and
 # the adapters opt out where printing or process access is their job.

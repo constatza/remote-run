@@ -8,6 +8,7 @@ use super::tree::{ObjectId, TreeId};
 use crate::domain::argv::{Argv, EnvVar};
 use crate::domain::ids::Commit;
 use anyhow::{Result, bail};
+use std::fmt;
 
 /// Git's own text for a line that begins an lfs pointer file.
 const LFS_POINTER_FIRST_LINE: &str = r"^version https://git-lfs\.github\.com/spec/v1$";
@@ -15,6 +16,12 @@ const LFS_POINTER_FIRST_LINE: &str = r"^version https://git-lfs\.github\.com/spe
 /// The path of a temporary index file, absolute, as the `GIT_INDEX_FILE` variable that names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexFile(EnvVar);
+
+impl fmt::Display for IndexFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.value())
+    }
+}
 
 impl IndexFile {
     pub fn parse(path: &str) -> Result<Self> {

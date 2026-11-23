@@ -124,6 +124,41 @@ pub fn parse_names(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+/// The most bytes a git-lfs pointer file has (the lfs specification's own bound), so only files
+/// this small are searched for one.
+const LFS_POINTER_MAX_BYTES: u64 = 1024;
+
+/// Whether `entry` is small enough to be a git-lfs pointer: the only files worth a `git grep`.
+pub fn may_be_lfs_pointer(entry: &Entry) -> bool {
+    entry.is_archived_file()
+        && entry.kind != EntryKind::Symlink
+        && entry.size <= LFS_POINTER_MAX_BYTES
+}
+
+/// The git-lfs pointer files among `entries`, from `git grep -l -z` output over `tree` (each name
+/// is `<tree>:<path>`): the files that matched and are small enough to be a pointer. A name that
+/// is not of that form is an error, not a file left out.
+pub fn lfs_pointer_paths(
+    entries: &[Entry],
+    tree: &TreeId,
+    grep_stdout: &str,
+) -> Result<Vec<String>> {
+    let prefix = format!("{}:", tree.as_str());
+    let mut found = Vec::new();
+    for name in parse_names(grep_stdout) {
+        let Some(path) = name.strip_prefix(&prefix) else {
+            bail!("git grep named a file outside the tree: {name:?}");
+        };
+        if entries
+            .iter()
+            .any(|e| e.path == path && may_be_lfs_pointer(e))
+        {
+            found.push(path.to_string());
+        }
+    }
+    Ok(found)
+}
+
 /// The paths a working tree has that `HEAD` does not, from `git status --porcelain=v1 -z`: the
 /// untracked ones (`??`) and the new names of staged additions, renames and copies. `git add -u`
 /// leaves exactly these out of the snapshot.
@@ -206,6 +241,33 @@ mod tests {
     fn names_are_split_on_nul() {
         assert_eq!(parse_names("a\0b c\0"), ["a", "b c"]);
         assert!(parse_names("").is_empty());
+    }
+
+    #[test]
+    fn lfs_pointers_are_small_files_that_grep_matched() {
+        let tree = TreeId::parse(A).unwrap();
+        let entries = vec![
+            entry(EntryKind::Regular, 130, "model.bin"),
+            entry(EntryKind::Regular, 5000, "doc.md"),
+            entry(EntryKind::Symlink, 9, "link"),
+        ];
+        let grep = format!("{A}:model.bin\0{A}:doc.md\0{A}:link\0");
+        assert_eq!(
+            lfs_pointer_paths(&entries, &tree, &grep).unwrap(),
+            ["model.bin"]
+        );
+        assert!(lfs_pointer_paths(&entries, &tree, "").unwrap().is_empty());
+        assert!(lfs_pointer_paths(&entries, &tree, "model.bin\0").is_err());
+        assert!(entries.iter().filter(|e| may_be_lfs_pointer(e)).count() == 1);
+    }
+
+    fn entry(kind: EntryKind, size: u64, path: &str) -> Entry {
+        Entry {
+            kind,
+            oid: ObjectId::parse(A).unwrap(),
+            size,
+            path: path.into(),
+        }
     }
 
     #[test]
