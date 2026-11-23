@@ -60,12 +60,19 @@ fn head(id: &TreeId) -> Script {
     ])
 }
 
-/// Refuse a snapshot directory that exists and is not safe, else say it is present.
+/// Refuse a snapshot directory that exists and is not safe, else mark it used and say it is
+/// present. The mark is made here, not only in `run_prelude`, so `rr gc --older-than` cannot remove
+/// the snapshot between this answer and the run's `cd`. `.rr-used` exists from the upload, so
+/// `touch` needs no write access to the read-only directory; a failure (a snapshot without the
+/// file, a read-only filesystem) is an error, never a `present` the run could not rely on.
 fn present_lines() -> Script {
     Script::lines([
         lit("safe \"$snap\" ")
             .lit(SNAPSHOT_MODE)
             .lit(" || refuse \"$PWD/$snap\""),
+        lit(
+            "touch -- \"$snap/.rr-used\" || { echo \"rr: cannot mark $PWD/$snap as used\" >&2; exit 1; }",
+        ),
         lit("echo ").lit(PRESENT),
     ])
 }
@@ -671,20 +678,106 @@ mod tests {
         cleared().shipped()
     }
 
+    /// Set `.rr-used` back to a fixed old time (it is mode 400, so it is opened for writing only
+    /// while writable) and return that time.
+    fn age_used(used: &Path) -> std::time::SystemTime {
+        std::fs::set_permissions(used, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(used)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::set_permissions(used, std::fs::Permissions::from_mode(0o400)).unwrap();
+        old
+    }
+
+    fn used_at(used: &Path) -> std::time::SystemTime {
+        std::fs::metadata(used).unwrap().modified().unwrap()
+    }
+
+    /// `rr gc --older-than` must not be able to take a snapshot between the probe's answer and the
+    /// run, so both scripts that answer `present` mark it used.
+    #[test]
+    fn a_present_answer_marks_the_snapshot_used() {
+        let remote = Remote::new();
+        remote.upload(&archive());
+        let used = remote.snap().join(".rr-used");
+        for run in [
+            |remote: &Remote| remote.probe(),
+            |remote: &Remote| remote.upload(b"never read"),
+        ] {
+            let old = age_used(&used);
+            assert_eq!(said(&run(&remote)), "rr-snapshot present");
+            assert!(used_at(&used) > old, "the answer marked the snapshot");
+            assert_eq!(mode(&used), 0o400, "the mark keeps the file read-only");
+            assert_eq!(mode(&remote.snap()), 0o500);
+        }
+    }
+
+    #[test]
+    fn a_probe_of_an_absent_tree_creates_no_snapshot_and_no_mark() {
+        let remote = Remote::new();
+        assert_eq!(said(&remote.probe()), "rr-snapshot absent");
+        assert!(remote.left().is_empty(), "{:?}", remote.left());
+        assert!(!remote.snap().exists());
+    }
+
+    /// A snapshot without `.rr-used` cannot be marked (its directory is read-only): that is an
+    /// error, not a `present` that gc could still race.
+    #[test]
+    fn a_snapshot_that_cannot_be_marked_is_an_error_not_present() {
+        let remote = Remote::new();
+        remote.upload(&archive());
+        let used = remote.snap().join(".rr-used");
+        std::fs::set_permissions(remote.snap(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_file(&used).unwrap();
+        std::fs::set_permissions(remote.snap(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        for run in [remote.probe(), remote.upload(b"never read")] {
+            assert_eq!(run.code, 1, "{}", run.stderr);
+            assert!(run.stdout.is_empty(), "{}", run.stdout);
+            assert!(run.stderr.contains("cannot mark"), "{}", run.stderr);
+        }
+        assert!(!used.exists(), "nothing was created in the read-only tree");
+        std::fs::set_permissions(remote.snap(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Run the prelude and print `$PYTHONPATH`, with it unset or set beforehand.
+    fn prelude_pythonpath(remote: &Remote, before: Option<&str>) -> String {
+        let print = "\nprintf '%s\\n' \"$PYTHONPATH\"";
+        let body = match before {
+            Some(_) => run_prelude(&shipped()).lit(print),
+            None => Script::lines([lit("unset PYTHONPATH"), run_prelude(&shipped()).lit(print)]),
+        };
+        let mut argv = remote.argv(body, &std::env::var("PATH").unwrap());
+        if let Some(value) = before {
+            argv = argv.with_env(EnvVar::parse("PYTHONPATH", value).unwrap());
+        }
+        let run = OsExec
+            .capture(&argv, crate::domain::argv::Stdin::Null)
+            .unwrap();
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        run.stdout.trim_end().to_owned()
+    }
+
+    #[test]
+    fn the_snapshot_source_leads_pythonpath_with_no_trailing_colon_when_it_was_unset() {
+        let remote = Remote::new();
+        remote.upload(&archive());
+        let snap = std::fs::canonicalize(remote.snap()).unwrap();
+        let unset = prelude_pythonpath(&remote, None);
+        assert_eq!(unset, format!("{}/src", snap.display()));
+        let set = prelude_pythonpath(&remote, Some("/already"));
+        assert_eq!(set, format!("{}/src:/already", snap.display()));
+    }
+
     #[test]
     fn running_in_a_snapshot_sets_the_environment_and_marks_it_used() {
         let remote = Remote::new();
         remote.upload(&archive());
         let used = remote.snap().join(".rr-used");
-        std::fs::set_permissions(&used, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
-        std::fs::File::options()
-            .write(true)
-            .open(&used)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-        std::fs::set_permissions(&used, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let old = age_used(&used);
         let body = run_prelude(&shipped())
             .lit("\nprintf '%s\\n' \"$PWD\" \"$PYTHONPATH\" \"$UV_PROJECT_ENVIRONMENT\" \"$RR_SNAPSHOT_ID\" \"$RR_BASE_COMMIT\" \"$RR_DIRTY\"");
         let argv = remote.argv(body, &std::env::var("PATH").unwrap());
