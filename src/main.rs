@@ -218,7 +218,7 @@ fn dispatch(
     match command {
         RemoteCmd::Job(command) => dispatch_job(command, session, ports),
         RemoteCmd::Q => app::q::run(session, ports),
-        RemoteCmd::Acct { since } => app::acct::run(session, app::acct::Args { since }, ports),
+        RemoteCmd::Acct(args) => app::acct::run(session, args.into(), ports),
         RemoteCmd::Log { job, follow, lines } => {
             app::log::run(session, app::log::Args { job, follow, lines }, ports)
         }

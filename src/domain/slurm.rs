@@ -12,6 +12,10 @@ pub const QUEUE_FORMAT: &str = "%.12i %.40j %.9T %.10M %.6D %R";
 /// The `sacct` columns `rr acct` shows.
 pub const ACCT_FIELDS: &str = "JobID,JobName%40,State,Elapsed,ExitCode";
 
+/// The `sacct` columns of `rr acct --format full`.
+pub const ACCT_FULL_FIELDS: &str =
+    "JobID,JobName%40,Partition,State,Elapsed,ExitCode,Start,End,NodeList,AllocCPUS,ReqMem";
+
 /// The `sacct -P` fields [`crate::domain::logpath::parse_sacct`] reads, in this order.
 pub const SACCT_FIELDS: &str = "JobIDRaw,JobID,JobName,User,WorkDir,StdOut";
 
@@ -94,12 +98,57 @@ pub fn queue_script() -> Script {
     lit("squeue --me -o ").word(quote(QUEUE_FORMAT))
 }
 
-/// Your jobs since `since` (a `sacct -S` time, user input).
-pub fn acct_script(since: &str) -> Script {
-    lit("sacct -X -u \"$USER\" -S ")
-        .word(quote(since))
-        .lit(" -o ")
-        .lit(ACCT_FIELDS)
+/// Which jobs `rr acct` lists: your jobs since a time, or the jobs you named. The two never mix:
+/// `sacct -S` would hide an old job that was named on purpose.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcctSelection {
+    /// A `sacct -S` time, user input.
+    Since(String),
+    Jobs(JobSet),
+}
+
+/// Which fields `rr acct` prints: a closed set, so no free text reaches `sacct -o`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcctColumns {
+    Brief,
+    Full,
+}
+
+impl AcctColumns {
+    /// The spellings `--format` takes.
+    pub const BRIEF: &'static str = "brief";
+    pub const FULL: &'static str = "full";
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            Self::BRIEF => Ok(Self::Brief),
+            Self::FULL => Ok(Self::Full),
+            other => Err(format!(
+                "unknown format {other:?} (use {} or {})",
+                Self::BRIEF,
+                Self::FULL
+            )),
+        }
+    }
+
+    fn fields(self) -> &'static str {
+        match self {
+            Self::Brief => ACCT_FIELDS,
+            Self::Full => ACCT_FULL_FIELDS,
+        }
+    }
+}
+
+/// Your jobs, as chosen by `selection`, with the fields of `columns`.
+pub fn acct_script(selection: &AcctSelection, columns: AcctColumns) -> Script {
+    let chosen = match selection {
+        AcctSelection::Since(since) => lit("sacct -X -u \"$USER\" -S ").word(quote(since)),
+        AcctSelection::Jobs(jobs) => {
+            let ids: Vec<&str> = jobs.as_slice().iter().map(JobId::as_str).collect();
+            lit("sacct -X -j ").word(quote(&ids.join(",")))
+        }
+    };
+    chosen.lit(" -o ").lit(columns.fields())
 }
 
 /// One job's record, for [`crate::domain::logpath::parse_sacct`].
@@ -408,14 +457,34 @@ mod tests {
         );
     }
 
+    fn since(text: &str) -> AcctSelection {
+        AcctSelection::Since(text.into())
+    }
+
+    #[test]
+    fn named_jobs_replace_the_time_and_the_format_picks_the_fields() {
+        let jobs = JobSet::new(vec![id("7"), id("8_1")]).unwrap();
+        assert_eq!(
+            acct_script(&AcctSelection::Jobs(jobs), AcctColumns::Full).to_string(),
+            "sacct -X -j '7,8_1' -o JobID,JobName%40,Partition,State,Elapsed,ExitCode,Start,End,NodeList,AllocCPUS,ReqMem"
+        );
+    }
+
+    #[test]
+    fn the_format_is_a_closed_set() {
+        assert_eq!(AcctColumns::parse("brief"), Ok(AcctColumns::Brief));
+        assert_eq!(AcctColumns::parse("full"), Ok(AcctColumns::Full));
+        assert!(AcctColumns::parse("JobID,User").is_err());
+    }
+
     #[test]
     fn the_acct_script_quotes_since() {
         assert_eq!(
-            acct_script("now-1days").to_string(),
+            acct_script(&since("now-1days"), AcctColumns::Brief).to_string(),
             r#"sacct -X -u "$USER" -S 'now-1days' -o JobID,JobName%40,State,Elapsed,ExitCode"#
         );
         assert_eq!(
-            acct_script("x'; touch /tmp/p; '").to_string(),
+            acct_script(&since("x'; touch /tmp/p; '"), AcctColumns::Brief).to_string(),
             r#"sacct -X -u "$USER" -S 'x'\''; touch /tmp/p; '\''' -o JobID,JobName%40,State,Elapsed,ExitCode"#
         );
     }
@@ -654,7 +723,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("pwned");
         let hostile = format!("x'; touch {0}; echo '$(touch {0})", marker.display());
-        let seen = arguments_seen_by("sacct", &acct_script(&hostile).to_string(), dir.path());
+        let seen = arguments_seen_by(
+            "sacct",
+            &acct_script(&since(&hostile), AcctColumns::Brief).to_string(),
+            dir.path(),
+        );
         assert_eq!(seen[..4], ["-X", "-u", "tester", "-S"]);
         assert_eq!(seen[4], hostile);
         let seen = arguments_seen_by("sacct", &record_script(&id("7_1")).to_string(), dir.path());

@@ -8,7 +8,7 @@ use remote_run::app::wait::Limits;
 use remote_run::domain::fwd::{Browser, LoopbackPort, Transport, Ttl, Wanted};
 use remote_run::domain::outcome::Format;
 use remote_run::domain::pull::JobPolicy;
-use remote_run::domain::slurm::{Follow, JobId};
+use remote_run::domain::slurm::{AcctColumns, AcctSelection, Follow, JobId, JobSet};
 use remote_run::domain::transfer::parse_size;
 use remote_run::domain::wait::{DEFAULT_TIMEOUT, PollInterval};
 use remote_run::ports::{Echo, Terminal};
@@ -132,7 +132,7 @@ impl RemoteCmd {
             | RemoteCmd::Get { .. }
             | RemoteCmd::Put { .. }
             | RemoteCmd::Q
-            | RemoteCmd::Acct { .. }
+            | RemoteCmd::Acct(_)
             | RemoteCmd::Log { .. }
             | RemoteCmd::X { .. } => StdoutUse::ProgramOutput,
         }
@@ -186,11 +186,7 @@ pub enum RemoteCmd {
     /// Your queued and running jobs (squeue --me)
     Q,
     /// Your recent jobs (sacct)
-    Acct {
-        /// sacct start time, e.g. now-3days or 2026-11-20
-        #[arg(long, default_value = "now-1days")]
-        since: String,
-    },
+    Acct(AcctArgs),
     /// Show a job's log
     Log {
         #[arg(value_parser = JobId::parse)]
@@ -252,6 +248,32 @@ pub enum RemoteCmd {
         #[arg(long, default_value = "1G", value_parser = parse_size)]
         limit: u64,
     },
+}
+
+/// `rr acct`'s arguments.
+#[derive(clap::Args)]
+pub struct AcctArgs {
+    /// sacct start time, e.g. now-3days or 2026-11-20
+    #[arg(long, default_value = "now-1days", conflicts_with = "jobs")]
+    since: String,
+    /// list these jobs (comma separated) instead of the recent ones
+    #[arg(short = 'j', long = "jobs", value_delimiter = ',', value_parser = JobId::parse)]
+    jobs: Vec<JobId>,
+    /// the fields to print: brief or full
+    #[arg(long = "format", default_value = AcctColumns::BRIEF, value_parser = AcctColumns::parse)]
+    columns: AcctColumns,
+}
+
+impl From<AcctArgs> for app::acct::Args {
+    /// clap refuses `--since` together with `--jobs`, so a non-empty list is the only choice then.
+    fn from(args: AcctArgs) -> Self {
+        let selection =
+            JobSet::new(args.jobs).map_or(AcctSelection::Since(args.since), AcctSelection::Jobs);
+        Self {
+            selection,
+            columns: args.columns,
+        }
+    }
 }
 
 /// `rr fwd`'s arguments.
@@ -497,6 +519,31 @@ mod tests {
             refused(&["x", "--tty=attached", "ls"]),
             "a flag takes no value"
         );
+    }
+
+    fn acct_of(args: &[&str]) -> app::acct::Args {
+        let argv: Vec<&str> = ["acct"].into_iter().chain(args.iter().copied()).collect();
+        match command_of(&argv) {
+            Cmd::Remote(RemoteCmd::Acct(args)) => args.into(),
+            _ => panic!("not an acct"),
+        }
+    }
+
+    #[test]
+    fn acct_lists_recent_jobs_or_the_named_ones_and_the_format_is_a_closed_set() {
+        let recent = acct_of(&[]);
+        assert_eq!(recent.selection, AcctSelection::Since("now-1days".into()));
+        assert_eq!(recent.columns, AcctColumns::Brief);
+        let named = acct_of(&["-j", "7,8_1", "--format", "full"]);
+        let jobs = JobSet::new(vec![
+            JobId::parse("7").unwrap(),
+            JobId::parse("8_1").unwrap(),
+        ]);
+        assert_eq!(named.selection, AcctSelection::Jobs(jobs.unwrap()));
+        assert_eq!(named.columns, AcctColumns::Full);
+        assert!(refused(&["acct", "-j", "7", "--since", "now-2days"]));
+        assert!(refused(&["acct", "-j", "7;id"]));
+        assert!(refused(&["acct", "--format", "JobID,User"]));
     }
 
     fn fwd_of(args: &[&str]) -> FwdArgs {

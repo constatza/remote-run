@@ -3,17 +3,17 @@
 use super::{Output, Ports, stream};
 use crate::config::Session;
 use crate::domain::outcome::Outcome;
-use crate::domain::slurm::acct_script;
+use crate::domain::slurm::{AcctColumns, AcctSelection, acct_script};
 use crate::ports::Terminal;
 use anyhow::Result;
 
 pub struct Args {
-    /// A `sacct -S` time, as typed.
-    pub since: String,
+    pub selection: AcctSelection,
+    pub columns: AcctColumns,
 }
 
 pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
-    let body = acct_script(&args.since);
+    let body = acct_script(&args.selection, args.columns);
     stream(
         ports,
         &session.place.at_home(),
@@ -33,12 +33,15 @@ mod tests {
     #[test]
     fn the_time_is_quoted_into_one_sacct_argument() {
         let fakes = Fakes::remote_streaming(vec![4]);
+        let selection = AcctSelection::Since("x'; id; '".into());
         let args = Args {
-            since: "x'; id; '".into(),
+            selection: selection.clone(),
+            columns: AcctColumns::Brief,
         };
         let outcome = run(&session(), args, &fakes.ports()).unwrap();
         let sent = fakes.remote.scripts();
-        assert_eq!(sent, [at_home(&acct_script("x'; id; '").to_string())]);
+        let expected = acct_script(&selection, AcctColumns::Brief).to_string();
+        assert_eq!(sent, [at_home(&expected)]);
         assert!(sent[0].contains(r"-S 'x'\''; id; '\'''"), "{}", sent[0]);
         assert!(matches!(outcome, Outcome::Remote(code) if code == RemoteExit::new(4)));
     }
@@ -48,7 +51,8 @@ mod tests {
         let fakes = Fakes::remote_streaming(vec![0]);
         fakes.remote.emit(HOSTILE);
         let args = Args {
-            since: "now-1day".into(),
+            selection: AcctSelection::Since("now-1day".into()),
+            columns: AcctColumns::Brief,
         };
         run(&session(), args, &fakes.ports()).unwrap();
         assert_eq!(*fakes.remote.shown.borrow(), HOSTILE_SHOWN.as_bytes());
