@@ -10,7 +10,8 @@ use anyhow::{Context, Result, anyhow};
 use std::io::{self, Write};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::mpsc::{self, Sender};
+use std::time::{Duration, Instant as WallClock};
 
 /// Runs programs with `std::process`.
 pub struct OsExec;
@@ -65,34 +66,99 @@ fn take_pipes(child: &mut Child) -> Option<(ChildStdout, ChildStderr)> {
     Some((child.stdout.take()?, child.stderr.take()?))
 }
 
-/// Kill `child`; an error means it had already ended, which is what is wanted.
-fn stop(child: &Mutex<Child>) {
-    if let Ok(mut child) = child.lock() {
-        let _ = child.kill();
+/// How long a child gets to leave after SIGTERM before it is killed. `ssh -t` puts the local tty
+/// in raw mode and restores it only when it ends on its own, so a kill is the last resort.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// How often a stopping child is checked for having ended.
+const STOP_POLL: Duration = Duration::from_millis(10);
+
+/// Whether `child` has ended (and is now reaped). A handle that cannot be asked counts as ended:
+/// there is nothing more that could be done to it.
+fn ended(child: &Mutex<Child>) -> bool {
+    child
+        .lock()
+        .map_or(true, |mut child| !matches!(child.try_wait(), Ok(None)))
+}
+
+/// Ask `child` to end with SIGTERM, and kill it when it is still there after `grace`. Std has no
+/// SIGTERM, so the `kill` program sends it; when that cannot run, the kill after `grace` still ends
+/// the child. Reaping here (through `try_wait`) leaves the final `wait` its cached status.
+fn terminate(child: &Mutex<Child>, grace: Duration) {
+    let Ok(pid) = child.lock().map(|child| child.id()) else {
+        return;
+    };
+    let _ = Command::new("kill")
+        .args(["-TERM", "--", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let deadline = WallClock::now() + grace;
+    while !ended(child) {
+        if WallClock::now() >= deadline {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+            }
+            return;
+        }
+        std::thread::sleep(STOP_POLL);
     }
 }
 
-/// `result`, after stopping `child` when it is an error: a child writing into a pipe nobody reads
-/// any more would otherwise run on, or sit idle, and the other pump would wait for it.
-fn stop_on_error(result: io::Result<()>, child: &Mutex<Child>) -> io::Result<()> {
+/// `result`, after asking the stopper thread to end the child when it is an error: a child writing
+/// into a pipe nobody reads any more would otherwise run on, or sit idle, and the other pump would
+/// wait for it. Only a message is sent, so the pump never waits for the child.
+fn stop_on_error(result: io::Result<()>, stop: &Sender<()>) -> io::Result<()> {
     if result.is_err() {
-        stop(child);
+        let _ = stop.send(());
     }
     result
+}
+
+/// Read both pipes of `child` into `out` and `err` at once. A failed write on either side has the
+/// child stopped by a third thread ([`terminate`]), which also lets the other pump finish.
+fn pump(
+    child: &Mutex<Child>,
+    (child_out, child_err): (ChildStdout, ChildStderr),
+    (mut out, mut err): (impl Write + Send, impl Write + Send),
+    grace: Duration,
+) -> (io::Result<()>, std::thread::Result<io::Result<()>>) {
+    std::thread::scope(|scope| {
+        let (stop, stopped) = mpsc::channel::<()>();
+        scope.spawn(move || {
+            // `recv` fails when both pumps ended without needing a stop
+            if stopped.recv().is_ok() {
+                terminate(child, grace);
+            }
+        });
+        let err_stop = stop.clone();
+        let err_pump =
+            scope.spawn(move || stop_on_error(write_sanitized(child_err, &mut err), &err_stop));
+        let out_result = stop_on_error(write_sanitized(child_out, &mut out), &stop);
+        drop(stop);
+        (out_result, err_pump.join())
+    })
 }
 
 /// Run `argv` with stdin inherited and its stdout and stderr read through [`write_sanitized`] into
 /// `out` and `err`. The two pipes are read at once, so a child that fills one while the other is
 /// idle cannot stall.
 ///
-/// A failed write to either side kills the child (closing the pipe alone would not stop one that
-/// never writes there again) and waits for it, so no zombie is left. A `BrokenPipe` on `out` or `err` is how
-/// `rr q | head -1` (or `2>&1 | head`) ends: it is not an error to report, and the result is the child's code, or
-/// [`OUTPUT_CLOSED_EXIT`] when that was success. Any other write error is returned.
-fn stream_filtered_to(
+/// A failed write to either side stops the child (closing the pipe alone would not stop one that
+/// never writes there again), first with SIGTERM and after [`STOP_GRACE`] with SIGKILL, and waits
+/// for it, so no zombie is left. A `BrokenPipe` on `out` or `err` is how `rr q | head -1` ends: it
+/// is not an error to report, and the result is the child's code, or [`OUTPUT_CLOSED_EXIT`] when
+/// that was success. Any other write error is returned.
+fn stream_filtered_to(argv: &Argv, out: impl Write + Send, err: impl Write + Send) -> Result<i32> {
+    stream_filtered_with(argv, out, err, STOP_GRACE)
+}
+
+/// [`stream_filtered_to`] with the grace period given, so a test need not wait the real one.
+fn stream_filtered_with(
     argv: &Argv,
-    mut out: impl Write + Send,
-    mut err: impl Write + Send,
+    out: impl Write + Send,
+    err: impl Write + Send,
+    grace: Duration,
 ) -> Result<i32> {
     let mut child = command(argv)
         .stdin(Stdio::inherit())
@@ -100,19 +166,13 @@ fn stream_filtered_to(
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("could not start {}", argv.program()))?;
-    let Some((child_out, child_err)) = take_pipes(&mut child) else {
+    let Some(pipes) = take_pipes(&mut child) else {
         let _ = child.kill();
         let _ = child.wait();
         return Err(anyhow!("{} has no output pipes", argv.program()));
     };
     let child = Mutex::new(child);
-    let (out_result, err_result) = std::thread::scope(|scope| {
-        let child = &child;
-        let err_pump =
-            scope.spawn(move || stop_on_error(write_sanitized(child_err, &mut err), child));
-        let out_result = stop_on_error(write_sanitized(child_out, &mut out), child);
-        (out_result, err_pump.join())
-    });
+    let (out_result, err_result) = pump(&child, pipes, (out, err), grace);
     let status = child
         .into_inner()
         .map_err(|_| anyhow!("the child handle was poisoned"))?
@@ -199,10 +259,6 @@ mod tests {
     }
 
     use crate::ports::fake::{FakeExec, How, output};
-    #[cfg(unix)]
-    use std::sync::mpsc;
-    #[cfg(unix)]
-    use std::time::Instant as WallClock;
 
     /// Longest a stream test may take; a regression that hangs fails instead of stalling the run.
     #[cfg(unix)]
@@ -373,6 +429,50 @@ mod tests {
         let (result, _) = filtered_into(chatty, Failing(io::ErrorKind::Other), io::sink());
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "could not write the output");
+    }
+
+    /// Run `script` (which gets `marker` as `$1`) with stdout already closed, under a grace period
+    /// of `grace`; the child's result and the time it took.
+    #[cfg(unix)]
+    fn stopped(
+        script: &'static str,
+        marker: &std::path::Path,
+        grace: Duration,
+    ) -> (Result<i32>, Duration) {
+        let args = ["-c", script, "sh", &marker.display().to_string()];
+        let argv = Argv::new("sh", args.map(String::from).to_vec());
+        within(move || {
+            let started = WallClock::now();
+            let broken = Failing(io::ErrorKind::BrokenPipe);
+            let result = stream_filtered_with(&argv, broken, io::sink(), grace);
+            (result, started.elapsed())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_child_gets_sigterm_first_so_it_can_clean_up() {
+        // like `ssh -t` restoring the tty: the trap runs only when TERM, not KILL, arrives
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cleaned-up");
+        let script =
+            r#"trap 'echo done > "$1"; exit 0' TERM; echo first; while :; do sleep 0.05; done"#;
+        let (result, took) = stopped(script, &marker, Duration::from_secs(20));
+        assert_ne!(result.unwrap(), 0, "a cut-short run is not a success");
+        assert!(marker.exists(), "the child never saw SIGTERM");
+        assert!(took < Duration::from_secs(10), "waited for the grace");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_ignores_sigterm_is_killed_after_the_grace_and_never_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r"trap '' TERM; echo first; while :; do sleep 0.05; done";
+        let grace = Duration::from_millis(300);
+        let (result, took) = stopped(script, &dir.path().join("unused"), grace);
+        assert_ne!(result.unwrap(), 0, "a signal-killed child is not a success");
+        assert!(took >= grace, "killed before the grace was over");
+        assert!(took < Duration::from_secs(10), "the child was not killed");
     }
 
     #[cfg(unix)]
