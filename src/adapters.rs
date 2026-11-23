@@ -86,8 +86,8 @@ fn stop_on_error(result: io::Result<()>, child: &Mutex<Child>) -> io::Result<()>
 /// idle cannot stall.
 ///
 /// A failed write to either side kills the child (closing the pipe alone would not stop one that
-/// never writes there again) and waits for it, so no zombie is left. A `BrokenPipe` on `out` is how
-/// `rr q | head -1` ends: it is not an error to report, and the result is the child's code, or
+/// never writes there again) and waits for it, so no zombie is left. A `BrokenPipe` on `out` or `err` is how
+/// `rr q | head -1` (or `2>&1 | head`) ends: it is not an error to report, and the result is the child's code, or
 /// [`OUTPUT_CLOSED_EXIT`] when that was success. Any other write error is returned.
 fn stream_filtered_to(
     argv: &Argv,
@@ -119,14 +119,15 @@ fn stream_filtered_to(
         .wait()
         .context("could not wait for the child")?;
     let code = exit_code(status);
+    let hard = |e: &io::Error| e.kind() != io::ErrorKind::BrokenPipe;
     match (out_result, err_result) {
-        (Err(e), _) if e.kind() != io::ErrorKind::BrokenPipe => {
-            Err(e).context("could not write the output")
-        }
+        (Err(e), _) if hard(&e) => Err(e).context("could not write the output"),
         (_, Err(_)) => Err(anyhow!("the stderr filter stopped")),
-        (_, Ok(Err(e))) => Err(e).context("could not write the error output"),
-        (Err(_), Ok(Ok(()))) if code == 0 => Ok(OUTPUT_CLOSED_EXIT),
-        (Ok(()) | Err(_), Ok(Ok(()))) => Ok(code),
+        (_, Ok(Err(e))) if hard(&e) => Err(e).context("could not write the error output"),
+        (Ok(()), Ok(Ok(()))) => Ok(code),
+        // a closed stdout or stderr cut the output short, so a clean exit is no success
+        (_, Ok(_)) if code == 0 => Ok(OUTPUT_CLOSED_EXIT),
+        (_, Ok(_)) => Ok(code),
     }
 }
 
@@ -376,9 +377,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_failing_stderr_stops_the_child_and_is_reported() {
+    fn a_closed_stderr_ends_quietly_like_a_closed_stdout() {
         let noisy = "while :; do echo line >&2; done";
         let (result, _) = filtered_into(noisy, io::sink(), Failing(io::ErrorKind::BrokenPipe));
+        assert_ne!(result.unwrap(), 0, "a cut-short run is not a success");
+        let (result, _) = filtered_into(
+            "echo hi >&2; exit 3",
+            io::sink(),
+            Failing(io::ErrorKind::BrokenPipe),
+        );
+        assert_eq!(result.unwrap(), 3, "the child's own failure code is kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_stderr_stops_the_child_and_is_reported() {
+        let noisy = "while :; do echo line >&2; done";
+        let (result, _) = filtered_into(noisy, io::sink(), Failing(io::ErrorKind::Other));
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "could not write the error output");
         // stdout is idle and open: only killing the child lets the stdout reader finish
