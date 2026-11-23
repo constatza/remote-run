@@ -95,7 +95,7 @@ run = ["python", "-m", "train", "--config={config}"]
 pull = "checkout"   # or "none"; the default is "checkout"
 ```
 
-`rr do train --set config=base -- --fast` runs `python -m train --config=base --fast`. With `pull = "checkout"` it is `rr run`: the guarded fast-forward first, and a refusal runs nothing; `"none"` is `rr x`. A slot without a value, a value for a slot the recipe does not have and a slot set twice are errors. Values are put in as given and are not expanded again.
+`rr do train --set config=base -- --fast` runs `python -m train --config=base --fast`. With `pull = "checkout"` it is `rr run`: the guarded fast-forward first, and a refusal runs nothing; `"none"` is `rr x`. A slot without a value, a value for a slot the recipe does not have and a slot set twice are errors. Values are put in as given and are not expanded again. A value is quoted but not guarded, so one that starts with `-` reaches the program as an option; a recipe that takes a path or a branch should put `"--"` before its slot.
 
 ### `rr wait`, `rr run --wait` and exit codes
 
@@ -175,7 +175,7 @@ alias rsub='rr run -- uv run --frozen --no-sync python -m mypackage.cluster subm
 
 - The remote login shell must quote like POSIX `sh` (bash, zsh and sh do; fish, csh and tcsh do not). Every command runs under `bash -c '<script>'`: ssh hands that line to the login shell, which must pass the quoted script to `bash` unchanged, and `bash` must be on the remote `PATH`. The script runs with `set -euo pipefail`.
 - `rr pull` needs `git` and GNU `realpath -m` on the remote. It reads the checkout in one ssh call and merges in a second; the second call checks again that `HEAD` and a clean tree are what the first call saw and, unless you passed `--force`, that no job was submitted from the checkout since (the same `squeue` and `realpath -m` test; a failing `squeue` or `realpath` refuses), and refuses (exit 3) if not. Only the moments between that check and `git merge`, inside one script, are left open.
-- `sacct` has no `--me`, so `rr acct` passes `-u "$USER"`. `sacct` reports the `--output` pattern unexpanded (`%x-%j.out`). `rr log` expands `%%`, `%A`, `%a`, `%J`, `%j`, `%u` and `%x`, and refuses any other placeholder.
+- `sacct` has no `--me`, so `rr acct` passes `-u "$USER"`. `rr acct -j` with an id `sacct` does not know prints only the header. `sacct` reports the `--output` pattern unexpanded (`%x-%j.out`). `rr log` expands `%%`, `%A`, `%a`, `%J`, `%j`, `%u` and `%x`, and refuses any other placeholder.
 - `rsync` must exist on both machines. Windows has no native `rsync`.
 
 ## Development
