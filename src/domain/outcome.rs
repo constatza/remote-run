@@ -179,6 +179,12 @@ fn render_gc(outcome: &GcOutcome) -> Rendered {
             stdout: String::new(),
             stderr: lines(&[format!("rr: refused: {why}")]),
         },
+        // a failure, not a refusal: an entry may be missing under its own name
+        GcOutcome::Stranded { why, report } => Rendered {
+            exit: Exit::Rr(RrCode::Failure),
+            stdout: lines(&gc_lines(report)),
+            stderr: lines(&[format!("rr: refused: {why}"), GC_NOT_SET_ASIDE.to_string()]),
+        },
     }
 }
 
@@ -373,6 +379,34 @@ mod tests {
             "{}",
             stuck.stderr
         );
+    }
+
+    #[test]
+    fn a_refusal_that_left_an_entry_unrestored_is_a_failure_naming_it() {
+        use crate::domain::snapshot::{GcRefusal, GcReport, Kept, RootEntry, Why};
+        let report = GcReport {
+            kept: vec![Kept {
+                entry: RootEntry::parse(A).unwrap(),
+                why: Why::Error,
+            }],
+            ..GcReport::default()
+        };
+        let shown = text(&Outcome::Gc(GcOutcome::Stranded {
+            why: GcRefusal::QueueUnreadable,
+            report,
+        }));
+        assert_eq!(shown.exit, Exit::Rr(RrCode::Failure));
+        assert!(
+            shown.stdout.contains(&format!("kept {A}")),
+            "{}",
+            shown.stdout
+        );
+        assert!(
+            shown.stderr.contains("refused: could not tell"),
+            "{}",
+            shown.stderr
+        );
+        assert!(shown.stderr.contains("put back"), "{}", shown.stderr);
     }
 
     #[test]

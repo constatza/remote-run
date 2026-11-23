@@ -212,10 +212,14 @@ pub struct Trashed(Script);
 
 impl Trashed {
     /// Read the queue again. A job found inside an entry puts it back and keeps it; a queue that
-    /// cannot be read puts everything back and refuses. What is left in `$clear` is set aside and
+    /// cannot be read puts everything back and refuses, naming each entry that could not be put
+    /// back (the refusal alone would say nothing was touched). What is left in `$clear` is set aside and
     /// unused.
     pub fn recheck(self) -> Rechecked {
-        let put_back = each_name(lit("  restore \"$name\" || :"), "$moved");
+        let put_back = each_name(
+            lit("  restore \"$name\" || say kept error \"$name\""),
+            "$moved",
+        );
         let decide = lit(
             "  if in_use \"$name\"; then\n    if restore \"$name\"; then say kept in-use \"$name\"; else say kept error \"$name\"; fi\n  else clear=\"$clear$name\n\"; fi",
         );
@@ -312,7 +316,7 @@ mod tests {
         let chosen = at("victims=\"$victims$name");
         let rename = at("mv -T -- \"$rootreal/$name\"");
         let second_check = at("if ! read_queue; then");
-        let put_back = at("restore \"$name\" || :");
+        let put_back = at("restore \"$name\" || say kept error");
         let rm = at("rm -rf --one-file-system");
         let chmod = at("chmod -R u+w");
         assert!(first_check < chosen && chosen < rename && rename < second_check);
@@ -566,6 +570,24 @@ mod shell {
         why
     }
 
+    /// What a refusal that left entries unrestored reported.
+    fn stranded(captured: &Captured) -> (GcRefusal, Vec<(String, Why)>) {
+        assert_eq!(
+            captured.code, GC_REFUSED_EXIT,
+            "{:?} {}",
+            captured.stdout, captured.stderr
+        );
+        let GcOutcome::Stranded { why, report } = parse_report(&captured.stdout).unwrap() else {
+            panic!("not a stranded refusal: {}", captured.stdout);
+        };
+        let kept = report
+            .kept
+            .iter()
+            .map(|k| (k.entry.name().to_string(), k.why))
+            .collect();
+        (why, kept)
+    }
+
     #[test]
     fn an_old_unused_snapshot_is_removed_read_only_files_and_all_and_a_young_one_is_not_touched() {
         let host = Host::new();
@@ -769,6 +791,31 @@ mod shell {
         two_answers(&host, "exit 0", "exit 1");
         assert_eq!(refused(&host.gc("2h", 0)), GcRefusal::QueueUnreadable);
         assert_eq!(host.left(), [A, B]);
+        assert!(host.snap(B).join("src/pkg/mod.py").is_file());
+    }
+
+    /// The second `squeue` fails and, meanwhile, something takes the snapshot's own name, so the
+    /// rename back cannot happen: the report must name the entry, not claim a clean refusal.
+    #[test]
+    fn a_queue_that_fails_the_second_time_names_an_entry_it_could_not_put_back() {
+        let host = Host::new();
+        host.snapshot(A, 3 * DAY);
+        host.snapshot(B, 3 * DAY);
+        let occupy = format!(
+            "mkdir -p '{0}/{A}' && touch '{0}/{A}/x'; exit 1",
+            host.root().display()
+        );
+        two_answers(&host, "exit 0", &occupy);
+        let out = host.gc("2h", 0);
+        let (why, kept) = stranded(&out);
+        assert_eq!(why, GcRefusal::QueueUnreadable);
+        assert_eq!(kept, [(A.to_string(), Why::Error)], "B was put back");
+        assert_eq!(
+            host.left(),
+            [format!(".trash-{A}"), A.to_string(), B.to_string()]
+        );
+        let trashed = host.snap(&format!(".trash-{A}"));
+        assert!(trashed.join("src/pkg/mod.py").is_file());
         assert!(host.snap(B).join("src/pkg/mod.py").is_file());
     }
 

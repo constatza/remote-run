@@ -163,7 +163,7 @@ impl fmt::Display for Why {
             Self::Young => "used or touched more recently than the age",
             Self::InUse => "an active job runs from it",
             Self::NotYours => "a symlink, not a directory, or not yours: not touched",
-            Self::Error => "could not be set aside, left as it was",
+            Self::Error => "could not be set aside or put back; it may be under .trash-*",
         })
     }
 }
@@ -236,6 +236,13 @@ impl fmt::Display for GcRefusal {
 pub enum GcOutcome {
     Cleaned(GcReport),
     Refused(GcRefusal),
+    /// Refused after entries were set aside, and some of them could not be put back: nothing was
+    /// deleted, but those entries (the `Why::Error` ones in the report) may now exist only as
+    /// `.trash-…`. A clean refusal would hide that.
+    Stranded {
+        why: GcRefusal,
+        report: GcReport,
+    },
 }
 
 /// Exit code of the clean-up script when it refuses; the report says why.
@@ -300,19 +307,28 @@ pub fn parse_report(stdout: &str) -> Result<GcOutcome> {
     };
     match ended {
         GcOutcome::Cleaned(report) => {
-            let names = report
-                .removed
-                .iter()
-                .chain(&report.failed)
-                .chain(report.kept.iter().map(|kept| &kept.entry))
-                .map(RootEntry::name);
-            let mut seen = std::collections::BTreeSet::new();
-            if let Some(twice) = names.into_iter().find(|name| !seen.insert(*name)) {
-                bail!("the clean-up named {twice} twice");
-            }
+            check_names_once(&report)?;
             Ok(GcOutcome::Cleaned(report))
         }
-        refused @ GcOutcome::Refused(_) => Ok(refused),
+        GcOutcome::Refused(why) if report.errored().next().is_some() => {
+            check_names_once(&report)?;
+            Ok(GcOutcome::Stranded { why, report })
+        }
+        other => Ok(other),
+    }
+}
+
+fn check_names_once(report: &GcReport) -> Result<()> {
+    let names = report
+        .removed
+        .iter()
+        .chain(&report.failed)
+        .chain(report.kept.iter().map(|kept| &kept.entry))
+        .map(RootEntry::name);
+    let mut seen = std::collections::BTreeSet::new();
+    match names.into_iter().find(|name| !seen.insert(*name)) {
+        Some(twice) => bail!("the clean-up named {twice} twice"),
+        None => Ok(()),
     }
 }
 
@@ -511,6 +527,36 @@ mod tests {
             parse_report(&report(&[&format!("kept\tyoung\t{A}"), "refused\tqueue"])).unwrap(),
             GcOutcome::Refused(GcRefusal::QueueUnreadable)
         );
+    }
+
+    /// A refusal that follows `kept error` lines is not a clean one: those entries could not be put
+    /// back, and the report keeps them (and what else was kept) for the user.
+    #[test]
+    fn a_refusal_after_an_error_is_stranded_and_keeps_the_report() {
+        let text = report(&[
+            &format!("kept\tyoung\t{B}"),
+            &format!("kept\terror\t{A}"),
+            "refused\tqueue",
+        ]);
+        let GcOutcome::Stranded {
+            why,
+            report: parsed,
+        } = parse_report(&text).unwrap()
+        else {
+            panic!("a stranded refusal");
+        };
+        assert_eq!(why, GcRefusal::QueueUnreadable);
+        assert_eq!(
+            parsed.errored().map(RootEntry::name).collect::<Vec<_>>(),
+            [A]
+        );
+        assert_eq!(parsed.kept.len(), 2);
+        let twice = report(&[
+            &format!("kept\terror\t{A}"),
+            &format!("kept\tyoung\t{A}"),
+            "refused\tqueue",
+        ]);
+        assert!(parse_report(&twice).is_err(), "an entry named twice");
     }
 
     /// A report that is cut short, contradicts itself or has a line it cannot read is never a

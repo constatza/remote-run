@@ -22,7 +22,9 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
         .capture(&script(&place, gc_script(args.age, args.keep)))?;
     match (captured.code, parse_report(&captured.stdout)) {
         (0, Ok(outcome @ GcOutcome::Cleaned(_)))
-        | (GC_REFUSED_EXIT, Ok(outcome @ GcOutcome::Refused(_))) => Ok(Outcome::Gc(outcome)),
+        | (GC_REFUSED_EXIT, Ok(outcome @ (GcOutcome::Refused(_) | GcOutcome::Stranded { .. }))) => {
+            Ok(Outcome::Gc(outcome))
+        }
         (0 | GC_REFUSED_EXIT, Ok(_)) => bail!("the clean-up's exit code and its report disagree"),
         (0 | GC_REFUSED_EXIT, Err(err)) => Err(err),
         (code, _) => bail!(
@@ -126,6 +128,20 @@ mod tests {
             );
             assert!(shown.stderr.contains("nothing was deleted"));
         }
+    }
+
+    #[test]
+    fn a_refusal_that_left_an_entry_unrestored_is_exit_1_and_names_it() {
+        let out = lines(&[format!("kept\terror\t{A}"), "refused\tqueue".into()]);
+        let fakes = remote(GC_REFUSED_EXIT, &out, "");
+        let outcome = run(&session(), args(), &fakes.ports()).unwrap();
+        let shown = render(&outcome, Format::Text);
+        assert_eq!(shown.exit, Exit::Rr(RrCode::Failure));
+        assert!(
+            shown.stdout.contains(&format!("kept {A}")),
+            "{}",
+            shown.stdout
+        );
     }
 
     #[test]

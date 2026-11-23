@@ -91,6 +91,12 @@ enum GcBody {
         reason: GcReason,
         detail: String,
     },
+    /// refused, but some entries could not be put back (see `kept`, why `error`)
+    Stranded {
+        reason: GcReason,
+        detail: String,
+        kept: Vec<KeptJson>,
+    },
 }
 
 #[derive(Serialize)]
@@ -269,13 +275,39 @@ fn gc(outcome: &GcOutcome) -> GcBody {
     match outcome {
         GcOutcome::Cleaned(report) => cleaned(report),
         GcOutcome::Refused(why) => GcBody::Refused {
-            reason: match why {
-                GcRefusal::RootNotSafe => GcReason::RootNotSafe,
-                GcRefusal::QueueUnreadable => GcReason::QueueUnreadable,
-            },
+            reason: reason(*why),
             detail: clean(&why.to_string()),
         },
+        GcOutcome::Stranded { why, report } => GcBody::Stranded {
+            reason: reason(*why),
+            detail: clean(&why.to_string()),
+            kept: kept_json(report),
+        },
     }
+}
+
+fn reason(why: GcRefusal) -> GcReason {
+    match why {
+        GcRefusal::RootNotSafe => GcReason::RootNotSafe,
+        GcRefusal::QueueUnreadable => GcReason::QueueUnreadable,
+    }
+}
+
+fn kept_json(report: &GcReport) -> Vec<KeptJson> {
+    report
+        .kept
+        .iter()
+        .map(|kept| KeptJson {
+            name: clean(kept.entry.name()),
+            why: match kept.why {
+                Why::Newest => WhyJson::Newest,
+                Why::Young => WhyJson::Young,
+                Why::InUse => WhyJson::InUse,
+                Why::NotYours => WhyJson::NotYours,
+                Why::Error => WhyJson::Error,
+            },
+        })
+        .collect()
 }
 
 fn cleaned(report: &GcReport) -> GcBody {
@@ -284,20 +316,7 @@ fn cleaned(report: &GcReport) -> GcBody {
     };
     GcBody::Cleaned {
         removed: names(&report.removed),
-        kept: report
-            .kept
-            .iter()
-            .map(|kept| KeptJson {
-                name: clean(kept.entry.name()),
-                why: match kept.why {
-                    Why::Newest => WhyJson::Newest,
-                    Why::Young => WhyJson::Young,
-                    Why::InUse => WhyJson::InUse,
-                    Why::NotYours => WhyJson::NotYours,
-                    Why::Error => WhyJson::Error,
-                },
-            })
-            .collect(),
+        kept: kept_json(report),
         failed: names(&report.failed),
     }
 }
@@ -521,6 +540,31 @@ mod tests {
                 ],
                 "failed": [],
             })
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_left_an_entry_unrestored_fails_and_lists_it() {
+        use crate::domain::snapshot::{GcOutcome, GcRefusal, GcReport, Kept, RootEntry, Why};
+        let report = GcReport {
+            kept: vec![Kept {
+                entry: RootEntry::parse(B).unwrap(),
+                why: Why::Error,
+            }],
+            ..GcReport::default()
+        };
+        let stranded = GcOutcome::Stranded {
+            why: GcRefusal::QueueUnreadable,
+            report,
+        };
+        let (value, exit) = json_of(&Outcome::Gc(stranded));
+        assert_eq!(
+            (
+                value["result"].as_str(),
+                value["kept"][0]["name"].as_str(),
+                exit
+            ),
+            (Some("stranded"), Some(B), Exit::Rr(RrCode::Failure))
         );
     }
 
