@@ -18,3 +18,4 @@ pub mod shell;
 pub mod slurm;
 pub mod ssh;
 pub mod transfer;
+pub mod wait;
