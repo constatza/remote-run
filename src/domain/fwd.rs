@@ -173,36 +173,76 @@ impl FromIterator<(ForwardName, ForwardSpec)> for ForwardTable {
     }
 }
 
+/// The local end one `rr fwd` listens on. A Unix socket has no port to choose and no browser to
+/// open, so those cannot be combined with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listener {
+    /// A TCP port on loopback: `local` when insisted on, else a free one.
+    Tcp {
+        local: Option<LoopbackPort>,
+        browser: Browser,
+    },
+    /// A Unix socket in the runtime directory.
+    Socket,
+}
+
 /// What one `rr fwd` will forward, once the table has been consulted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     /// Names the socket file. A forward given as `host:port` is named by its remote port.
     pub name: ForwardName,
     pub target: ForwardTarget,
-    pub local: Option<LoopbackPort>,
+    pub listener: Listener,
+}
+
+impl Plan {
+    /// Whether to open the browser once the forward listens: only a TCP forward has a URL.
+    pub fn browser(&self) -> Browser {
+        match self.listener {
+            Listener::Tcp { browser, .. } => browser,
+            Listener::Socket => Browser::Leave,
+        }
+    }
 }
 
 impl ForwardTable {
-    /// The plan for `wanted`; `local` from the command line wins over the table's.
-    pub fn plan(&self, wanted: Wanted, local: Option<LoopbackPort>) -> Result<Plan> {
-        match wanted {
-            Wanted::Target(target) => Ok(Plan {
-                name: ForwardName::parse(&target.port.to_string())?,
-                target,
-                local,
-            }),
+    /// The plan for `wanted`; `local` from the command line wins over the table's. A socket takes
+    /// neither a local port (from the command line or the table) nor `--open`.
+    pub fn plan(
+        &self,
+        wanted: Wanted,
+        local: Option<LoopbackPort>,
+        transport: Transport,
+        browser: Browser,
+    ) -> Result<Plan> {
+        let (name, target, configured) = match wanted {
+            Wanted::Target(target) => (ForwardName::parse(&target.port.to_string())?, target, None),
             Wanted::Named(name) => {
                 let Some(spec) = self.0.get(&name) else {
                     let known: Vec<&str> = self.0.keys().map(ForwardName::as_str).collect();
                     bail!("no forward named {name} in the config (configured: {known:?})");
                 };
-                Ok(Plan {
-                    target: spec.target.clone(),
-                    local: local.or(spec.local),
-                    name,
-                })
+                (name, spec.target.clone(), spec.local)
             }
-        }
+        };
+        let local = local.or(configured);
+        let listener = match (transport, local, browser) {
+            (Transport::Tcp, local, browser) => Listener::Tcp { local, browser },
+            (Transport::Socket, None, Browser::Leave) => Listener::Socket,
+            (Transport::Socket, Some(_), _) => {
+                bail!(
+                    "--socket has no TCP port: drop --local, or the local port of {name} in the config"
+                )
+            }
+            (Transport::Socket, None, Browser::Open) => {
+                bail!("--open needs a TCP forward; drop --socket")
+            }
+        };
+        Ok(Plan {
+            name,
+            target,
+            listener,
+        })
     }
 }
 
@@ -545,6 +585,56 @@ mod tests {
             "http://127.0.0.1:5051/"
         );
         assert_eq!(OpenUrl::of_forward(port(1)).as_str(), "http://127.0.0.1:1/");
+    }
+
+    fn table(local: Option<u16>) -> ForwardTable {
+        let spec = ForwardSpec {
+            target: ForwardTarget::parse("gpu-01:5000").unwrap(),
+            local: local.map(port),
+        };
+        [(ForwardName::parse("mlflow").unwrap(), spec)]
+            .into_iter()
+            .collect()
+    }
+
+    fn plan_of(
+        table: &ForwardTable,
+        (wanted, local): (&str, Option<u16>),
+        (transport, browser): (Transport, Browser),
+    ) -> Result<Plan> {
+        table.plan(
+            Wanted::parse(wanted).unwrap(),
+            local.map(port),
+            transport,
+            browser,
+        )
+    }
+
+    #[test]
+    fn a_socket_has_no_port_and_no_browser() {
+        let tcp = (Transport::Tcp, Browser::Open);
+        let socket = (Transport::Socket, Browser::Leave);
+        let t = table(None);
+        let plan = plan_of(&t, ("mlflow", Some(7000)), tcp).unwrap();
+        let (local, browser) = (Some(port(7000)), Browser::Open);
+        assert_eq!(plan.listener, Listener::Tcp { local, browser });
+        assert_eq!(
+            plan_of(&t, ("mlflow", None), socket).unwrap().listener,
+            Listener::Socket
+        );
+        assert_eq!(
+            plan_of(&t, ("h:1", None), socket).unwrap().name.as_str(),
+            "1"
+        );
+        let refused = [
+            plan_of(&t, ("mlflow", Some(7000)), socket),
+            plan_of(&t, ("mlflow", None), (Transport::Socket, Browser::Open)),
+            // a local port in the config is a port too
+            plan_of(&table(Some(6000)), ("mlflow", None), socket),
+        ];
+        for result in refused {
+            assert!(result.is_err());
+        }
     }
 
     #[test]

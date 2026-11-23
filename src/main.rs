@@ -159,10 +159,8 @@ fn dispatch(
 
 /// `rr fwd` is the one command that also needs the local network, clock and runtime directory.
 fn fwd(session: &Session, args: FwdArgs, ports: &Ports, env: &Environment) -> Result<Outcome> {
-    let clock = SystemClock::new();
     let machine = app::fwd::Machine {
         net: &OsNet,
-        clock: &clock,
         runtime_dir: env.xdg_runtime_dir.as_deref(),
     };
     app::fwd::run(session, args.into(), ports, &machine)

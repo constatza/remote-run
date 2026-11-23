@@ -92,19 +92,33 @@ pub trait Exec {
     /// [`Exec::stream_filtered`]. For a program that is meant to keep running (an ssh tunnel); the
     /// child ends when the handle is dropped, and when `rr` is killed or interrupted.
     fn spawn(&self, argv: &Argv) -> Result<Box<dyn Child>>;
+    /// Start `argv` and let it go: no stdin, stdout or stderr, its own process group (so a Ctrl-C
+    /// at `rr` does not reach it), and nobody waits for its result. For a program that is the
+    /// user's, such as a browser, which must neither block `rr` nor end with it. An `Err` means it
+    /// could not be started.
+    fn launch(&self, argv: &Argv) -> Result<()>;
+}
+
+/// How a [`Child`] ended. An interrupt of `rr` is not an exit of the child: the child was ended
+/// by `rr`, so its code is not a result worth passing on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ended {
+    /// The child ended with this code (a child killed by a signal reads as non-zero, never as
+    /// success).
+    Exited(i32),
+    /// `rr` was interrupted (SIGINT, SIGTERM or SIGHUP) and has ended the child.
+    Interrupted,
 }
 
 /// A program started by [`Exec::spawn`].
 pub trait Child {
-    /// Its exit code once it has ended (a child killed by a signal reads as non-zero, never as
-    /// success), else `None` while it runs.
-    fn try_wait(&mut self) -> Result<Option<i32>>;
+    /// How it ended, or `None` while it runs.
+    fn try_wait(&mut self) -> Result<Option<Ended>>;
     /// End it and reap it. Ending a child that has already ended is not an error.
     fn kill(&mut self) -> Result<()>;
 }
 
-/// The local network and the files a forward needs: asking a question about the machine, never
-/// changing it.
+/// The local network and the files a forward needs.
 pub trait Net {
     /// A TCP port on loopback that nothing listens on: `want` when given (an error if taken),
     /// else any free one. Another process can still take it before ssh binds; ssh then fails
@@ -113,6 +127,10 @@ pub trait Net {
     /// An error when something already exists at `path`: a stale socket would make ssh fail to
     /// bind, and removing a file that is not ours is not `rr`'s call.
     fn socket_unused(&self, path: &SocketPath) -> Result<()>;
+    /// Remove the socket file at `path` (none there is fine). Only for a path that
+    /// [`Net::socket_unused`] found free before ssh was started, once ssh has been reaped: the
+    /// file is then ssh's, and a SIGKILLed ssh cannot unlink it.
+    fn remove_socket(&self, path: &SocketPath) -> Result<()>;
     /// Whether a connection to `endpoint` is accepted right now.
     fn accepts(&self, endpoint: &Endpoint) -> bool;
 }
@@ -207,6 +225,7 @@ pub mod fake {
         StreamFiltered,
         StreamTee,
         Spawn,
+        Launch,
     }
 
     /// A scripted answer to `capture`.
@@ -363,29 +382,42 @@ pub mod fake {
 
     /// A child that answers `try_wait` from a script, repeating the last answer, and counts kills.
     pub struct FakeChild {
-        waits: VecDeque<Option<i32>>,
+        waits: VecDeque<Option<Ended>>,
         killed: Rc<Cell<u32>>,
+        kill_fails: bool,
     }
 
     impl FakeChild {
         /// `waits` are the answers of successive `try_wait` calls; once killed, it has ended.
         pub fn new(waits: Vec<Option<i32>>) -> (Self, Rc<Cell<u32>>) {
+            Self::scripted(waits.into_iter().map(|w| w.map(Ended::Exited)).collect())
+        }
+
+        /// Like [`FakeChild::new`], for answers that are not an exit code.
+        pub fn scripted(waits: Vec<Option<Ended>>) -> (Self, Rc<Cell<u32>>) {
             let killed = Rc::new(Cell::new(0));
             let child = Self {
                 waits: waits.into(),
                 killed: Rc::clone(&killed),
+                kill_fails: false,
             };
             (child, killed)
+        }
+
+        /// Make `kill` fail (after it has been counted), as for a child that cannot be signalled.
+        pub fn with_failing_kill(mut self) -> Self {
+            self.kill_fails = true;
+            self
         }
     }
 
     /// The code a killed fake child reads as: 128 + SIGKILL.
-    pub const KILLED_EXIT: i32 = 137;
+    const KILLED_EXIT: i32 = 137;
 
     impl Child for FakeChild {
-        fn try_wait(&mut self) -> Result<Option<i32>> {
+        fn try_wait(&mut self) -> Result<Option<Ended>> {
             if self.killed.get() > 0 {
-                return Ok(Some(KILLED_EXIT));
+                return Ok(Some(Ended::Exited(KILLED_EXIT)));
             }
             Ok(match self.waits.len() {
                 0 => None,
@@ -396,6 +428,9 @@ pub mod fake {
 
         fn kill(&mut self) -> Result<()> {
             self.killed.set(self.killed.get() + 1);
+            if self.kill_fails {
+                anyhow::bail!("not allowed to signal the child");
+            }
             Ok(())
         }
     }
@@ -407,6 +442,8 @@ pub mod fake {
         pub free: Option<u16>,
         pub accepts: RefCell<VecDeque<bool>>,
         pub socket_taken: bool,
+        /// The socket paths `remove_socket` was asked to remove.
+        pub removed: RefCell<Vec<String>>,
     }
 
     impl FakeNet {
@@ -415,6 +452,7 @@ pub mod fake {
                 free,
                 accepts: RefCell::new(accepts.into()),
                 socket_taken: false,
+                removed: RefCell::default(),
             }
         }
     }
@@ -435,6 +473,11 @@ pub mod fake {
             Ok(())
         }
 
+        fn remove_socket(&self, path: &SocketPath) -> Result<()> {
+            self.removed.borrow_mut().push(path.as_str().to_string());
+            Ok(())
+        }
+
         fn accepts(&self, _: &Endpoint) -> bool {
             let mut answers = self.accepts.borrow_mut();
             if answers.len() > 1 {
@@ -450,6 +493,7 @@ pub mod fake {
         captures: RefCell<VecDeque<Reply>>,
         streams: RefCell<VecDeque<i32>>,
         children: RefCell<VecDeque<FakeChild>>,
+        launch_fails: bool,
         pub calls: RefCell<Vec<(Argv, How)>>,
     }
 
@@ -459,6 +503,7 @@ pub mod fake {
                 captures: RefCell::new(captures.into()),
                 streams: RefCell::new(streams.into()),
                 children: RefCell::default(),
+                launch_fails: false,
                 calls: RefCell::default(),
             }
         }
@@ -466,6 +511,12 @@ pub mod fake {
         /// The children that `spawn` hands out, in order.
         pub fn with_children(self, children: Vec<FakeChild>) -> Self {
             *self.children.borrow_mut() = children.into();
+            self
+        }
+
+        /// Make `launch` fail, as for a program that is not installed.
+        pub fn with_failing_launch(mut self) -> Self {
+            self.launch_fails = true;
             self
         }
 
@@ -532,6 +583,14 @@ pub mod fake {
             self.calls.borrow_mut().push((argv.clone(), How::Spawn));
             let child = self.children.borrow_mut().pop_front();
             Ok(Box::new(child.expect("an unexpected spawn")))
+        }
+
+        fn launch(&self, argv: &Argv) -> Result<()> {
+            self.calls.borrow_mut().push((argv.clone(), How::Launch));
+            if self.launch_fails {
+                anyhow::bail!("could not start {}", argv.program());
+            }
+            Ok(())
         }
     }
 

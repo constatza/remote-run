@@ -17,8 +17,9 @@
 //! }
 //! ```
 
-use crate::domain::fwd::Endpoint;
-use crate::ports::{Argv, Child, Clock, Deadline, Exec, Net};
+use crate::domain::fwd::{Endpoint, ForwardTarget, argv};
+use crate::domain::host::Host;
+use crate::ports::{Child, Clock, Deadline, Ended, Exec, Net};
 use anyhow::{Result, bail};
 use std::time::Duration;
 
@@ -38,8 +39,10 @@ const SETTLE: Duration = Duration::from_millis(500);
 pub enum End {
     /// Its time to live ran out and `rr` closed it.
     Expired,
-    /// ssh ended by itself (or `rr` was interrupted) with this code.
-    Ssh(i32),
+    /// `rr` was interrupted and closed it.
+    Interrupted,
+    /// ssh ended by itself with this code.
+    Exited(i32),
 }
 
 /// ssh is running; nothing is known about the forward yet.
@@ -54,36 +57,61 @@ pub struct ListeningForward {
     endpoint: Endpoint,
 }
 
+/// What waiting for a forward to listen came to.
+pub enum Started {
+    Listening(ListeningForward),
+    /// `rr` was interrupted first; ssh has been ended.
+    Interrupted,
+}
+
+/// Whether ssh is still running at a look.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Look {
+    Running,
+    Interrupted,
+}
+
 impl StartingForward {
-    pub fn start(exec: &dyn Exec, argv: &Argv, endpoint: Endpoint) -> Result<Self> {
+    /// Start ssh for `endpoint` -> `target` through `host`. The command line is built here from
+    /// those three values, so the endpoint that is polled and announced is the one ssh was given.
+    pub fn start(
+        exec: &dyn Exec,
+        host: &Host,
+        target: &ForwardTarget,
+        endpoint: Endpoint,
+    ) -> Result<Self> {
         Ok(Self {
-            child: exec.spawn(argv)?,
+            child: exec.spawn(&argv(host, &endpoint, target))?,
             endpoint,
         })
     }
 
     /// Wait until `endpoint` accepts and ssh is still alive after [`SETTLE`]. On any failure ssh
-    /// is killed first, so an error never leaves a tunnel behind.
-    pub fn wait_listening(mut self, net: &dyn Net, clock: &dyn Clock) -> Result<ListeningForward> {
+    /// is killed first, so an error never leaves a tunnel behind; a kill that fails is part of the
+    /// error returned.
+    pub fn wait_listening(mut self, net: &dyn Net, clock: &dyn Clock) -> Result<Started> {
         match self.poll_listening(net, clock) {
-            Ok(()) => Ok(ListeningForward {
+            Ok(Look::Running) => Ok(Started::Listening(ListeningForward {
                 child: self.child,
                 endpoint: self.endpoint,
+            })),
+            Ok(Look::Interrupted) => Ok(Started::Interrupted),
+            Err(err) => Err(match self.child.kill() {
+                Ok(()) => err,
+                Err(kill) => err.context(format!("ssh could not be stopped either: {kill:#}")),
             }),
-            Err(err) => {
-                let _ = self.child.kill();
-                Err(err)
-            }
         }
     }
 
-    fn poll_listening(&mut self, net: &dyn Net, clock: &dyn Clock) -> Result<()> {
+    fn poll_listening(&mut self, net: &dyn Net, clock: &dyn Clock) -> Result<Look> {
         let give_up = Deadline::after(clock.now(), START_LIMIT);
         loop {
-            self.require_alive()?;
+            if self.look()? == Look::Interrupted {
+                return Ok(Look::Interrupted);
+            }
             if net.accepts(&self.endpoint) {
                 clock.sleep(SETTLE);
-                return self.require_alive();
+                return self.look();
             }
             if give_up.expired(clock.now()) {
                 bail!(
@@ -95,10 +123,14 @@ impl StartingForward {
         }
     }
 
-    fn require_alive(&mut self) -> Result<()> {
+    /// An exit before the forward listens is an error.
+    fn look(&mut self) -> Result<Look> {
         match self.child.try_wait()? {
-            None => Ok(()),
-            Some(code) => bail!("ssh ended ({code}) before the forward was listening"),
+            None => Ok(Look::Running),
+            Some(Ended::Interrupted) => Ok(Look::Interrupted),
+            Some(Ended::Exited(code)) => {
+                bail!("ssh ended ({code}) before the forward was listening")
+            }
         }
     }
 }
@@ -108,11 +140,14 @@ impl ListeningForward {
         &self.endpoint
     }
 
-    /// Keep the forward until ssh ends or `until` passes; then kill ssh.
+    /// Keep the forward until ssh ends or `until` passes; then kill ssh. When this returns ssh has
+    /// been reaped (also on an error, as the handle is dropped), so a socket file can be removed.
     pub fn hold(mut self, until: Deadline, clock: &dyn Clock) -> Result<End> {
         loop {
-            if let Some(code) = self.child.try_wait()? {
-                return Ok(End::Ssh(code));
+            match self.child.try_wait()? {
+                Some(Ended::Exited(code)) => return Ok(End::Exited(code)),
+                Some(Ended::Interrupted) => return Ok(End::Interrupted),
+                None => {}
             }
             if until.expired(clock.now()) {
                 self.child.kill()?;

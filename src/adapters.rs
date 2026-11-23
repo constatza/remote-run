@@ -7,7 +7,7 @@ use crate::domain::host::Host;
 use crate::domain::shell::Script;
 use crate::domain::ssh::{Terminal, ssh_argv};
 use crate::ports::{
-    Child as PortChild, Clock, Exec, Instant, Net, Remote, Teed, tee_lines, write_sanitized,
+    Child as PortChild, Clock, Ended, Exec, Instant, Net, Remote, Teed, tee_lines, write_sanitized,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::{self, Write};
@@ -87,11 +87,33 @@ impl Exec for OsExec {
     fn spawn(&self, argv: &Argv) -> Result<Box<dyn PortChild>> {
         spawn_child(argv).map(|child| Box::new(child) as Box<dyn PortChild>)
     }
+
+    fn launch(&self, argv: &Argv) -> Result<()> {
+        let mut command = command(argv);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        own_process_group(&mut command);
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("could not start {}", argv.program()))?;
+        // reaped in the background, so a launcher that ends while `rr` runs on leaves no zombie
+        std::thread::spawn(move || child.wait());
+        Ok(())
+    }
 }
 
-/// The exit code a child reads as after `rr` was interrupted (SIGINT, SIGTERM or SIGHUP): 128 plus
-/// SIGINT, the shell's convention for Ctrl-C.
-const INTERRUPTED_EXIT: i32 = 130;
+/// Put the child in its own process group: a Ctrl-C is sent to the terminal's foreground group, so
+/// it would otherwise reach the program `rr` launched for the user.
+#[cfg(unix)]
+fn own_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn own_process_group(_: &mut Command) {}
 
 /// A child started by [`OsExec::spawn`]. Dropping it ends the child, because dropping a
 /// `std::process::Child` leaves the process running, and an orphaned tunnel is the failure `rr fwd`
@@ -104,17 +126,40 @@ struct OsChild {
 }
 
 impl PortChild for OsChild {
-    fn try_wait(&mut self) -> Result<Option<i32>> {
+    fn try_wait(&mut self) -> Result<Option<Ended>> {
         if self.interrupted.load(Ordering::SeqCst) {
             self.kill()?;
-            return Ok(Some(INTERRUPTED_EXIT));
+            return Ok(Some(Ended::Interrupted));
         }
         let status = self.child.try_wait().context("could not poll the child")?;
-        Ok(status.map(exit_code))
+        Ok(status.map(|status| Ended::Exited(exit_code(status))))
     }
 
+    /// SIGTERM first, SIGKILL after [`STOP_GRACE`]: ssh unlinks its own forwarding socket when it
+    /// ends cleanly, and a SIGKILL leaves the file behind. A child that has ended is not signalled,
+    /// because its pid may belong to another process by now.
     fn kill(&mut self) -> Result<()> {
-        // `kill` on a child that has already been reaped is `Ok`; only a real failure is an error
+        if self
+            .child
+            .try_wait()
+            .context("could not poll the child")?
+            .is_some()
+        {
+            return Ok(());
+        }
+        send_term(self.child.id());
+        let deadline = WallClock::now() + STOP_GRACE;
+        while WallClock::now() < deadline {
+            if self
+                .child
+                .try_wait()
+                .context("could not poll the child")?
+                .is_some()
+            {
+                return Ok(());
+            }
+            std::thread::sleep(STOP_POLL);
+        }
         self.child.kill().context("could not kill the child")?;
         self.child.wait().context("could not wait for the child")?;
         Ok(())
@@ -169,8 +214,8 @@ fn flag_interrupts(_: &Arc<AtomicBool>) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn die_with_parent(command: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // SAFETY: the closure runs between fork and exec and calls only `prctl` and `getppid`, which
-    // are async-signal-safe, and allocates nothing.
+    // SAFETY: the closure runs between fork and exec and calls only `prctl`, `getppid` and
+    // `Error::from_raw_os_error`/`last_os_error`, none of which allocates.
     unsafe {
         let parent = libc::getpid();
         command.pre_exec(move || {
@@ -179,7 +224,8 @@ fn die_with_parent(command: &mut Command) {
             }
             // `rr` may have died between fork and prctl, when the signal is no longer coming
             if libc::getppid() != parent {
-                return Err(io::Error::other("rr ended while its child was starting"));
+                // no allocation after fork: `io::Error::other` would box a message
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
             }
             Ok(())
         });
@@ -212,6 +258,14 @@ impl Net for OsNet {
             ),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err).with_context(|| format!("checking {}", path.as_str())),
+        }
+    }
+
+    fn remove_socket(&self, path: &SocketPath) -> Result<()> {
+        match std::fs::remove_file(path.as_str()) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("removing {}", path.as_str())),
         }
     }
 
@@ -254,18 +308,23 @@ fn ended(child: &Mutex<Child>) -> bool {
         .map_or(true, |mut child| !matches!(child.try_wait(), Ok(None)))
 }
 
-/// Ask `child` to end with SIGTERM, and kill it when it is still there after `grace`. Std has no
-/// SIGTERM, so the `kill` program sends it; when that cannot run, the kill after `grace` still ends
-/// the child. Reaping here (through `try_wait`) leaves the final `wait` its cached status.
-fn terminate(child: &Mutex<Child>, grace: Duration) {
-    let Ok(pid) = child.lock().map(|child| child.id()) else {
-        return;
-    };
+/// Send SIGTERM to `pid`. Std has no SIGTERM, so the `kill` program sends it; when that cannot
+/// run, the caller's kill after its grace period still ends the child.
+fn send_term(pid: u32) {
     let _ = Command::new("kill")
         .args(["-TERM", "--", &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// Ask `child` to end with SIGTERM, and kill it when it is still there after `grace`. Std has no
+/// SIGTERM, so [`send_term`] sends it. Reaping here (through `try_wait`) leaves the final `wait` its cached status.
+fn terminate(child: &Mutex<Child>, grace: Duration) {
+    let Ok(pid) = child.lock().map(|child| child.id()) else {
+        return;
+    };
+    send_term(pid);
     let deadline = WallClock::now() + grace;
     while !ended(child) {
         if WallClock::now() >= deadline {
@@ -767,7 +826,7 @@ mod tests {
     fn ended_with(child: &mut dyn PortChild) -> i32 {
         let deadline = WallClock::now() + WATCHDOG;
         loop {
-            if let Some(code) = child.try_wait().unwrap() {
+            if let Some(Ended::Exited(code)) = child.try_wait().unwrap() {
                 return code;
             }
             assert!(WallClock::now() < deadline, "the child never ended");
@@ -782,7 +841,7 @@ mod tests {
         let mut sleeper = spawn_child(&sh("sleep 30")).unwrap();
         assert_eq!(sleeper.try_wait().unwrap(), None);
         sleeper.kill().unwrap();
-        assert_ne!(sleeper.try_wait().unwrap(), Some(0));
+        assert_ne!(sleeper.try_wait().unwrap(), Some(Ended::Exited(0)));
         sleeper.kill().unwrap();
         let missing = Argv::new("rr-no-such-program", vec![]);
         assert!(OsExec.spawn(&missing).is_err());
@@ -803,7 +862,86 @@ mod tests {
     fn an_interrupt_ends_the_child_and_reads_as_interrupted() {
         let mut child = spawn_child(&sh("sleep 30")).unwrap();
         child.interrupted.store(true, Ordering::SeqCst);
-        assert_eq!(child.try_wait().unwrap(), Some(INTERRUPTED_EXIT));
+        assert_eq!(child.try_wait().unwrap(), Some(Ended::Interrupted));
+    }
+
+    /// What the child printed after it ran, once it has written `file`.
+    #[cfg(unix)]
+    fn written(file: &std::path::Path) -> String {
+        let deadline = WallClock::now() + WATCHDOG;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(file)
+                && text.ends_with('\n')
+            {
+                return text;
+            }
+            assert!(WallClock::now() < deadline, "nothing was written");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A launched program is not waited for, shares neither the terminal nor the process group,
+    /// and its output goes nowhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launched_program_is_not_waited_for_and_has_its_own_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pgrp");
+        let script = format!(
+            "echo noise; sleep 1; cut -d' ' -f5 /proc/$$/stat > {}",
+            file.display()
+        );
+        let started = WallClock::now();
+        OsExec.launch(&sh(&script)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "launch waited"
+        );
+        let theirs: u32 = written(&file).trim().parse().unwrap();
+        let ours = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let ours: u32 = ours
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split(' ')
+            .nth(4)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_ne!(theirs, ours);
+        let missing = Argv::new("rr-no-such-program", vec![]);
+        assert!(OsExec.launch(&missing).is_err());
+    }
+
+    /// SIGTERM comes first (ssh unlinks its socket then); a child that ignores it is killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_ignores_sigterm_is_killed_after_the_grace_period() {
+        let mut stubborn = spawn_child(&sh("trap '' TERM; sleep 30")).unwrap();
+        // let the shell install its trap before the signal arrives
+        std::thread::sleep(Duration::from_millis(300));
+        let started = WallClock::now();
+        stubborn.kill().unwrap();
+        assert!(started.elapsed() >= STOP_GRACE);
+        assert!(matches!(stubborn.try_wait().unwrap(), Some(Ended::Exited(code)) if code != 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_file_is_removed_and_a_missing_one_is_fine() {
+        use crate::domain::fwd::ForwardName;
+        let dir = tempfile::tempdir().unwrap();
+        let name = ForwardName::parse("t").unwrap();
+        let path = SocketPath::new(dir.path().to_str().unwrap(), &name).unwrap();
+        OsNet.remove_socket(&path).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(path.as_str()).unwrap();
+        drop(listener);
+        assert!(
+            OsNet.socket_unused(&path).is_err(),
+            "the file is left by a closed listener"
+        );
+        OsNet.remove_socket(&path).unwrap();
+        OsNet.socket_unused(&path).unwrap();
     }
 
     #[test]
