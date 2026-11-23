@@ -106,12 +106,14 @@ fn tee_into(
         {
             return Ok(());
         }
-        writer.write_all(&line)?;
-        writer.flush()?;
+        // recorded before the echo: a failing write on the matching line itself must still hand
+        // back its job id
         if at_line_start && line.starts_with(prefix.as_bytes()) {
             let text = String::from_utf8_lossy(&line);
             matched.push(text.trim_end_matches(['\r', '\n']).to_string());
         }
+        writer.write_all(&line)?;
+        writer.flush()?;
         at_line_start = line.ends_with(b"\n");
     }
 }
@@ -813,6 +815,23 @@ pub mod fake {
             tee_lines(&raw[..], &mut FailsOnSecondWrite(0), "Submitted batch job ").unwrap_err();
         assert_eq!(err.matched, ["Submitted batch job 9"]);
         assert_eq!(err.to_string(), "closed");
+    }
+
+    /// The echo fails on the very line that carries the job id: the job is submitted all the same.
+    #[test]
+    fn a_write_error_on_the_matching_line_still_returns_that_line() {
+        struct AlwaysFails;
+        impl Write for AlwaysFails {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let raw = b"Submitted batch job 9\n";
+        let err = tee_lines(&raw[..], &mut AlwaysFails, "Submitted batch job ").unwrap_err();
+        assert_eq!(err.matched, ["Submitted batch job 9"]);
     }
 
     #[test]

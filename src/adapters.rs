@@ -1183,6 +1183,27 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(20), "child stopped");
     }
 
+    /// The echo fails on the line that carries the job id itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_tee_on_the_matching_line_still_names_the_job() {
+        struct AlwaysFails;
+        impl Write for AlwaysFails {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let script = "echo 'Submitted batch job 9'; exec sleep 30";
+        let err = within(move || {
+            stream_tee_to(&sh(script), "Submitted batch job ", &mut AlwaysFails).unwrap_err()
+        });
+        let shown = format!("{err:#}");
+        assert!(shown.contains("[Submitted batch job 9]"), "{shown}");
+    }
+
     #[test]
     fn the_net_hands_out_loopback_ports_and_sees_who_listens() {
         // the listener keeps its port for the whole test: a port freed and asked for again could
