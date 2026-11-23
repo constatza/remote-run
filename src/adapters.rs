@@ -2,7 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::domain::argv::{Argv, Captured, Stdin};
-use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath};
+use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath, listener_held};
 use crate::domain::host::Host;
 use crate::domain::shell::Script;
 use crate::domain::ssh::{Liveness, Terminal, ssh_argv};
@@ -175,6 +175,10 @@ impl OsChild {
 }
 
 impl PortChild for OsChild {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     fn try_wait(&mut self) -> Result<Option<Ended>> {
         if self.interrupted.load(Ordering::SeqCst) {
             self.kill()?;
@@ -323,8 +327,28 @@ pub struct OsNet;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const LOOPBACK_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
+/// Whether `pid` holds the listener on `127.0.0.1:port`, by matching the inode of the listening
+/// socket in `/proc/net/tcp` against the sockets in `/proc/<pid>/fd`. Only Linux can answer.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // reads /proc: the one place the socket tables are read
+fn holds_listener(port: LoopbackPort, pid: u32) -> Result<bool> {
+    let table = std::fs::read_to_string("/proc/net/tcp").context("cannot read /proc/net/tcp")?;
+    let fds = format!("/proc/{pid}/fd");
+    let links: Vec<String> = std::fs::read_dir(&fds)
+        .with_context(|| format!("cannot list {fds}"))?
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .map(|link| link.to_string_lossy().into_owned())
+        .collect();
+    Ok(listener_held(&table, &links, port))
+}
+
 impl Net for OsNet {
+    /// Refuses off Linux: a TCP forward is announced only for a listener proved to be ssh's, and
+    /// only Linux can prove it ([`Net::held_by`]); `--socket` works everywhere.
     fn free_port(&self, want: Option<LoopbackPort>) -> Result<LoopbackPort> {
+        if !cfg!(target_os = "linux") {
+            bail!("a TCP forward needs Linux to prove the listener is ssh's; use --socket");
+        }
         let port = want.map_or(0, LoopbackPort::get);
         let listener = TcpListener::bind((LOOPBACK_ADDR, port))
             .with_context(|| format!("cannot listen on 127.0.0.1:{port}"))?;
@@ -353,6 +377,17 @@ impl Net for OsNet {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err).with_context(|| format!("checking {}", path.as_str())),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn held_by(&self, port: LoopbackPort, pid: u32) -> bool {
+        // fail closed: an unreadable table or a process we may not inspect is "not held"
+        holds_listener(port, pid).unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn held_by(&self, _: LoopbackPort, _: u32) -> bool {
+        false
     }
 
     fn accepts(&self, endpoint: &Endpoint) -> bool {
@@ -1241,12 +1276,35 @@ mod tests {
         // meanwhile be taken by any other test's connection
         let listener = TcpListener::bind((LOOPBACK_ADDR, 0)).unwrap();
         let port = LoopbackPort::from_u16(listener.local_addr().unwrap().port()).unwrap();
-        assert_ne!(OsNet.free_port(None).unwrap(), port);
+        if cfg!(target_os = "linux") {
+            assert_ne!(OsNet.free_port(None).unwrap(), port);
+        }
         let endpoint = Endpoint::Tcp(port);
         assert!(OsNet.accepts(&endpoint));
         assert!(
             OsNet.free_port(Some(port)).is_err(),
             "a taken port is refused"
+        );
+    }
+
+    /// A listener is held by the process that made it and by no other: the check that keeps a
+    /// foreign listener on the forwarded port from passing for ssh's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_loopback_listener_is_held_by_its_own_process_only() {
+        let listener = TcpListener::bind((LOOPBACK_ADDR, 0)).unwrap();
+        let port = LoopbackPort::from_u16(listener.local_addr().unwrap().port()).unwrap();
+        assert!(OsNet.held_by(port, std::process::id()));
+        let child = OsExec.spawn(&sh("exec sleep 30")).unwrap();
+        assert!(
+            !OsNet.held_by(port, child.pid()),
+            "a child of ours is not the holder"
+        );
+        assert!(!OsNet.held_by(port, 0), "no such process");
+        drop(listener);
+        assert!(
+            !OsNet.held_by(port, std::process::id()),
+            "nothing listens any more"
         );
     }
 

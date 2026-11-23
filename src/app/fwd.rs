@@ -166,7 +166,7 @@ mod tests {
     use crate::domain::fwd::{ForwardName, ForwardSpec, ForwardTarget};
     use crate::domain::outcome::{Format, render};
     use crate::ports::Ended;
-    use crate::ports::fake::{FakeChild, FakeExec, FakeNet, How};
+    use crate::ports::fake::{FAKE_CHILD_PID, FakeChild, FakeExec, FakeNet, How};
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::Duration;
@@ -340,6 +340,54 @@ mod tests {
         let err = go(&w, &session(), args("n:1"), None).unwrap_err();
         assert!(err.to_string().contains("ssh ended (255)"), "{err}");
         assert!(notes(&w).is_empty());
+    }
+
+    /// The race the ownership check closes: another process took the port after `rr` picked it.
+    /// Its listener accepts, ssh is alive (still authenticating), and nothing may be announced.
+    #[test]
+    fn a_foreign_listener_is_never_announced_and_ssh_is_stopped() {
+        for browser in [Browser::Leave, Browser::Open] {
+            let mut w = world(vec![None], vec![true]);
+            w.net.holder = None;
+            let given = Args {
+                browser,
+                ..args("n:1")
+            };
+            let err = go(&w, &session(), given, None).unwrap_err();
+            assert!(err.to_string().contains("not ssh's"), "{err}");
+            assert!(
+                notes(&w).is_empty(),
+                "no URL for a listener that is not ssh's"
+            );
+            assert_eq!(w.killed.get(), 1, "ssh is stopped");
+            assert_eq!(
+                w.fakes.exec.calls.borrow().len(),
+                1,
+                "no browser is launched"
+            );
+        }
+    }
+
+    /// A listener of some other process, even one that is itself a child of nobody known, does not
+    /// count: only the pid of the ssh `rr` started does.
+    #[test]
+    fn the_listener_must_be_held_by_the_ssh_child_on_the_forwarded_port() {
+        let w = world(vec![None], vec![true]);
+        go(&w, &session(), args("n:1"), None).unwrap();
+        assert_eq!(*w.net.asked.borrow(), [(5051, FAKE_CHILD_PID)]);
+        let mut w = world(vec![None], vec![true]);
+        w.net.holder = Some(FAKE_CHILD_PID + 1);
+        assert!(go(&w, &session(), args("n:1"), None).is_err());
+        assert!(notes(&w).is_empty());
+    }
+
+    /// A socket in the private runtime directory has no port to take: it is checked as before.
+    #[test]
+    fn a_socket_forward_needs_no_port_owner() {
+        let mut w = world(vec![None], vec![true]);
+        w.net.holder = None;
+        go(&w, &session(), socket_args(), Some(RUNTIME)).unwrap();
+        assert!(w.net.asked.borrow().is_empty());
     }
 
     #[test]
