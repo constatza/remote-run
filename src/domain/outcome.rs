@@ -273,8 +273,9 @@ pub fn pull_report(outcome: &PullOutcome) -> Vec<String> {
         }
         PullOutcome::Stale { stderr } => {
             let mut report = vec![
-                "rr: the remote environment does not match uv.lock: run `uv sync` on the remote \
-                 (it may download several GB)"
+                "rr: the environment is out of date or uv failed (the uv.lock check on the remote \
+                 did not pass): if it is out of date, run `uv sync` there (it may download \
+                 several GB)"
                     .to_string(),
             ];
             if !stderr.is_empty() {
@@ -413,7 +414,7 @@ mod tests {
         assert!(
             stale
                 .stderr
-                .starts_with("rr: the remote environment does not match uv.lock")
+                .starts_with("rr: the environment is out of date or uv failed")
         );
         assert!(
             stale.stderr.ends_with("Would update?[2J 3 packages\n"),

@@ -49,6 +49,10 @@ fn head(id: &TreeId) -> Script {
             .word(number(UNSAFE_EXIT))
             .lit("; }"),
         lit("mkdir -p -m 0700 -- \"$root\""),
+        // a project directory with the setgid bit (a shared group, a default ACL) hands it on to
+        // what is created in it, and `safe` compares the mode exactly. A symlink is left alone
+        // (chmod would follow it); `safe` refuses it next.
+        lit("[ -L \"$root\" ] || chmod g-s -- \"$root\" 2>/dev/null || :"),
         lit("safe \"$root\" ")
             .lit(ROOT_MODE)
             .lit(" || refuse \"$PWD/$root\""),
@@ -93,7 +97,9 @@ pub fn probe_script(tree: &ClearedTree) -> Script {
 /// - the staging directory is `mktemp -d` (random, 0700) inside the root, removed by a trap on
 ///   EXIT, HUP, INT and TERM (a SIGKILL leaves a `.tmp-*` directory for `rr gc` to sweep);
 /// - `mv -T` renames onto the final name; when that fails because another upload won, the answer
-///   is `present`, and only if the winner passes the same owner, mode and symlink check.
+///   is `present`, and only if the winner passes the same owner, mode and symlink check. A failure
+///   with nothing at the final name (a full disk, a permission) is an error that carries `mv`'s
+///   own message, not a claim about the directory's owner.
 pub fn upload_script(tree: &ClearedTree) -> Result<Script> {
     let provenance = provenance_json(tree)?;
     Ok(Script::lines([
@@ -106,6 +112,8 @@ pub fn upload_script(tree: &ClearedTree) -> Result<Script> {
         // `|| :` because `set -e` is on in a trap too: a failing chmod must not skip the rm
         lit("trap 'chmod -R u+w -- \"$tmp\" 2>/dev/null || :; rm -rf -- \"$tmp\"' EXIT"),
         lit("trap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 143' TERM"),
+        // cleared again so the published mode never depends on what the root's mode was
+        lit("chmod g-s -- \"$tmp\""),
         lit("tar -x --no-same-owner --no-same-permissions -C \"$tmp\" -f - <&3"),
         lit(RESERVED_CHECK),
         lit("mkdir -- \"$tmp/.rr\""),
@@ -113,14 +121,14 @@ pub fn upload_script(tree: &ClearedTree) -> Result<Script> {
             .word(quote(&provenance))
             .lit(" > \"$tmp/.rr/provenance.json\""),
         lit(": > \"$tmp/.rr-used\""),
-        lit("chmod -R a-w -- \"$tmp\""),
-        lit("if mv -T -- \"$tmp\" \"$snap\"; then echo ")
+        lit("chmod -R a-w,g-s -- \"$tmp\""),
+        lit("if err=$(mv -T -- \"$tmp\" \"$snap\" 2>&1); then echo ")
             .lit(PUBLISHED)
-            .lit("; else\n  safe \"$snap\" ")
+            .lit("\nelif [ -e \"$snap\" ] || [ -L \"$snap\" ]; then\n  safe \"$snap\" ")
             .lit(SNAPSHOT_MODE)
             .lit(" || refuse \"$PWD/$snap\"\n  echo ")
             .lit(PRESENT)
-            .lit("\nfi"),
+            .lit("\nelse\n  echo \"rr: could not publish the snapshot: $err\" >&2; exit 1\nfi"),
     ]))
 }
 
@@ -345,6 +353,29 @@ mod tests {
         assert_eq!(said(&remote.probe()), "rr-snapshot present");
     }
 
+    /// A project directory with the setgid bit (a shared group) hands it to every directory made in
+    /// it; the checks compare the mode exactly, so the scripts must clear it again.
+    #[test]
+    fn a_setgid_project_directory_still_gets_exact_modes() {
+        let remote = Remote::new();
+        std::fs::set_permissions(
+            remote.project.path(),
+            std::fs::Permissions::from_mode(0o2755),
+        )
+        .unwrap();
+        assert_eq!(said(&remote.probe()), "rr-snapshot absent");
+        assert_eq!(mode(&remote.root()), 0o700, "the root is not setgid");
+        assert_eq!(said(&remote.upload(&archive())), "rr-snapshot published");
+        assert_eq!(said(&remote.probe()), "rr-snapshot present");
+        let mut all = Vec::new();
+        walk(&remote.snap(), &mut all);
+        for path in &all {
+            assert_eq!(mode(path) & 0o2000, 0, "{} is setgid", path.display());
+        }
+        assert_eq!(mode(&remote.snap()), 0o500);
+        assert_eq!(said(&remote.upload(&archive())), "rr-snapshot present");
+    }
+
     #[test]
     fn an_upload_publishes_a_read_only_tree_with_its_provenance() {
         let remote = Remote::new();
@@ -477,6 +508,20 @@ mod tests {
             std::fs::set_permissions(remote.snap(), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
         }
+    }
+
+    /// `mv` failing with no winner in the way says what `mv` said, not "not a private directory".
+    #[test]
+    fn a_rename_that_fails_for_another_reason_is_its_own_error() {
+        let remote = Remote::new();
+        remote.stub("mv", "echo 'mv: No space left on device' >&2; exit 1");
+        let run = remote.upload(&archive());
+        assert_eq!(run.code, 1);
+        assert!(run.stdout.is_empty());
+        assert!(run.stderr.contains("could not publish"), "{}", run.stderr);
+        assert!(run.stderr.contains("No space left"), "{}", run.stderr);
+        assert!(!run.stderr.contains("not a private"), "{}", run.stderr);
+        assert!(remote.left().is_empty(), "{:?}", remote.left());
     }
 
     #[test]
