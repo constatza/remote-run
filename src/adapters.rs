@@ -5,8 +5,9 @@ use crate::domain::argv::{Argv, Captured, Stdin};
 use crate::domain::host::Host;
 use crate::domain::shell::Script;
 use crate::domain::ssh::{Terminal, ssh_argv};
-use crate::ports::{Clock, Exec, Instant, Remote};
-use anyhow::{Context, Result};
+use crate::ports::{Clock, Exec, Instant, Remote, write_sanitized};
+use anyhow::{Context, Result, anyhow};
+use std::io::{self, Write};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
@@ -47,6 +48,41 @@ impl Exec for OsExec {
             .with_context(|| format!("could not start {}", argv.program()))?;
         Ok(exit_code(status))
     }
+
+    fn stream_filtered(&self, argv: &Argv) -> Result<i32> {
+        stream_filtered_to(argv, io::stdout(), io::stderr())
+    }
+}
+
+/// Run `argv` with stdin inherited and its stdout and stderr read through [`write_sanitized`] into
+/// `out` and `err`. The two pipes are read at once, so a child that fills one while the other is
+/// idle cannot stall. When a write fails its reader is dropped, which closes the pipe and ends the
+/// child; the error is reported after the child has been waited for, so no zombie is left.
+fn stream_filtered_to(
+    argv: &Argv,
+    mut out: impl Write + Send,
+    mut err: impl Write + Send,
+) -> Result<i32> {
+    let mut child = command(argv)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("could not start {}", argv.program()))?;
+    let (Some(child_out), Some(child_err)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err(anyhow!("{} has no output pipes", argv.program()));
+    };
+    let (out_result, err_result) = std::thread::scope(|scope| {
+        let err_pump = scope.spawn(move || write_sanitized(child_err, &mut err));
+        let out_result = write_sanitized(child_out, &mut out);
+        (out_result, err_pump.join())
+    });
+    let status = child.wait().context("could not wait for the child")?;
+    out_result.context("could not write the output")?;
+    err_result
+        .map_err(|_| anyhow!("the stderr filter stopped"))?
+        .context("could not write the error output")?;
+    Ok(exit_code(status))
 }
 
 /// The real host, reached as `ssh <host>`, so `~/.ssh/config` and the agent apply.
@@ -70,6 +106,11 @@ impl Remote for Ssh<'_> {
     fn stream(&self, script: &Script, terminal: Terminal) -> Result<i32> {
         self.exec
             .stream(&ssh_argv(self.host, &script.to_string(), terminal))
+    }
+
+    fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32> {
+        self.exec
+            .stream_filtered(&ssh_argv(self.host, &script.to_string(), terminal))
     }
 }
 
@@ -148,6 +189,86 @@ mod tests {
         let missing = Argv::new("rr-no-such-program", vec![]);
         let err = OsExec.stream(&missing).unwrap_err().to_string();
         assert_eq!(err, "could not start rr-no-such-program");
+    }
+
+    /// What the user's terminal would have received from `script`, and the child's exit code.
+    fn filtered(script: &str) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = stream_filtered_to(&sh(script), &mut out, &mut err).unwrap();
+        let text = |bytes| String::from_utf8(bytes).unwrap();
+        (code, text(out), text(err))
+    }
+
+    #[test]
+    fn a_child_cannot_put_control_sequences_on_the_terminal_through_either_stream() {
+        let (code, out, err) = filtered(
+            r"printf 'a\033]52;c;ZXZpbA==\007b\n'; printf 'x\342\200\256y\033[2J\n' >&2; exit 5",
+        );
+        assert_eq!(code, 5);
+        assert_eq!(out, "a?]52;c;ZXZpbA==?b\n");
+        assert_eq!(err, "x?y?[2J\n");
+    }
+
+    #[test]
+    fn bad_utf8_and_terminal_newlines_are_cleaned_and_a_huge_line_does_not_stall() {
+        let (_, out, _) = filtered(r"printf 'caf\351\r\n'");
+        assert_eq!(out, "caf\u{FFFD}\n");
+        let (code, out, _) = filtered("head -c 300000 /dev/zero | tr '\\000' a");
+        assert_eq!((code, out.len()), (0, 300_000));
+    }
+
+    #[test]
+    fn a_lot_of_output_on_both_streams_at_once_does_not_deadlock() {
+        let (code, out, err) = filtered(
+            "i=0; while [ $i -lt 4000 ]; do echo out-$i; echo err-$i >&2; i=$((i+1)); done",
+        );
+        assert_eq!(code, 0);
+        assert_eq!((out.lines().count(), err.lines().count()), (4000, 4000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_filtered_signal_killed_child_is_never_success_and_a_missing_program_is_an_error() {
+        let (code, _, _) = filtered("kill -9 $$");
+        assert_ne!(code, 0);
+        let missing = Argv::new("rr-no-such-program", vec![]);
+        let err = stream_filtered_to(&missing, io::sink(), io::sink()).unwrap_err();
+        assert_eq!(err.to_string(), "could not start rr-no-such-program");
+    }
+
+    #[test]
+    fn a_failing_output_stops_the_child_and_is_reported() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let forever = sh("while :; do echo line; done");
+        assert!(stream_filtered_to(&forever, Closed, io::sink()).is_err());
+    }
+
+    #[test]
+    fn filtered_streams_go_through_ssh_with_the_same_argv_as_plain_ones() {
+        let exec = FakeExec::new(vec![], vec![0, 9]);
+        let cluster = host();
+        let ssh = Ssh::new(&cluster, &exec);
+        assert_eq!(
+            ssh.stream_filtered(&lit("true"), Terminal::Plain).unwrap(),
+            0
+        );
+        let attached = ssh.stream_filtered(&lit("true"), Terminal::Attached);
+        assert_eq!(attached.unwrap(), 9);
+        let calls = exec.calls.borrow();
+        assert_eq!(calls[0].1, How::StreamFiltered);
+        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(
+            calls[1].0.args()[4..],
+            ["-t", "--", "cluster", "bash -c 'true'"]
+        );
     }
 
     #[test]

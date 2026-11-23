@@ -1,6 +1,6 @@
 //! `rr log`: show a job's log.
 
-use super::{Ports, stream};
+use super::{Ports, stream_filtered};
 use crate::config::Session;
 use crate::domain::logpath::{log_path, parse_sacct};
 use crate::domain::outcome::{Outcome, log_path_note};
@@ -28,13 +28,14 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
         Follow::Follow => Terminal::Attached,
     };
     let body = tail_script(&path, args.lines, args.follow);
-    stream(ports, &home, body, terminal)
+    stream_filtered(ports, &home, body, terminal)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::testing::{Fakes, at_home, session};
+    use super::super::testing::{Fakes, HOSTILE, HOSTILE_SHOWN, at_home, session};
     use super::*;
+    use crate::domain::exit::RemoteExit;
     use crate::ports::fake::RemoteCall;
 
     /// `sacct -P` with the unit separator: ids, name, user, directory, `--output` pattern.
@@ -64,17 +65,28 @@ mod tests {
             calls[1],
             (
                 at_home("tail -n 5 -- '/o/9.out'"),
-                RemoteCall::Stream(Terminal::Plain)
+                RemoteCall::StreamFiltered(Terminal::Plain)
             )
         );
         assert_eq!(
             calls[3],
             (
                 at_home("tail -n 5 -F -- '/o/9.out'"),
-                RemoteCall::Stream(Terminal::Attached)
+                RemoteCall::StreamFiltered(Terminal::Attached)
             )
         );
         assert_eq!(*fakes.notes.0.borrow(), ["rr: /o/9.out", "rr: /o/9.out"]);
+    }
+
+    #[test]
+    fn a_job_log_is_sanitized_whether_followed_or_not_and_the_exit_code_is_tails() {
+        for follow in [Follow::Once, Follow::Follow] {
+            let fakes = Fakes::new(vec![], vec![], vec![(0, RECORD, "")], vec![130]);
+            fakes.remote.emit(HOSTILE);
+            let outcome = run(&session(), args(follow), &fakes.ports()).unwrap();
+            assert_eq!(*fakes.remote.shown.borrow(), HOSTILE_SHOWN.as_bytes());
+            assert!(matches!(outcome, Outcome::Remote(code) if code == RemoteExit::new(130)));
+        }
     }
 
     #[test]
