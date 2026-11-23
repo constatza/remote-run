@@ -1,7 +1,7 @@
 //! The real [`Exec`] and [`Remote`]: the only place that starts a process.
 #![allow(clippy::disallowed_methods)]
 
-use crate::domain::argv::{Argv, Captured, Stdin};
+use crate::domain::argv::{Argv, Captured, Payload, Stdin};
 use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath, listener_held};
 use crate::domain::host::Host;
 use crate::domain::shell::Script;
@@ -54,6 +54,27 @@ impl Exec for OsExec {
         let status = command(argv)
             .status()
             .with_context(|| format!("could not start {}", argv.program()))?;
+        Ok(exit_code(status))
+    }
+
+    fn stream_input(&self, argv: &Argv, input: &Payload) -> Result<i32> {
+        let mut child = command(argv)
+            .stdin(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("could not start {}", argv.program()))?;
+        let stdin = child.stdin.take();
+        let bytes = input.as_bytes().to_vec();
+        // written on its own thread: a child that prints before it has read everything would
+        // otherwise block on a full output pipe while `rr` blocks on a full input pipe. A write
+        // error (the child ended early, a broken pipe) is the child's business, its exit code
+        // says how it went.
+        let writer = std::thread::spawn(move || {
+            if let Some(mut stdin) = stdin {
+                let _ = stdin.write_all(&bytes);
+            }
+        });
+        let status = child.wait().context("could not wait for the child")?;
+        let _ = writer.join();
         Ok(exit_code(status))
     }
 
@@ -605,6 +626,16 @@ impl Remote for Ssh<'_> {
         self.exec.stream(&argv)
     }
 
+    fn send(&self, script: &Script, input: &Payload) -> Result<i32> {
+        let argv = ssh_argv(
+            self.host,
+            &script.to_string(),
+            Terminal::Plain,
+            Liveness::Configured,
+        );
+        self.exec.stream_input(&argv, input)
+    }
+
     fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32> {
         let argv = ssh_argv(
             self.host,
@@ -721,6 +752,27 @@ mod tests {
     fn a_null_stdin_is_closed_at_once() {
         let out = OsExec.capture(&sh("cat; echo done"), Stdin::Null).unwrap();
         assert_eq!(out.stdout, "done\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_input_feeds_the_child_its_stdin_and_passes_its_exit_code_on() {
+        let reads = |wanted: &str| sh(&format!("test \"$(cat)\" = {wanted}"));
+        let hello = Payload::new(b"hello".to_vec());
+        assert_eq!(OsExec.stream_input(&reads("hello"), &hello).unwrap(), 0);
+        assert_eq!(OsExec.stream_input(&reads("other"), &hello).unwrap(), 1);
+        assert_eq!(OsExec.stream_input(&sh("exit 7"), &hello).unwrap(), 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_input_with_more_bytes_than_a_pipe_holds_and_a_child_that_never_reads() {
+        let big = Payload::new(vec![b'x'; 4 * 1024 * 1024]);
+        assert_eq!(OsExec.stream_input(&sh("exit 3"), &big).unwrap(), 3);
+        assert_eq!(
+            OsExec.stream_input(&sh("wc -c >/dev/null"), &big).unwrap(),
+            0
+        );
     }
 
     #[cfg(unix)]
@@ -957,6 +1009,18 @@ mod tests {
             calls[1].0.args()[4..],
             ["-t", "--", "cluster", "bash -c 'true'"]
         );
+    }
+
+    #[test]
+    fn send_hands_the_input_to_ssh_without_a_remote_terminal() {
+        let exec = FakeExec::new(vec![], vec![4]);
+        let input = Payload::new(b"print(1)\n".to_vec());
+        let code = Ssh::new(&host(), &exec).send(&lit("true"), &input).unwrap();
+        assert_eq!(code, 4);
+        let calls = exec.calls.borrow();
+        assert_eq!(calls[0].1, How::StreamInput);
+        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(*exec.inputs.borrow(), [b"print(1)\n".to_vec()]);
     }
 
     #[test]

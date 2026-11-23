@@ -2,7 +2,7 @@
 //! tests can record the argv and replay output instead of starting anything.
 
 // the vocabulary the ports speak is the core's
-pub use crate::domain::argv::{Argv, Captured, Stdin};
+pub use crate::domain::argv::{Argv, Captured, Payload, Stdin};
 use crate::domain::fwd::{Endpoint, LoopbackPort, SocketPath};
 use crate::domain::sanitize::sanitize_bytes;
 use crate::domain::shell::Script;
@@ -131,6 +131,10 @@ pub trait Exec {
     fn capture(&self, argv: &Argv, stdin: Stdin) -> Result<Captured>;
     /// Run `argv` with the terminal attached (stdin, stdout and stderr inherited).
     fn stream(&self, argv: &Argv) -> Result<i32>;
+    /// Like [`Exec::stream`], but the child reads `input` on stdin, then end of file, instead of
+    /// the terminal. A child that stops reading early is not an error of `rr`: its exit code says
+    /// how it went.
+    fn stream_input(&self, argv: &Argv, input: &Payload) -> Result<i32>;
     /// Like [`Exec::stream`], but the child's stdout and stderr come back through
     /// [`write_sanitized`] to the user's stdout and stderr, so nothing it prints can carry a
     /// terminal control sequence. Stdin stays inherited.
@@ -223,6 +227,9 @@ pub trait Remote {
     /// Run `script` with the local terminal attached; `terminal` says whether the remote side gets
     /// one too.
     fn stream(&self, script: &Script, terminal: Terminal) -> Result<i32>;
+    /// Run `script` with `input` on its stdin (no remote terminal: the input is not one). For a
+    /// program or archive that is data, so it needs no quoting into the script.
+    fn send(&self, script: &Script, input: &Payload) -> Result<i32>;
     /// Like [`Remote::stream`], with the output filtered as in [`Exec::stream_filtered`]. For
     /// commands whose output is the remote's text rather than a program the user chose to run.
     fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32>;
@@ -301,6 +308,7 @@ pub mod fake {
     pub enum How {
         Capture(Stdin),
         Stream,
+        StreamInput,
         StreamFiltered,
         StreamTee,
         Spawn,
@@ -328,6 +336,7 @@ pub mod fake {
         Capture,
         Poll,
         Stream(Terminal),
+        Send,
         StreamFiltered(Terminal),
         StreamTee(Terminal, Echo),
     }
@@ -341,6 +350,8 @@ pub mod fake {
         emitted: RefCell<VecDeque<Vec<u8>>>,
         /// What the user would have seen from the filtered streams, after the filter.
         pub shown: RefCell<Vec<u8>>,
+        /// The input of every `send`, in order.
+        pub sent: RefCell<Vec<Vec<u8>>>,
         pub calls: RefCell<Vec<(String, RemoteCall)>>,
     }
 
@@ -360,6 +371,7 @@ pub mod fake {
                 streams: RefCell::new(streams.into()),
                 emitted: RefCell::default(),
                 shown: RefCell::default(),
+                sent: RefCell::default(),
                 calls: RefCell::default(),
             }
         }
@@ -412,6 +424,18 @@ pub mod fake {
                 .borrow_mut()
                 .pop_front()
                 .expect("an unexpected remote stream"))
+        }
+
+        fn send(&self, script: &Script, input: &Payload) -> Result<i32> {
+            self.calls
+                .borrow_mut()
+                .push((script.to_string(), RemoteCall::Send));
+            self.sent.borrow_mut().push(input.as_bytes().to_vec());
+            Ok(self
+                .streams
+                .borrow_mut()
+                .pop_front()
+                .expect("an unexpected remote send"))
         }
 
         fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32> {
@@ -632,6 +656,8 @@ pub mod fake {
         children: RefCell<VecDeque<FakeChild>>,
         launch_fails: bool,
         pub calls: RefCell<Vec<(Argv, How)>>,
+        /// The input of every `stream_input`, in order.
+        pub inputs: RefCell<Vec<Vec<u8>>>,
     }
 
     impl FakeExec {
@@ -642,6 +668,7 @@ pub mod fake {
                 children: RefCell::default(),
                 launch_fails: false,
                 calls: RefCell::default(),
+                inputs: RefCell::default(),
             }
         }
 
@@ -685,6 +712,18 @@ pub mod fake {
 
         fn stream(&self, argv: &Argv) -> Result<i32> {
             self.calls.borrow_mut().push((argv.clone(), How::Stream));
+            Ok(self
+                .streams
+                .borrow_mut()
+                .pop_front()
+                .expect("an unexpected stream"))
+        }
+
+        fn stream_input(&self, argv: &Argv, input: &Payload) -> Result<i32> {
+            self.calls
+                .borrow_mut()
+                .push((argv.clone(), How::StreamInput));
+            self.inputs.borrow_mut().push(input.as_bytes().to_vec());
             Ok(self
                 .streams
                 .borrow_mut()

@@ -37,6 +37,21 @@ pub enum Stdin {
     Inherit,
 }
 
+/// Bytes a child reads on standard input to their end (a script, an archive). A type of its own,
+/// so a call that feeds a child cannot be confused with one that leaves stdin to the terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payload(Vec<u8>);
+
+impl Payload {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// What a command printed and how it ended.
 #[derive(Clone, Debug)]
 pub struct Captured {
