@@ -164,8 +164,13 @@ pub fn wait_report(outcome: &WaitOutcome) -> Vec<String> {
     };
     match outcome {
         WaitOutcome::Completed(rows) | WaitOutcome::Failed(rows) => states(rows),
-        WaitOutcome::TimedOut(rows) => {
+        WaitOutcome::TimedOut { rows, unlisted } => {
             let mut report = states(rows);
+            report.extend(
+                unlisted
+                    .iter()
+                    .map(|job| format!("rr: {} not listed by sacct", sanitize(job.as_str()))),
+            );
             report.push("rr: timed out; the jobs are still active".to_string());
             report
         }
@@ -419,7 +424,7 @@ mod tests {
 
     #[test]
     fn a_wait_prints_one_line_per_job_and_exits_with_its_own_code() {
-        use crate::domain::slurm::{JobState, SqueueId};
+        use crate::domain::slurm::{JobId, JobState, SqueueId};
         let row = |id: &str, state: &str| JobStatus {
             id: SqueueId::parse(id).unwrap(),
             state: JobState::parse(state),
@@ -434,11 +439,14 @@ mod tests {
             failed.stderr,
             "rr: 7 COMPLETED\nrr: 8 ?[2J\n".replace("?[2J", "FAILED?[2J")
         );
-        let late = waited(WaitOutcome::TimedOut(rows));
+        let late = waited(WaitOutcome::TimedOut {
+            rows,
+            unlisted: vec![JobId::parse("9").unwrap()],
+        });
         assert_eq!(late.exit, Exit::Rr(RrCode::Timeout));
         assert!(
             late.stderr
-                .ends_with("rr: timed out; the jobs are still active\n")
+                .ends_with("rr: 9 not listed by sacct\nrr: timed out; the jobs are still active\n")
         );
         let unknown = waited(WaitOutcome::Unknown {
             why: "no\u{1b}[2J".into(),

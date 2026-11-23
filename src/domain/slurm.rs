@@ -323,8 +323,12 @@ pub enum WaitOutcome {
     Completed(Vec<JobStatus>),
     /// A job ended in a state other than COMPLETED (the others may still be active).
     Failed(Vec<JobStatus>),
-    /// `--timeout` passed with jobs still active; these are the states last read.
-    TimedOut(Vec<JobStatus>),
+    /// `--timeout` passed with a job read as active. `rows` are the states last read;
+    /// `unlisted` are requested jobs that `sacct` never listed, which the report names.
+    TimedOut {
+        rows: Vec<JobStatus>,
+        unlisted: Vec<JobId>,
+    },
     /// `rr` could not learn how the jobs ended; `why` is remote or program text.
     Unknown { why: String },
 }
@@ -336,7 +340,7 @@ impl WaitOutcome {
         match self {
             WaitOutcome::Completed(_) => Exit::Success,
             WaitOutcome::Failed(_) => Exit::Rr(RrCode::JobFailed),
-            WaitOutcome::TimedOut(_) => Exit::Rr(RrCode::Timeout),
+            WaitOutcome::TimedOut { .. } => Exit::Rr(RrCode::Timeout),
             WaitOutcome::Unknown { .. } => Exit::Rr(RrCode::Unknown),
         }
     }

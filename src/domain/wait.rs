@@ -129,10 +129,14 @@ fn is_row_of(job: &JobId, row: &SqueueId) -> bool {
             .is_some_and(|rest| rest.starts_with(['_', '+']))
 }
 
-fn covers(rows: &[JobStatus], jobs: &JobSet) -> bool {
+/// The requested jobs that no row answers for: `sacct` has not listed them.
+fn unlisted(rows: &[JobStatus], jobs: &JobSet) -> Vec<JobId> {
+    let listed = |job: &&JobId| rows.iter().any(|row| is_row_of(job, &row.id));
     jobs.as_slice()
         .iter()
-        .all(|job| rows.iter().any(|row| is_row_of(job, &row.id)))
+        .filter(|job| !listed(job))
+        .cloned()
+        .collect()
 }
 
 fn ended_badly(row: &JobStatus) -> bool {
@@ -151,18 +155,18 @@ fn completed(row: &JobStatus) -> bool {
 pub fn next_action(reading: &Reading, jobs: &JobSet, progress: Progress) -> Action {
     let rows = match reading {
         Reading::Statuses(rows) => rows,
-        Reading::Unreadable(why) => return unreadable(why, &[], progress),
+        Reading::Unreadable(why) => return unreadable(why, &[], jobs, progress),
     };
     if rows.iter().any(ended_badly) {
         return Action::Done(WaitOutcome::Failed(rows.clone()));
     }
-    if !covers(rows, jobs) {
-        return unreadable("sacct does not list every job yet", rows, progress);
+    if !unlisted(rows, jobs).is_empty() {
+        return unreadable("sacct does not list every job yet", rows, jobs, progress);
     }
     if rows.iter().all(completed) {
         Action::Done(WaitOutcome::Completed(rows.clone()))
     } else if progress.elapsed >= progress.timeout {
-        Action::Done(WaitOutcome::TimedOut(rows.clone()))
+        Action::Done(at_timeout(rows, jobs))
     } else {
         Action::Poll {
             unreadable_polls: 0,
@@ -170,10 +174,35 @@ pub fn next_action(reading: &Reading, jobs: &JobSet, progress: Progress) -> Acti
     }
 }
 
-/// A poll that could not tell every job's state. At the timeout it is "timed out" only when `seen`
-/// holds a job that really read as not finished; with nothing read, "the jobs are still active" would
-/// be a guess, so it is "unknown".
-fn unreadable(why: &str, seen: &[JobStatus], progress: Progress) -> Action {
+/// How a wait that ran out of time ends, given what was last read. "Timed out" (exit 4) says the
+/// jobs are still active, so it needs a row that read as active; rows that are only in a state
+/// `rr` does not recognise cannot be called active, and are "unknown" (exit 6) naming that state.
+/// Requested jobs that no row answers for are named in the result, not left out.
+fn at_timeout(seen: &[JobStatus], jobs: &JobSet) -> WaitOutcome {
+    let active = |row: &&JobStatus| matches!(row.state, JobState::Active(_));
+    if seen.iter().any(|row| active(&row)) {
+        return WaitOutcome::TimedOut {
+            rows: seen.to_vec(),
+            unlisted: unlisted(seen, jobs),
+        };
+    }
+    let unrecognised: Vec<String> = seen
+        .iter()
+        .filter(|row| matches!(row.state, JobState::Unknown(_)))
+        .map(|row| format!("job {} is in state {:?}", row.id.as_str(), row.state.name()))
+        .collect();
+    let why = if unrecognised.is_empty() {
+        "nothing read as active".to_string()
+    } else {
+        format!("{}, which rr does not recognise", unrecognised.join("; "))
+    };
+    WaitOutcome::Unknown { why }
+}
+
+/// A poll that could not tell every job's state. At the timeout the answer is [`at_timeout`] on
+/// what `seen` holds, unless the wait gave up first; with nothing read, "the jobs are still
+/// active" would be a guess, so it is "unknown".
+fn unreadable(why: &str, seen: &[JobStatus], jobs: &JobSet, progress: Progress) -> Action {
     let polls = progress.unreadable_polls + 1;
     let timed_out = progress.elapsed >= progress.timeout;
     let gave_up = polls >= MAX_UNREADABLE_POLLS;
@@ -182,8 +211,8 @@ fn unreadable(why: &str, seen: &[JobStatus], progress: Progress) -> Action {
             unreadable_polls: polls,
         };
     }
-    if !gave_up && !seen.iter().all(completed) {
-        return Action::Done(WaitOutcome::TimedOut(seen.to_vec()));
+    if !gave_up && seen.iter().any(|row| !completed(row)) {
+        return Action::Done(at_timeout(seen, jobs));
     }
     Action::Done(WaitOutcome::Unknown { why: why.into() })
 }
@@ -297,22 +326,50 @@ mod tests {
     fn active_jobs_past_the_timeout_end_as_timed_out_with_their_states() {
         let reading = seen(&[("1", "RUNNING")]);
         let action = next_action(&reading, &jobs(&["1"]), at(HOUR, 0));
+        assert_eq!(action, Action::Done(timed_out(&[("1", "RUNNING")], &[])));
+    }
+
+    /// The jobs the reading did not list, named in the outcome.
+    fn timed_out(read: &[(&str, &str)], unlisted: &[&str]) -> WaitOutcome {
+        WaitOutcome::TimedOut {
+            rows: rows(read),
+            unlisted: unlisted
+                .iter()
+                .map(|id| JobId::parse(id).unwrap())
+                .collect(),
+        }
+    }
+
+    /// "Timed out" says the jobs are still active; a state `rr` cannot place is not that, so with
+    /// nothing read as active the end is "unknown" and names the state.
+    #[test]
+    fn an_unknown_state_is_never_the_end_and_is_unknown_at_the_timeout() {
+        let reading = seen(&[("1", "BRAND_NEW")]);
+        assert_eq!(next_action(&reading, &jobs(&["1"]), early()), POLL);
+        let Action::Done(WaitOutcome::Unknown { why }) =
+            next_action(&reading, &jobs(&["1"]), at(HOUR, 0))
+        else {
+            panic!("an unrecognised state past the timeout is unknown, not a timeout");
+        };
+        assert!(why.contains("job 1") && why.contains("BRAND_NEW"), "{why}");
+        // an active job beside it keeps it a timeout, with both states shown
+        let mixed = seen(&[("1", "BRAND_NEW"), ("2", "RUNNING")]);
+        let action = next_action(&mixed, &jobs(&["1", "2"]), at(HOUR, 0));
         assert_eq!(
             action,
-            Action::Done(WaitOutcome::TimedOut(rows(&[("1", "RUNNING")])))
+            Action::Done(timed_out(&[("1", "BRAND_NEW"), ("2", "RUNNING")], &[]))
         );
     }
 
+    /// A job `sacct` never listed is part of the report, not silently dropped.
     #[test]
-    fn an_unknown_state_is_never_the_end_and_is_reported_at_the_timeout() {
-        let reading = seen(&[("1", "BRAND_NEW")]);
-        assert_eq!(next_action(&reading, &jobs(&["1"]), early()), POLL);
-        let Action::Done(WaitOutcome::TimedOut(last)) =
-            next_action(&reading, &jobs(&["1"]), at(HOUR, 0))
-        else {
-            panic!("an unknown state past the timeout is a timeout");
-        };
-        assert_eq!(last[0].state, JobState::Unknown("BRAND_NEW".into()));
+    fn a_timeout_names_the_jobs_sacct_never_listed() {
+        let reading = seen(&[("1", "RUNNING")]);
+        let action = next_action(&reading, &jobs(&["1", "2", "3"]), at(HOUR, 0));
+        assert_eq!(
+            action,
+            Action::Done(timed_out(&[("1", "RUNNING")], &["2", "3"]))
+        );
     }
 
     #[test]
@@ -363,7 +420,7 @@ mod tests {
         let running = seen(&[("1", "RUNNING")]);
         assert_eq!(
             next_action(&running, &jobs, at(HOUR, 0)),
-            Action::Done(WaitOutcome::TimedOut(rows(&[("1", "RUNNING")])))
+            Action::Done(timed_out(&[("1", "RUNNING")], &["2"]))
         );
         for nothing_active in [seen(&[]), seen(&[("1", "COMPLETED")])] {
             let action = next_action(&nothing_active, &jobs, at(HOUR, 0));

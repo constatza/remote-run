@@ -107,10 +107,20 @@ struct JobJson {
 #[derive(Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 enum WaitBody {
-    Completed { jobs: Vec<JobJson> },
-    Failed { jobs: Vec<JobJson> },
-    TimedOut { jobs: Vec<JobJson> },
-    Unknown { why: String },
+    Completed {
+        jobs: Vec<JobJson>,
+    },
+    Failed {
+        jobs: Vec<JobJson>,
+    },
+    /// `unlisted` are requested jobs that `sacct` never listed.
+    TimedOut {
+        jobs: Vec<JobJson>,
+        unlisted: Vec<String>,
+    },
+    Unknown {
+        why: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -170,7 +180,10 @@ fn wait(outcome: &WaitOutcome) -> WaitBody {
     match outcome {
         WaitOutcome::Completed(rows) => WaitBody::Completed { jobs: jobs(rows) },
         WaitOutcome::Failed(rows) => WaitBody::Failed { jobs: jobs(rows) },
-        WaitOutcome::TimedOut(rows) => WaitBody::TimedOut { jobs: jobs(rows) },
+        WaitOutcome::TimedOut { rows, unlisted } => WaitBody::TimedOut {
+            jobs: jobs(rows),
+            unlisted: unlisted.iter().map(|job| clean(job.as_str())).collect(),
+        },
         WaitOutcome::Unknown { why } => WaitBody::Unknown { why: clean(why) },
     }
 }
@@ -262,7 +275,7 @@ mod tests {
     use crate::domain::ids::{Commit, digest};
     use crate::domain::outcome::{Format, TrustReport, render};
     use crate::domain::pull::Target;
-    use crate::domain::slurm::{JobState, SqueueId};
+    use crate::domain::slurm::{JobId, JobState, SqueueId};
     use crate::domain::status::Status;
     use serde_json::{Value, json};
     use std::path::PathBuf;
@@ -350,7 +363,14 @@ mod tests {
         let cases = [
             (WaitOutcome::Completed(jobs.clone()), "completed", 0),
             (WaitOutcome::Failed(jobs.clone()), "failed", 5),
-            (WaitOutcome::TimedOut(jobs.clone()), "timed_out", 4),
+            (
+                WaitOutcome::TimedOut {
+                    rows: jobs.clone(),
+                    unlisted: vec![],
+                },
+                "timed_out",
+                4,
+            ),
         ];
         for (outcome, name, code) in cases {
             let (value, exit) = json_of(&Outcome::Waited(outcome));
@@ -366,9 +386,13 @@ mod tests {
         let (value, exit) = json_of(&Outcome::Waited(unknown));
         assert_eq!(value["why"], "ssh: no route?[2J");
         assert_eq!(exit, Exit::Rr(RrCode::Unknown));
-        let odd = WaitOutcome::TimedOut(vec![row("1", "BRAND\u{202E}NEW")]);
+        let odd = WaitOutcome::TimedOut {
+            rows: vec![row("1", "BRAND\u{202E}NEW")],
+            unlisted: vec![JobId::parse("2").unwrap()],
+        };
         let (value, _) = json_of(&Outcome::Waited(odd));
         assert_eq!(value["jobs"][0]["state"], "BRAND?NEW", "bidi controls go");
+        assert_eq!(value["unlisted"], json!(["2"]), "a job sacct never listed");
     }
 
     #[test]
