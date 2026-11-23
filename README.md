@@ -26,7 +26,7 @@ cargo install --git https://github.com/constatza/remote-run
 | Setting | Flag | Variable | Meaning |
 |---|---|---|---|
 | `host` | `--host` | `RR_HOST` | ssh host or alias |
-| `dir` | `--dir` | `RR_DIR` | remote project directory, relative to the remote home or absolute |
+| `dir` | `--dir` | `RR_DIR` | remote project directory, relative to the remote home or absolute; may not start with `-` |
 | `env` | `--env` | `RR_ENV` | remote shell file sourced before every command, for example the one that puts `uv` on `PATH`; relative to the remote home |
 
 The user file is `$XDG_CONFIG_HOME/rr/config.toml`, else `~/.config/rr/config.toml`, else `%APPDATA%\rr\config.toml`. Put settings about you and the cluster there:
@@ -37,7 +37,7 @@ host = "mycluster"
 env = "setup/env.sh"
 ```
 
-Put the remote directory of a project in `.rr.toml` at the project root. The file is personal, so keep it out of git:
+Put the remote directory of a project in `.rr.toml` at the project root. The file is personal, so keep it out of git. `rr` refuses a project file you have not reviewed, because it can choose the host, the remote directory and a shell file the remote sources: run `rr trust` to see what applies, then `rr trust --yes` to record it. Editing the file makes it untrusted again:
 
 ```toml
 # <project>/.rr.toml
@@ -71,6 +71,8 @@ rr get <remote> [local]       # rsync from the remote; relative paths are inside
 rr put <local> [remote]       # rsync to the remote (default: the project directory); never deletes
 ```
 
+Remote paths are absolute or relative to the project directory. Only a leading `~/` is read, as the remote home; no other `~` is expanded (rsync is run with `-s`, so the remote shell never sees the path). A local path with a `:` before its first `/` is copied as a file name, not as a remote host. `rr log` and `rr cancel` accept only job ids such as `123`, `123_4` or `123.batch`.
+
 `get` and `put` measure first (`rsync --dry-run --stats`) and refuse anything above `--limit`, 1G by default. They are meant for logs, configs and figures, not datasets.
 
 ### `rr pull`
@@ -81,8 +83,8 @@ Code reaches the cluster only as a pushed commit. Push first (`git push`), then:
 2. On the remote it runs `git fetch origin` and checks three things. A refusal at any check exits with code 3:
    - the commit exists on `origin` (otherwise "push it first");
    - the remote checkout has no uncommitted changes;
-   - none of your active jobs was submitted from the checkout, judged by the job's working directory (`squeue %Z`). `--force` skips this check only.
-3. It runs `git merge --ff-only <commit>`, so a diverged remote fails instead of merging. If the directory holds `uv.lock`, it also runs `uv sync --frozen --check`, which checks the environment without changing it. A mismatch exits with code 3. `rr` never runs `uv sync` itself.
+   - none of your active jobs was submitted from the checkout, judged by the job's submit directory (`squeue %Z`, normalised on the remote with `realpath -m`; a directory that cannot be normalised counts as inside). A job submitted from another directory with `sbatch proj/run.sh` is not detected. `--force` skips this check only.
+3. It runs `git merge --ff-only <commit>`, so a diverged remote fails instead of merging. If the directory holds `uv.lock`, it also runs `uv sync --frozen --check`, which checks the environment without changing it. A mismatch exits with code 3 and prints what `uv` said; a remote without `uv` on `PATH` is an error (1), not a mismatch. `rr` never runs `uv sync` itself.
 
 Exit codes: 0 ok, 3 refused, any other code is the remote command's own or an `rr` error (1).
 

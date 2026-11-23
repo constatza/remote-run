@@ -1,0 +1,29 @@
+# The functional core must not reach the machine. Process, file, environment and clock access
+# belong to the adapter modules, `main`, and the config/trust file readers, which opt out with
+# `#[allow(clippy::disallowed_methods)]` on exactly the functions that do the I/O.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "start processes through ports::Exec" },
+    { path = "std::fs::read_to_string", reason = "read files at the edge (config, trust)" },
+    { path = "std::fs::read", reason = "read files at the edge (config, trust)" },
+    { path = "std::fs::write", reason = "write files at the edge (trust)" },
+    { path = "std::fs::rename", reason = "write files at the edge (trust)" },
+    { path = "std::fs::metadata", reason = "inspect files at the edge (config, trust)" },
+    { path = "std::fs::create_dir_all", reason = "create directories at the edge (trust)" },
+    { path = "std::fs::read_dir", reason = "list directories at the edge" },
+    { path = "std::fs::File::open", reason = "open files at the edge" },
+    { path = "std::path::Path::is_file", reason = "inspect files at the edge (config)" },
+    { path = "std::path::Path::exists", reason = "inspect files at the edge (config)" },
+    { path = "std::path::Path::canonicalize", reason = "resolve paths at the edge (config)" },
+    { path = "std::path::Path::try_exists", reason = "inspect files at the edge (config)" },
+    { path = "std::env::var", reason = "read the environment once, in main" },
+    { path = "std::env::var_os", reason = "read the environment once, in main" },
+    { path = "std::env::current_dir", reason = "read the working directory once, in main" },
+    { path = "std::thread::sleep", reason = "sleep through an injected clock" },
+    { path = "std::time::SystemTime::now", reason = "read the clock through an injected clock" },
+    { path = "std::time::Instant::now", reason = "read the clock through an injected clock" },
+]
+# the longest function a reviewer reads in one go
+too-many-lines-threshold = 50
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true

@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 clap = { version = "4.6.9", features = ["derive", "env"] }
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
 toml = "1.2.2"
 
 [[bin]]
@@ -15,3 +16,12 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The library is the functional core: it neither prints nor panics on a bad value. `main.rs` and
+# the adapters opt out where printing or process access is their job.
+[lints.clippy]
+print_stdout = "deny"
+print_stderr = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+too_many_lines = "deny"
