@@ -4,6 +4,7 @@
 use crate::domain::argv::Captured;
 use crate::domain::slurm::{
     Finished, JobId, JobSet, JobState, JobStatus, SACCT_SEPARATOR, SqueueId, WaitOutcome,
+    sacct_stdout,
 };
 use anyhow::{Result, bail};
 // `core`, not `std`: a Duration is a plain value; the clock itself lives in `ports`
@@ -89,7 +90,7 @@ impl Reading {
     /// job failed". An `Err` is different: the call never reached the remote (ssh is not
     /// installed, the process would not start), which no retry can cure, so it ends the wait.
     pub fn from_capture(result: Result<Captured>) -> Result<Self> {
-        let stdout = result?.into_stdout("sacct");
+        let stdout = sacct_stdout(result?);
         Ok(match stdout.and_then(|text| parse_states(&text)) {
             Ok(rows) => Reading::Statuses(rows),
             Err(err) => Reading::Unreadable(format!("{err:#}")),
@@ -527,7 +528,7 @@ mod tests {
         let Reading::Unreadable(why) = read(124, "", "") else {
             panic!("a timed-out sacct is unreadable");
         };
-        assert!(why.contains("124"), "{why}");
+        assert_eq!(why, "sacct did not answer within 60s");
         // a call that never reached the remote is an error, not a poll to retry
         let wont_start = Reading::from_capture(Err(anyhow::anyhow!("could not start ssh")));
         assert!(wont_start.is_err());

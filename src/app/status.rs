@@ -5,7 +5,7 @@ use crate::config::Session;
 use crate::domain::logpath::log_path;
 use crate::domain::outcome::Outcome;
 use crate::domain::place::script;
-use crate::domain::slurm::{Follow, JobId, status_script, tail_script};
+use crate::domain::slurm::{Follow, JobId, sacct_stdout, status_script, tail_script};
 use crate::domain::status::{LogTail, StatusReport, parse_status};
 use anyhow::{Result, bail};
 
@@ -23,7 +23,7 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     let record = ports
         .remote
         .poll(&script(&home, status_script(&args.job)))?;
-    let status = parse_status(&record.into_stdout("sacct")?)?;
+    let status = parse_status(&sacct_stdout(record)?)?;
     // a job that has not started has no log yet: that is a state of the job, not a failure
     let log = match log_path(&status.record) {
         Err(err) => LogTail::Unavailable {
@@ -80,7 +80,7 @@ mod tests {
         let outcome = run(&session(), args(), &fakes.ports()).unwrap();
         let scripts = fakes.remote.scripts();
         assert!(
-            scripts[0].starts_with(&at_home("sacct -n -X")),
+            scripts[0].starts_with(&at_home("timeout 60 sacct -n -X")),
             "{}",
             scripts[0]
         );
@@ -123,6 +123,13 @@ mod tests {
             "{err}"
         );
         assert_eq!(fakes.remote.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_status_poll_that_hit_the_sacct_limit_names_it() {
+        let fakes = Fakes::new(vec![], vec![], vec![(124, "", "")], vec![]);
+        let err = format!("{:#}", run(&session(), args(), &fakes.ports()).unwrap_err());
+        assert_eq!(err, "sacct did not answer within 60s");
     }
 
     /// Only `tail` failing to open the file is "no log"; a dead link while reading the log is not.
