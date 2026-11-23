@@ -7,7 +7,11 @@ use crate::domain::outcome::Outcome;
 use crate::domain::place::script;
 use crate::domain::slurm::{Follow, JobId, status_script, tail_script};
 use crate::domain::status::{LogTail, StatusReport, parse_status};
-use anyhow::Result;
+use anyhow::{Result, bail};
+
+/// What `tail` exits with when it cannot open the file (not there yet, or not readable): the one
+/// failure that is a state of the job, not of the connection.
+const TAIL_CANNOT_OPEN: i32 = 1;
 
 pub struct Args {
     pub job: JobId,
@@ -33,9 +37,15 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
                     path,
                     lines: shown.stdout.lines().map(String::from).collect(),
                 },
-                _ => LogTail::Unavailable {
+                TAIL_CANNOT_OPEN => LogTail::Unavailable {
                     why: shown.stderr.trim().to_string(),
                 },
+                // ssh itself failing (255) or a missing program must not look like "no log yet"
+                code => bail!(
+                    "reading the log of job {} failed ({code}): {}",
+                    status.record.id,
+                    shown.stderr.trim()
+                ),
             }
         }
     };
@@ -104,9 +114,27 @@ mod tests {
     #[test]
     fn an_unknown_job_and_a_failed_ssh_are_errors() {
         let fakes = Fakes::new(vec![], vec![], vec![(0, "", "")], vec![]);
-        assert!(run(&session(), args(), &fakes.ports()).is_err());
+        let err = run(&session(), args(), &fakes.ports()).unwrap_err();
+        assert!(!format!("{err:#}").is_empty());
         let fakes = Fakes::new(vec![], vec![], vec![(255, "", "ssh: no route")], vec![]);
-        assert!(run(&session(), args(), &fakes.ports()).is_err());
+        let err = format!("{:#}", run(&session(), args(), &fakes.ports()).unwrap_err());
+        assert!(
+            err.contains("255") && err.contains("ssh: no route"),
+            "{err}"
+        );
         assert_eq!(fakes.remote.calls.borrow().len(), 1);
+    }
+
+    /// Only `tail` failing to open the file is "no log"; a dead link while reading the log is not.
+    #[test]
+    fn a_failed_ssh_while_reading_the_log_is_an_error_not_an_unavailable_log() {
+        let tail = (255, "", "ssh: no route\n");
+        let fakes = Fakes::new(vec![], vec![], vec![(0, RECORD, ""), tail], vec![]);
+        let err = format!("{:#}", run(&session(), args(), &fakes.ports()).unwrap_err());
+        assert!(
+            err.contains("255") && err.contains("ssh: no route"),
+            "{err}"
+        );
+        assert_eq!(fakes.remote.calls.borrow().len(), 2);
     }
 }
