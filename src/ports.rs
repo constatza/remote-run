@@ -457,6 +457,9 @@ pub mod fake {
         waits: VecDeque<Option<Ended>>,
         killed: Rc<Cell<u32>>,
         kill_fails: bool,
+        /// `try_wait` fails from this call on (counted from 0), until the child is killed.
+        wait_fails_from: Option<u32>,
+        waited: u32,
     }
 
     impl FakeChild {
@@ -472,8 +475,16 @@ pub mod fake {
                 waits: waits.into(),
                 killed: Rc::clone(&killed),
                 kill_fails: false,
+                wait_fails_from: None,
+                waited: 0,
             };
             (child, killed)
+        }
+
+        /// Make `try_wait` fail from its `call`th call on (counted from 0).
+        pub fn with_failing_wait_from(mut self, call: u32) -> Self {
+            self.wait_fails_from = Some(call);
+            self
         }
 
         /// Make `kill` fail (after it has been counted), as for a child that cannot be signalled.
@@ -490,6 +501,10 @@ pub mod fake {
         fn try_wait(&mut self) -> Result<Option<Ended>> {
             if self.killed.get() > 0 {
                 return Ok(Some(Ended::Exited(KILLED_EXIT)));
+            }
+            self.waited += 1;
+            if self.wait_fails_from.is_some_and(|from| self.waited > from) {
+                anyhow::bail!("cannot poll the child");
             }
             Ok(match self.waits.len() {
                 0 => None,

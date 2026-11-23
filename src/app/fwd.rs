@@ -3,7 +3,7 @@
 //! the forward at its deadline, and an interrupt or the death of `rr` ends ssh.
 
 use super::Ports;
-use super::tunnel::{End, ListeningForward, NotStopped, Started, StartingForward};
+use super::tunnel::{End, ListeningForward, SshEnded, Started, StartingForward};
 use crate::config::Session;
 use crate::domain::exit::RemoteExit;
 use crate::domain::fwd::{
@@ -12,7 +12,7 @@ use crate::domain::fwd::{
 use crate::domain::fwd::{Transport, Ttl, Wanted};
 use crate::domain::outcome::Outcome;
 use crate::ports::{Deadline, Net};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 pub struct Args {
     pub wanted: Wanted,
@@ -48,7 +48,7 @@ pub fn run(session: &Session, args: Args, ports: &Ports, machine: &Machine) -> R
                 }
             }
             SshAfter::MayRun => ports.notes.note(&format!(
-                "rr: ssh could not be stopped, so {} is left in place",
+                "rr: ssh may still be running, so {} is left in place",
                 path.as_str()
             )),
         }
@@ -66,8 +66,10 @@ enum SshAfter {
 
 fn ssh_after(served: &Result<Outcome>) -> SshAfter {
     match served {
-        Err(err) if err.downcast_ref::<NotStopped>().is_some() => SshAfter::MayRun,
-        Ok(_) | Err(_) => SshAfter::Gone,
+        Ok(_) => SshAfter::Gone,
+        Err(err) if err.downcast_ref::<SshEnded>().is_some() => SshAfter::Gone,
+        // an error that does not prove ssh gone keeps the file
+        Err(_) => SshAfter::MayRun,
     }
 }
 
@@ -102,7 +104,9 @@ fn closed(end: End, ports: &Ports) -> Result<Outcome> {
             ports.notes.note("rr: interrupted, forward closed");
             Ok(Outcome::Forwarded(Closed::Interrupted))
         }
-        End::Exited(0) => bail!("ssh ended by itself before the time to live: the forward is gone"),
+        End::Exited(0) => Err(SshEnded::error(
+            "ssh ended by itself before the time to live: the forward is gone",
+        )),
         End::Exited(code) => {
             ports
                 .notes
@@ -446,26 +450,68 @@ mod tests {
     }
 
     /// ssh that could not be stopped may still own its socket: the file stays, and the user is
-    /// told. Both places a stop can fail are covered: a failed start and the end of the ttl.
+    /// told. Every place a stop can fail is covered, and where the child could be stopped the
+    /// same run removes the file.
     #[test]
-    fn a_socket_file_stays_when_ssh_could_not_be_stopped() {
-        let stuck = |waits: Vec<Option<i32>>, accepts: Vec<bool>| {
-            let (child, killed) = FakeChild::new(waits);
+    fn a_socket_file_stays_unless_ssh_is_known_to_be_stopped() {
+        let cases = vec![
+            ("never listened", FakeChild::new(vec![None]), vec![false]),
+            ("ttl reached", FakeChild::new(vec![None]), vec![true]),
+            (
+                "interrupted before listening",
+                FakeChild::scripted(vec![Some(Ended::Interrupted)]),
+                vec![false],
+            ),
+            (
+                "interrupted while held",
+                FakeChild::scripted(vec![None, None, None, Some(Ended::Interrupted)]),
+                vec![true],
+            ),
+            (
+                "poll fails while held",
+                {
+                    let (child, killed) = FakeChild::new(vec![None]);
+                    (child.with_failing_wait_from(2), killed)
+                },
+                vec![true],
+            ),
+        ];
+        for (what, (child, killed), accepts) in cases {
             let w = world_of(child.with_failing_kill(), killed, accepts);
             let err = go(&w, &session(), socket_args(), Some(RUNTIME)).unwrap_err();
             assert!(
                 format!("{err:#}").contains("could not be stopped"),
-                "{err:#}"
+                "{what}: {err:#}"
             );
-            assert!(removed(&w).is_empty(), "the socket may be ssh's still");
+            assert!(removed(&w).is_empty(), "{what}: the socket may be ssh's");
             assert!(
                 notes(&w).pop().unwrap().contains("left in place"),
-                "{:?}",
+                "{what}: {:?}",
                 notes(&w)
             );
-        };
-        stuck(vec![None], vec![false]); // never listened
-        stuck(vec![None], vec![true]); // ttl reached
+        }
+    }
+
+    /// The same ends with a kill that works: ssh is gone, so the file goes.
+    #[test]
+    fn a_socket_file_goes_when_an_interrupt_or_a_failed_poll_ended_ssh() {
+        let (child, killed) = FakeChild::scripted(vec![None, None, None, Some(Ended::Interrupted)]);
+        let w = world_of(child, killed, vec![true]);
+        go(&w, &session(), socket_args(), Some(RUNTIME)).unwrap();
+        assert_eq!(removed(&w), [SOCKET]);
+        assert_eq!(w.killed.get(), 1, "an interrupt ends ssh explicitly");
+        let (child, killed) = FakeChild::new(vec![None]);
+        let w = world_of(child.with_failing_wait_from(2), killed, vec![true]);
+        assert!(go(&w, &session(), socket_args(), Some(RUNTIME)).is_err());
+        assert_eq!(removed(&w), [SOCKET]);
+        assert_eq!(w.killed.get(), 1);
+    }
+
+    /// An error that does not say whether ssh was reaped must not take the socket away.
+    #[test]
+    fn an_error_of_unknown_cause_keeps_the_socket() {
+        let unknown: Result<Outcome> = Err(anyhow::anyhow!("something else"));
+        assert!(matches!(ssh_after(&unknown), SshAfter::MayRun));
     }
 
     #[test]
