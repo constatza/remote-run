@@ -1,6 +1,6 @@
 # Snapshot step 0: probe results
 
-Phase D (snapshots) rests on three assumptions about a shared environment (`docs/plan.md`, Phase D, "Gate first"). This file records each probe with its date and versions. No snapshot code is written before all three pass on the real host.
+Phase D (snapshots) rests on three assumptions about a shared environment (a gate that had to pass before any snapshot code was written). This file records each probe with its date and versions. No snapshot code is written before all three pass on the real host.
 
 ## Workstation, 2026-11-23 (uv 0.13.9, Python 3.14.10, Linux)
 
