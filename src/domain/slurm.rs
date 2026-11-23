@@ -180,9 +180,34 @@ pub fn tail_script(path: &str, lines: u32, follow: Follow) -> Script {
         .word(quote(path))
 }
 
-/// Every active job as `<id> <submit directory>` lines, for the pull guard.
+/// The job states that count as active for the pull guard and `rr gc`: a job in one of them can
+/// still read the directory it was submitted from. A completed state is left out on purpose, so a
+/// job that just finished does not hold back a pull. Spelled out because `squeue` without `-t`
+/// lists only pending and running jobs, and an exported `SQUEUE_STATES` would change that.
+pub const ACTIVE_JOB_STATES: &str = "PENDING,RUNNING,SUSPENDED,STOPPED,COMPLETING,CONFIGURING,REQUEUED,RESIZING,SIGNALING,STAGE_OUT,SPECIAL_EXIT";
+
+/// `squeue` reads these variables as defaults for its filters, so a login shell that exports one
+/// would hide jobs from the guard. They are removed for this one call.
+const SQUEUE_FILTER_ENV: [&str; 6] = [
+    "SQUEUE_STATES",
+    "SQUEUE_PARTITION",
+    "SQUEUE_ACCOUNT",
+    "SQUEUE_QOS",
+    "SQUEUE_NAMES",
+    "SLURM_CLUSTERS",
+];
+
+/// Every active job as `<id> <submit directory>` lines, for the pull guard and `rr gc`, whatever
+/// filters the remote login environment sets.
 pub fn job_workdirs_command() -> Script {
-    lit("squeue --me -h -o ").word(quote(JOB_WORKDIR_FORMAT))
+    let unset = SQUEUE_FILTER_ENV
+        .into_iter()
+        .fold(lit("env"), |script, name| script.lit(" -u ").lit(name));
+    unset
+        .lit(" squeue --me -h -t ")
+        .lit(ACTIVE_JOB_STATES)
+        .lit(" -o ")
+        .word(quote(JOB_WORKDIR_FORMAT))
 }
 
 /// The `sacct` fields [`parse_states`](crate::domain::wait::parse_states) reads, in this order.
@@ -571,11 +596,18 @@ mod tests {
     }
 
     #[test]
-    fn the_pull_guard_reads_the_same_squeue_it_always_did() {
+    fn the_job_query_ignores_squeue_filters_in_the_environment_and_names_the_active_states() {
         assert_eq!(
             job_workdirs_command().to_string(),
-            "squeue --me -h -o '%i %Z'"
+            format!(
+                "env -u SQUEUE_STATES -u SQUEUE_PARTITION -u SQUEUE_ACCOUNT -u SQUEUE_QOS \
+                 -u SQUEUE_NAMES -u SLURM_CLUSTERS squeue --me -h -t {ACTIVE_JOB_STATES} \
+                 -o '%i %Z'"
+            )
         );
+        for done in ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"] {
+            assert!(!ACTIVE_JOB_STATES.contains(done), "{done} must not block");
+        }
     }
 
     #[test]

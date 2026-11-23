@@ -260,6 +260,7 @@ pub fn gc_script(age: Age, keep: Keep) -> Script {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::slurm::job_workdirs_command;
 
     fn script(age: &str, keep: u32) -> String {
         gc_script(
@@ -290,7 +291,7 @@ mod tests {
     #[test]
     fn the_queue_is_the_pull_guards_loop_and_it_is_read_twice() {
         let text = script("2h", 0);
-        let squeue = "squeue --me -h -o '%i %Z'";
+        let squeue = &job_workdirs_command().to_string();
         assert_eq!(text.matches(squeue).count(), 1, "one function reads it");
         assert!(text.contains("realpath -m -- \"${line#* }\""), "{text}");
         assert_eq!(

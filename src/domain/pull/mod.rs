@@ -158,6 +158,7 @@ pub fn next(outcome: &PullOutcome) -> Next {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::slurm::job_workdirs_command;
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -460,7 +461,8 @@ mod tests {
         let permit = Permit::between(commit(A), commit(B), JobPolicy::Respect);
         let merge = apply_script(&permit).to_string();
         let state = state_script(&Target::OriginHead).to_string();
-        for piece in ["squeue --me -h -o '%i %Z' | while", "realpath -m -- "] {
+        let query = format!("{} | while", job_workdirs_command());
+        for piece in [query.as_str(), "realpath -m -- "] {
             assert!(merge.contains(piece), "{merge}");
             assert!(state.contains(piece), "{state}");
         }

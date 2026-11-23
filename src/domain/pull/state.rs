@@ -433,7 +433,8 @@ mod tests {
     fn the_state_script_uses_printf_only_and_one_squeue() {
         let text = state_script(&Target::OriginHead).to_string();
         assert!(text.contains("git fetch -q --prune origin"), "{text}");
-        assert!(text.contains("squeue --me -h -o '%i %Z' | while"), "{text}");
+        let query = format!("{} | while", job_workdirs_command());
+        assert!(text.contains(&query), "{text}");
         assert!(text.contains("realpath -m -- "), "{text}");
         assert!(
             text.contains(r#"git branch -r --contains "$target" --list 'origin/*'"#),
