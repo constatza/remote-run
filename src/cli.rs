@@ -12,7 +12,7 @@ use remote_run::trust::TrustAction;
 #[command(
     name = "rr",
     version,
-    about = "Run, submit, watch and copy on a remote Slurm cluster over ssh."
+    about = "Run commands, update a checkout and copy files on a remote Slurm cluster over ssh."
 )]
 pub struct Cli {
     /// ssh host or alias from ~/.ssh/config
@@ -164,6 +164,19 @@ fn parse_trust(text: &str) -> Result<TrustAction, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tagline names only what is built: `submit` and `watch` are not commands yet.
+    #[test]
+    fn the_tagline_promises_no_unbuilt_command() {
+        use clap::CommandFactory;
+        let about = Cli::command().get_about().map(|text| text.to_string());
+        let about = about.unwrap_or_default().to_lowercase();
+        assert!(!about.is_empty());
+        assert!(
+            !about.contains("submit") && !about.contains("watch"),
+            "{about}"
+        );
+    }
 
     fn refused(args: &[&str]) -> bool {
         let argv = ["rr", "--host", "h"]

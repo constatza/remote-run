@@ -25,9 +25,9 @@ Commits `91c06e7` to `8a09db1`. The final tree passes `cargo fmt --check`, `carg
 | R architecture refactor (R1-R10) | done | none; `Clock` exists but nothing uses it yet |
 | A1 option injection | done | none |
 | A2 untrusted project file | done | owner and mode checks were dropped on purpose (the digest pin covers them); stopping the `.rr.toml` search at `$HOME` is optional |
-| A3 terminal text | partly | `sanitize` and `error_line` cover every message `main` prints. `q`, `acct` and `log` still inherit stdio, so remote bytes bypass `rr`: add a line-wise `stream_filtered` |
+| A3 terminal text | done | `q`, `acct` and `log` stream through `stream_filtered` (line-wise `sanitize`, 64 KiB line cap, CRLF kept as a newline); `x` and `run` stay raw. Needs a check on the real host: output of `rr log -f` over `ssh -t` |
 | A4 job ids | done | `--wait` stdout parsing comes with Phase B |
-| A5 README and `about` wording | not done | `cli.rs` and `lib.rs` still say "submit, watch" |
+| A5 README and `about` wording | done | reword again when `submit` / `watch` exist (Phase B) |
 | A6 pull guards | partly | done: fail-closed state parsing, `realpath -m` workdirs, an unresolvable workdir blocks, uv missing is exit 127 and a mismatch is 75. Not done: re-assert `HEAD` and a clean tree inside the merge script, `git branch -r --contains <sha>`, the POSIX-login-shell note |
 | B `wait`, `--json`, `status` | not started | all |
 | C `fwd` | not started | all |

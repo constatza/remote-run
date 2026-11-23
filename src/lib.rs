@@ -1,4 +1,4 @@
-//! `rr`: run, submit, watch and copy on a remote Slurm cluster over the system `ssh`.
+//! `rr`: run commands, fast-forward a checkout and copy files on a remote Slurm cluster over the system `ssh`.
 //!
 //! Dependencies point inward only:
 //!
