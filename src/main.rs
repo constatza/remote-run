@@ -21,7 +21,7 @@ use remote_run::domain::slurm::JobSet;
 use remote_run::ports::{Echo, Notes, Payload};
 use remote_run::trust;
 use std::cell::RefCell;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -274,23 +274,12 @@ fn x(session: &Session, program: XProgram, ports: &Ports) -> Result<Outcome> {
     }
 }
 
-/// The script's bytes, at most [`app::exec::SCRIPT_LIMIT`].
+/// The script's bytes. Whatever size the file has, it is the user's choice to send it.
 fn read_script(path: &Path) -> Result<Payload> {
-    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.take(app::exec::SCRIPT_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     // an empty file is a wrong path or a failed export, and the interpreter would exit 0 on it
     if bytes.is_empty() {
         bail!("{} is empty", path.display());
-    }
-    if bytes.len() as u64 > app::exec::SCRIPT_LIMIT {
-        bail!(
-            "{} is larger than {} bytes",
-            path.display(),
-            app::exec::SCRIPT_LIMIT
-        );
     }
     Ok(Payload::new(bytes))
 }

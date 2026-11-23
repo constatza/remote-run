@@ -15,10 +15,6 @@ pub struct Args {
     pub cmd: Vec<String>,
 }
 
-/// The largest script `rr x -s` sends: a script is read whole, so a device or a dataset named by
-/// mistake must not fill memory.
-pub const SCRIPT_LIMIT: u64 = 1 << 20;
-
 /// A script and the interpreter that reads it from stdin.
 pub struct ScriptArgs {
     pub interp: Interpreter,

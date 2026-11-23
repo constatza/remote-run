@@ -37,9 +37,8 @@ pub enum Stdin {
     Inherit,
 }
 
-/// Bytes a child reads on standard input to their end (a script, an archive). The callers bound
-/// their size (`rr x -s` reads at most `SCRIPT_LIMIT`); the type only says "this is data for stdin"
-/// where a call takes one.
+/// Bytes a child reads on standard input to their end (a script, an archive): the type says "this
+/// is data for stdin" where a call takes one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Payload(Vec<u8>);
 
