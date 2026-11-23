@@ -363,6 +363,52 @@ pub mod fake {
     }
 
     #[test]
+    fn a_bidi_override_split_by_the_line_cap_does_not_survive() {
+        let mut raw = vec![b'a'; MAX_LINE_BYTES as usize - 1];
+        raw.extend_from_slice("\u{202E}b\n".as_bytes());
+        let shown = sanitized(&raw);
+        assert!(!shown.contains('\u{202E}'));
+        assert!(shown.ends_with("\u{FFFD}\u{FFFD}\u{FFFD}b\n"), "{shown:?}");
+    }
+
+    /// Records the size of every `write_all` and counts the flushes.
+    #[derive(Default)]
+    struct Counting {
+        writes: Vec<usize>,
+        flushes: usize,
+    }
+    impl Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.push(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn every_write_is_bounded_and_each_line_is_flushed_once() {
+        // a bad byte grows to the three bytes of U+FFFD, so a piece may be 3 times the cap
+        let widest = 3 * MAX_LINE_BYTES as usize;
+        let mut raw = b"one\ntwo\r\n".to_vec();
+        raw.extend(vec![0xff; 2 * MAX_LINE_BYTES as usize + 1]);
+        raw.extend_from_slice(b"\nlast");
+        let mut counting = Counting::default();
+        write_sanitized(raw.as_slice(), &mut counting).unwrap();
+        // one piece per line, three pieces for the long run of bad bytes (the last holds the
+        // single byte left over and the newline), and the unterminated tail
+        assert_eq!(counting.writes.len(), 2 + 3 + 1);
+        assert!(
+            counting.writes.iter().all(|&n| n <= widest),
+            "{:?}",
+            counting.writes
+        );
+        assert_eq!(counting.flushes, counting.writes.len());
+    }
+
+    #[test]
     fn a_fake_clock_moves_only_by_sleeping_and_by_exactly_that_long() {
         let clock = fake::FakeClock::default();
         let start = clock.now();
