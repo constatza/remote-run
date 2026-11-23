@@ -21,6 +21,9 @@ pub enum Reason {
     NotOnOrigin(Target),
     RemoteDirty(Vec<String>),
     JobsFromCheckout(Vec<SqueueId>),
+    /// The remote checkout moved or became dirty between reading it and merging: the merge script
+    /// found `HEAD` or the tree different from what [`decide`] judged, and did not merge.
+    StateChanged,
 }
 
 impl fmt::Display for Reason {
@@ -44,6 +47,10 @@ impl fmt::Display for Reason {
                     ids.join(", ")
                 )
             }
+            Reason::StateChanged => f.write_str(
+                "the remote checkout changed while rr was working (a commit or an edit landed); \
+                 nothing was merged, run the command again",
+            ),
         }
     }
 }

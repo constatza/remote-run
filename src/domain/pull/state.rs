@@ -50,7 +50,9 @@ pub struct RemoteState {
     /// `pwd -P` of the checkout.
     pub dir: String,
     pub head: Commit,
-    /// The target resolved after `git fetch origin`; `None` when origin does not have it.
+    /// The target resolved after `git fetch origin` and found in at least one `origin/*` branch
+    /// (`git branch -r --contains`); `None` when origin does not have it. An object that is in
+    /// the store but on no origin branch (an old fetch, a force-pushed branch) is `None` too.
     pub target: Option<Commit>,
     /// `git status --porcelain` lines.
     pub dirty: Vec<String>,
@@ -100,17 +102,29 @@ fn jobs_script() -> Script {
         .lit(" ;;\n  esac\ndone")
 }
 
+/// The `origin/*` branches that contain the resolved `$target`, one `onorigin` field each; prints
+/// nothing when there is no target. A `git` that fails here fails the script (`pipefail`), so an
+/// unreadable answer is an error and never an empty one.
+fn origin_branches_script() -> Script {
+    let branches = lit(r#"git branch -r --contains "$target" --list 'origin/*'"#);
+    lit(r#"if [ -n "$target" ]; then "#)
+        .then(each_line(branches, "onorigin"))
+        .lit("; fi")
+}
+
 /// The script that prints the remote state, one prefixed field per line.
 pub fn state_script(target: &Target) -> Script {
     let revision = quote(&format!("{}^{{commit}}", target.revision()));
-    let resolved = lit(r#""$(git rev-parse -q --verify "#)
+    let resolved = lit(r#"target="$(git rev-parse -q --verify "#)
         .word(revision)
         .lit(r#" || true)""#);
     Script::lines([
         field("dir", lit(r#""$(pwd -P)""#)),
         field("head", lit(r#""$(git rev-parse HEAD)""#)),
         lit("git fetch -q origin"),
-        field("target", resolved),
+        resolved,
+        field("target", lit(r#""$target""#)),
+        origin_branches_script(),
         each_line(lit("git status --porcelain"), "dirty"),
         jobs_script(),
     ])
@@ -119,7 +133,7 @@ pub fn state_script(target: &Target) -> Script {
 /// Parse the output of [`state_script`] (pure).
 pub fn parse_state(text: &str) -> Result<RemoteState> {
     let (mut dir, mut head, mut target) = (None, None, None);
-    let (mut dirty, mut jobs) = (Vec::new(), Vec::new());
+    let (mut dirty, mut jobs, mut branches) = (Vec::new(), Vec::new(), Vec::new());
     for line in text.lines() {
         let Some(fields) = state_fields(line) else {
             continue;
@@ -132,6 +146,7 @@ pub fn parse_state(text: &str) -> Result<RemoteState> {
             "head" => set_once(&mut head, key, Commit::parse(value)?)?,
             "target" => set_once(&mut target, key, parse_target(value)?)?,
             "dirty" => dirty.push(value.to_string()),
+            "onorigin" => branches.push(parse_origin_branch(value)?),
             "job" => jobs.push(parse_job(value)?),
             "jobunresolved" => jobs.push(Job {
                 id: SqueueId::parse(value)?,
@@ -144,7 +159,7 @@ pub fn parse_state(text: &str) -> Result<RemoteState> {
         (Some(dir), Some(head), Some(target)) => Ok(RemoteState {
             dir,
             head,
-            target,
+            target: confirm_on_origin(target, &branches)?,
             dirty,
             jobs,
         }),
@@ -167,6 +182,26 @@ fn set_once<T>(slot: &mut Option<T>, key: &str, value: T) -> Result<()> {
         bail!("the remote state names {key:?} twice");
     }
     Ok(())
+}
+
+/// One line of `git branch -r --contains`: a branch under `origin/`, with the padding git adds.
+/// Anything else is not an answer to the question asked.
+fn parse_origin_branch(value: &str) -> Result<String> {
+    let branch = value.trim();
+    if !branch.starts_with("origin/") {
+        bail!("unexpected branch in the remote state: {value:?}");
+    }
+    Ok(branch.to_string())
+}
+
+/// Keep the resolved target only when an origin branch contains it. Branches named for a target
+/// that did not resolve contradict each other, so that is an error rather than a guess.
+fn confirm_on_origin(target: Option<Commit>, branches: &[String]) -> Result<Option<Commit>> {
+    match (target, branches.is_empty()) {
+        (Some(commit), false) => Ok(Some(commit)),
+        (Some(_), true) | (None, true) => Ok(None),
+        (None, false) => bail!("the remote state lists origin branches for a target it lacks"),
+    }
 }
 
 fn parse_target(value: &str) -> Result<Option<Commit>> {
@@ -198,8 +233,10 @@ mod tests {
     }
 
     fn report(lines: &[&str]) -> String {
-        let mut text =
-            format!("rr-state\tdir\t/work/u/proj\nrr-state\thead\t{A}\nrr-state\ttarget\t{B}\n");
+        let mut text = format!(
+            "rr-state\tdir\t/work/u/proj\nrr-state\thead\t{A}\nrr-state\ttarget\t{B}\n\
+             rr-state\tonorigin\t  origin/HEAD -> origin/main\nrr-state\tonorigin\t  origin/main\n"
+        );
         for line in lines {
             text.push_str(line);
             text.push('\n');
@@ -229,6 +266,35 @@ mod tests {
         let missing = format!("rr-state\tdir\t/d\nrr-state\thead\t{A}\nrr-state\ttarget\t\n");
         assert_eq!(parse_state(&missing).unwrap().target, None);
         assert!(parse_state("rr-state\tdir\t/x\n").is_err());
+    }
+
+    #[test]
+    fn a_target_no_origin_branch_contains_is_not_on_origin() {
+        let none = format!("rr-state\tdir\t/d\nrr-state\thead\t{A}\nrr-state\ttarget\t{B}\n");
+        assert_eq!(parse_state(&none).unwrap().target, None);
+        assert_eq!(parse_state(&report(&[])).unwrap().target, Some(commit(B)));
+    }
+
+    #[test]
+    fn an_unreadable_or_contradictory_branch_answer_is_an_error() {
+        for bad in [
+            "rr-state\tonorigin\t",
+            "rr-state\tonorigin\t   ",
+            "rr-state\tonorigin\tfeature",
+            "rr-state\tonorigin\tupstream/main",
+            "rr-state\tonorigin\tfatal: bad object",
+        ] {
+            assert!(parse_state(&report(&[bad])).is_err(), "{bad:?}");
+        }
+        let no_target = format!(
+            "rr-state\tdir\t/d\nrr-state\thead\t{A}\nrr-state\ttarget\t\n\
+             rr-state\tonorigin\torigin/main\n"
+        );
+        let err = parse_state(&no_target).unwrap_err().to_string();
+        assert!(
+            err.contains("origin branches for a target it lacks"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -315,6 +381,10 @@ mod tests {
         assert!(text.contains("squeue --me -h -o '%i %Z' | while"), "{text}");
         assert!(text.contains("realpath -m -- "), "{text}");
         assert!(
+            text.contains(r#"git branch -r --contains "$target" --list 'origin/*'"#),
+            "{text}"
+        );
+        assert!(
             !text.contains("sed"),
             "BSD and busybox sed print a literal t for \\t: {text}"
         );
@@ -332,18 +402,28 @@ mod shell_tests {
 
     use super::*;
     use crate::adapters::OsExec;
+    use crate::domain::argv::Captured;
     use crate::ports::{Argv, Exec, Stdin};
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::Path;
 
-    const GIT: &str = r#"#!/bin/sh
+    /// A stand-in `git` with a head, a resolvable target and a dirty tree; `branch_body` is what
+    /// `git branch` does.
+    fn git_stub(branch_body: &str) -> String {
+        format!(
+            r#"#!/bin/sh
 case "$1 $2" in
   "rev-parse HEAD") echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
   "rev-parse -q") echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
   "status --porcelain") printf ' M a b.py\n?? x\ty\n' ;;
+  "branch -r") {branch_body} ;;
 esac
-"#;
+"#
+        )
+    }
+
+    const ON_MAIN: &str = r"printf '  origin/HEAD -> origin/main\n  origin/main\n'";
 
     fn install(dir: &Path, name: &str, body: &str) {
         let path = dir.join(name);
@@ -353,7 +433,14 @@ esac
 
     /// The state report of the checkout `cwd`, with `squeue` printing `queue`.
     fn run_state_script(stubs: &Path, cwd: &Path, queue: &str) -> String {
-        install(stubs, "git", GIT);
+        let out = run_with_git(stubs, cwd, queue, ON_MAIN);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        out.stdout
+    }
+
+    /// The script's whole result when `git branch` runs `branch_body`.
+    fn run_with_git(stubs: &Path, cwd: &Path, queue: &str, branch_body: &str) -> Captured {
+        install(stubs, "git", &git_stub(branch_body));
         install(
             stubs,
             "squeue",
@@ -372,9 +459,7 @@ esac
             &format!("set -euo pipefail\n{body}"),
         ];
         let env = Argv::new("env", args.map(String::from).to_vec());
-        let out = OsExec.capture(&env, Stdin::Null).unwrap();
-        assert_eq!(out.code, 0, "{}", out.stderr);
-        out.stdout
+        OsExec.capture(&env, Stdin::Null).unwrap()
     }
 
     #[test]
@@ -412,6 +497,35 @@ esac
             .map(|job| job.id.as_str())
             .collect();
         assert_eq!(blocked, ["7", "8", "10"]);
+    }
+
+    /// What `git branch -r --contains` prints decides whether the target counts as on origin.
+    #[test]
+    fn the_target_is_on_origin_only_when_a_branch_contains_it() {
+        let root = tempfile::tempdir().unwrap();
+        let stubs = tempfile::tempdir().unwrap();
+        let on = run_with_git(stubs.path(), root.path(), "5 /else", ON_MAIN);
+        assert_eq!(on.code, 0, "{}", on.stderr);
+        assert!(on.stdout.contains("rr-state\tonorigin\t  origin/main\n"));
+        assert_eq!(
+            parse_state(&on.stdout).unwrap().target,
+            Some(Commit::parse(&"b".repeat(40)).unwrap())
+        );
+        let off = run_with_git(stubs.path(), root.path(), "5 /else", "true");
+        assert_eq!(off.code, 0, "{}", off.stderr);
+        assert!(!off.stdout.contains("onorigin"), "{}", off.stdout);
+        assert_eq!(parse_state(&off.stdout).unwrap().target, None);
+    }
+
+    /// `git branch` failing is neither "no branch" nor a branch: the script fails, and `sync`
+    /// turns a failed state call into an error.
+    #[test]
+    fn a_failing_branch_query_fails_the_script() {
+        let root = tempfile::tempdir().unwrap();
+        let stubs = tempfile::tempdir().unwrap();
+        let failing = "echo 'fatal: bad' >&2; exit 129";
+        let out = run_with_git(stubs.path(), root.path(), "5 /else", failing);
+        assert_ne!(out.code, 0, "{}", out.stdout);
     }
 
     #[test]

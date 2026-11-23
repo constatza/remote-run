@@ -44,7 +44,10 @@ mod tests {
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn state(head: &str, target: &str, extra: &str) -> String {
-        format!("rr-state\tdir\t/d\nrr-state\thead\t{head}\nrr-state\ttarget\t{target}\n{extra}")
+        format!(
+            "rr-state\tdir\t/d\nrr-state\thead\t{head}\nrr-state\ttarget\t{target}\n\
+             rr-state\tonorigin\t  origin/main\n{extra}"
+        )
     }
 
     /// A clean local repository at `B`, and a remote that answers `captures`.

@@ -231,6 +231,17 @@ mod tests {
     }
 
     #[test]
+    fn a_checkout_that_changed_mid_pull_is_a_refusal_with_its_reason() {
+        let changed = pulled(PullOutcome::Refused(Reason::StateChanged));
+        assert_eq!(changed.exit, Exit::Rr(RrCode::Refused));
+        assert!(
+            changed
+                .stderr
+                .starts_with("rr: refused: the remote checkout changed")
+        );
+    }
+
+    #[test]
     fn a_stale_report_without_uv_output_is_one_line() {
         let stale = pulled(PullOutcome::Stale {
             stderr: String::new(),
