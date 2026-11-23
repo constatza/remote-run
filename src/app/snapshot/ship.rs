@@ -189,6 +189,44 @@ mod tests {
         assert!(fakes.exec.calls.borrow().is_empty(), "no archive was built");
     }
 
+    /// The probe never uploads, so `published` from it is a broken script, not an answer to act on;
+    /// likewise an upload that ends `absent` published nothing.
+    #[test]
+    fn an_answer_a_script_cannot_give_is_an_error_and_never_shipped() {
+        let probe = fakes(vec![(0, "rr-snapshot published\n", "")], vec![]);
+        let err = ship_it(&probe, 2).unwrap_err().to_string();
+        assert!(err.contains("cannot"), "{err}");
+        assert_eq!(hows(&probe), [RemoteCall::Capture], "nothing was uploaded");
+        let upload = fakes(
+            vec![
+                (0, "rr-snapshot absent\n", ""),
+                (0, "rr-snapshot absent\n", ""),
+            ],
+            vec![(0, tar(), "")],
+        );
+        let err = ship_it(&upload, 2).unwrap_err().to_string();
+        assert!(err.contains("without publishing"), "{err}");
+    }
+
+    /// Another upload won between the probe and this one: the tree is there, the archive was sent
+    /// for nothing, and the answer is the same as for a tree that was there at the probe.
+    #[test]
+    fn losing_an_upload_race_is_a_tree_that_was_already_there() {
+        let fakes = fakes(
+            vec![
+                (0, "rr-snapshot absent\n", ""),
+                (0, "rr-snapshot present\n", ""),
+            ],
+            vec![(0, tar(), "")],
+        );
+        let Shipment::Shipped { snapshot, delivery } = ship_it(&fakes, 2).unwrap() else {
+            panic!("refused");
+        };
+        assert_eq!(snapshot.id().as_str(), TREE);
+        assert_eq!(delivery, Delivery::AlreadyThere);
+        assert_eq!(hows(&fakes), [RemoteCall::Capture, RemoteCall::Upload]);
+    }
+
     #[test]
     fn a_remote_directory_that_is_not_ours_is_a_refusal_at_the_probe_or_the_upload() {
         let probe = fakes(

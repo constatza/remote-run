@@ -688,6 +688,50 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_tells_the_user_what_to_do() {
+        let link = UnsafeLink {
+            path: "a".into(),
+            target: "/etc".into(),
+        };
+        let cases = [
+            (
+                Refusal::Dirty,
+                "the working tree differs from HEAD and --require-clean is set; commit or stash",
+            ),
+            (
+                Refusal::TooLarge { total: 9, limit: 5 },
+                "9 bytes in the snapshot, over the limit of 5 (--snapshot-limit)",
+            ),
+            (
+                Refusal::LfsPointers(vec!["m.bin".into()]),
+                "git-lfs pointer files stand for content the archive does not hold (m.bin); \
+                 --allow-submodules ships the pointers",
+            ),
+            (
+                Refusal::UnsafeSymlinks(vec![link]),
+                "symlinks that point out of the tree (an absolute target or `..`): a -> /etc",
+            ),
+            (
+                Refusal::ArchiveMismatch {
+                    expected: 3,
+                    found: 2,
+                },
+                "git archive holds 2 files but the tree has 3 (export-ignore in .gitattributes?)",
+            ),
+            (
+                Refusal::RemoteNotPrivate {
+                    stderr: "rr: x is not a private directory of yours\n".into(),
+                },
+                "the snapshot directory on the remote host is not a private directory of yours: \
+                 rr: x is not a private directory of yours",
+            ),
+        ];
+        for (refusal, text) in cases {
+            assert_eq!(refusal.to_string(), text);
+        }
+    }
+
+    #[test]
     fn the_dirty_flag_serializes_as_a_json_bool() {
         let json = |c: Cleanliness| serde_json::to_string(&c).unwrap();
         assert_eq!(json(Cleanliness::Dirty), "true");
