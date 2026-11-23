@@ -1,6 +1,6 @@
 # remote-run (`rr`)
 
-Work on a remote Slurm cluster from your own machine: run commands in a remote project, look at the queue and job logs, wait for jobs to end, fast-forward the remote checkout, and copy small files. Everything goes through your system `ssh`, so `~/.ssh/config` (aliases, `User`, `IdentityFile`, `ProxyJump`), ssh-agent and `known_hosts` apply as they do for `ssh <host>`.
+Work on a remote Slurm cluster from your own machine: run commands and named recipes in a remote project, send a local script to a remote interpreter, look at the queue, job history and logs, wait for jobs to end, fast-forward the remote checkout, forward a port, and copy small files. Everything goes through your system `ssh`, so `~/.ssh/config` (aliases, `User`, `IdentityFile`, `ProxyJump`), ssh-agent and `known_hosts` apply as they do for `ssh <host>`.
 
 `rr` adds three checks that a plain alias leaves out:
 
@@ -21,7 +21,7 @@ cargo install --git https://github.com/constatza/remote-run
 
 ## Configure
 
-`rr` reads three settings. Each one is taken from the first source that sets it, in this order: the flag, the environment variable, the nearest `.rr.toml` found by walking up from the current directory, the user file.
+`rr` reads three settings and two kinds of named tables. A setting is taken from the first source that sets it, in this order: the flag, the environment variable, the nearest `.rr.toml` found by walking up from the current directory, the user file. The tables, `[forward.<name>]` (see `rr fwd`) and `[recipe.<name>]` (see Recipes), come from the two files only and merge by name; a name in `.rr.toml` replaces the same name in the user file.
 
 | Setting | Flag | Variable | Meaning |
 |---|---|---|---|
@@ -44,7 +44,7 @@ Put the remote directory of a project in `.rr.toml` at the project root. The fil
 dir = "projects/myproject"
 ```
 
-Unknown keys are refused. `rr` sees the remote side as a non-interactive ssh shell, which usually does not read your interactive rc files. That is why `env` exists.
+`rr trust` shows the file's path, SHA-256 and content; `rr trust --yes` records that SHA-256 as reviewed. Unknown keys are refused. `rr` sees the remote side as a non-interactive ssh shell, which usually does not read your interactive rc files. That is why `env` exists.
 
 ### Faster repeated calls (optional)
 
@@ -70,11 +70,14 @@ rr x [-t] -- <cmd>...         # run a command in the remote project (-t: allocat
 rr x -s <file> --interp "python -"   # send a local script on stdin to the interpreter, run in your remote home (no -t)
 rr do <recipe> [--set slot=value]... [-t] [--force] [-- <more words>]   # run a recipe from the config
 rr pull [--force]             # fast-forward the remote checkout to your local HEAD
-rr run [-t] [--force] [--wait] -- <cmd>...   # pull, then run; --wait then waits for the jobs it submitted
-rr get <remote> [local]       # rsync from the remote; relative paths are inside the project
-rr put <local> [remote]       # rsync to the remote (default: the project directory); never deletes
+rr run [-t] [--force] [--wait [--timeout S] [--poll S]] -- <cmd>...   # pull, then run; --wait then waits for the jobs it submitted
+rr get <remote> [local] [--limit 1G]   # rsync from the remote; relative paths are inside the project
+rr put <local> [remote] [--limit 1G]   # rsync to the remote (default: the project directory); never deletes
 rr fwd <host:port|name> [--open] [--socket] [--local P] [--ttl 8h]   # ssh port forward to localhost
+rr trust [--yes]              # review the project file (.rr.toml); --yes records it as trusted
 ```
+
+Every command takes `--host`, `--dir` and `--env` (the settings above) and `--json` (see `--json` below). `rr <command> --help` lists the options of one command.
 
 What reaches your terminal:
 
@@ -84,6 +87,20 @@ What reaches your terminal:
 Remote paths are absolute or relative to the project directory. Only a leading `~/` is read, as the remote home; no other `~` is expanded (rsync is run with `-s`, so the remote shell never sees the path). A local path with a `:` before its first `/` is copied as a file name, not as a remote host. `rr log` and `rr cancel` accept only job ids such as `123`, `123_4` or `123.batch`.
 
 `get` and `put` measure first (`rsync --dry-run --stats`) and refuse anything above `--limit`, 1G by default. They are meant for logs, configs and figures, not datasets.
+
+### `rr acct`
+
+`rr acct` lists your jobs from `sacct`. `--since <time>` (default `now-1days`; any `sacct -S` time such as `now-3days` or `2026-11-20`) picks how far back to look. `-j 7,8_1` lists the named jobs instead, however old; it cannot be combined with `--since`, and each id must be a job id such as `123`, `123_4` or `123.batch`. `--format brief` (the default: id, name, state, elapsed, exit code) or `--format full` (adds partition, start, end, nodes, CPUs and requested memory) picks the columns; only those two sets exist.
+
+### Scripts: `rr x -s`
+
+`rr x -s probe.py --interp "python -"` sends a local file to a remote interpreter on its standard input, so there is nothing to copy first and no quoting of the script:
+
+- The interpreter runs in your remote home after your `env` file, not in the project directory, and nothing is pulled.
+- `--interp` is split on blanks; `'...'` and `"..."` group a word and stand for exactly their text. A backslash, an unclosed quote or an empty program is refused. Every word is quoted again for the remote shell, so `$HOME` in it stays text.
+- There is no terminal (`-t` is refused), because stdin is the script. ssh runs with `-T`, so a `RequestTTY` in your ssh config cannot put the script through a tty. The script reaches the interpreter whole even when your `env` file reads standard input.
+- An empty file is refused before ssh starts; the file is read whole, whatever its size. The command is either `-s FILE --interp ...` or `-- <cmd>...`, never both.
+- Output is raw, like `rr x`, and the exit code is the interpreter's.
 
 ### Recipes
 
@@ -95,13 +112,17 @@ run = ["python", "-m", "train", "--config={config}"]
 pull = "checkout"   # or "none"; the default is "checkout"
 ```
 
-`rr do train --set config=base -- --fast` runs `python -m train --config=base --fast`. With `pull = "checkout"` it is `rr run`: the guarded fast-forward first, and a refusal runs nothing; `"none"` is `rr x`. A slot without a value, a value for a slot the recipe does not have and a slot set twice are errors. Values are put in as given and are not expanded again. A value is quoted but not guarded, so one that starts with `-` reaches the program as an option; a recipe that takes a path or a branch should put `"--"` before its slot.
+`rr do train --set config=base -- --fast` runs `python -m train --config=base --fast`. With `pull = "checkout"` it is `rr run`: the guarded fast-forward first, and a refusal runs nothing; `"none"` is `rr x`. `-t` allocates a terminal; `--force` is the same as for `rr pull` and is refused (not ignored) for a recipe that does not pull. A slot without a value, a value for a slot the recipe does not have and a slot set twice are errors. Values are put in as given and are not expanded again. A value is quoted but not guarded, so one that starts with `-` reaches the program as an option; a recipe that takes a path or a branch should put `"--"` before its slot.
 
-### `rr wait`, `rr run --wait` and exit codes
+### `rr status`, `rr wait` and `rr run --wait`
+
+`rr status <job>` prints the job's state, elapsed time, exit code, working directory and the last `-n` (default 10) lines of its log in one call; `rr log <job>` shows `-n` (default 40) lines, and `-f` follows. Both take a single job id.
 
 `rr wait` asks `sacct` every `--poll` seconds (default 30, at least 5) until every job has ended or `--timeout` seconds (default 86400, 24 hours) have passed. It stops at the first job that ended in any state other than `COMPLETED`, because a job that depends on it may never start. `REQUEUED` and the other active states keep it waiting; a state `rr` does not know never ends the wait, so the timeout is what stops it, as 6 naming the state (4 needs a job read as active). A timeout also names the requested jobs `sacct` never listed.
 
 `rr run --wait` runs the command with its output shown as it comes, then waits for every job that printed `Submitted batch job <id>`. If the command exits non-zero, that is its code and nothing is waited for. If it exits 0 without such a line, `rr` exits 6, because nothing says what to wait for. `--timeout` and `--poll` need `--wait` and are read before the command only: after it, a flag belongs to the command. A line that starts with `Submitted batch job ` but has no valid job id ends as 6 as well, because the wait would otherwise skip that job.
+
+### Exit codes
 
 | Exit | Meaning |
 |---|---|
@@ -115,6 +136,8 @@ pull = "checkout"   # or "none"; the default is "checkout"
 | 130 | `rr fwd` was interrupted (Ctrl-C, SIGTERM or SIGHUP) and closed its forward; ssh ending by itself keeps its own code |
 
 A failed ssh or an empty `sacct` answer (accounting can lag a new submission) is retried five times and then ends as 6, never as 5: the job may be fine. A poll that hangs is cut off, so it counts as one such failed poll: the polls of `wait` and `status` (not `x`, `run` or `log -f`, which keep your own ssh configuration) run ssh with `ConnectTimeout=10` and a link silent for 60 s closed, and `sacct` itself runs under `timeout 60`, so a stalled accounting daemon on a live link is one failed poll too. A job that already shows a state other than `COMPLETED` ends the wait as 5 even while another job is not listed yet; a wait whose `--timeout` passes without a single job read as active ends as 6, not 4. `rr x` and `rr run` return the remote command's own code, which can be any number, so 1 to 6 can also be a command's code. `--json` says which: `"source": "rr"` or `"source": "remote"`.
+
+### `--json`
 
 `--json` (before or after the command) makes stdout exactly one JSON object, with `source`, `exit` and a `kind`, for `status`, `wait`, `pull`, `trust`, `fwd` and `run --wait`. Under `run --wait --json` the command's own output is shown on stderr instead, so stdout stays one document. A refused pull names a `reason`: `not_on_origin`, `remote_dirty`, `jobs_from_checkout`, `state_changed` (a commit, an edit or a job landed since `rr` read the checkout) or `queue_unreadable` (the queue could not be re-read just before the merge). An `rr` error under `--json` is one document too, `{"source":"rr","exit":1,"kind":"error","message":...}`, and nothing is written to stderr; a command line `rr` cannot parse is the same document with exit 2 (`--help` and `--version` print as usual). `rr fwd --json` prints one document when the forward ends (`"kind":"forward"`, `"result":"expired"` or `"interrupted"`, `"source":"rr"`); the URL line stays on stderr. When ssh ends by itself, a non-zero code gives `"source":"remote"`, `"kind":"forward"`, `"result":"ssh_ended"` with ssh's code as `exit` (a lost forward is not mistaken for a remote command's exit); code 0 gives an `rr` error document (`"source":"rr"`, `"kind":"error"`), because nothing asked ssh to stop. The lines `rr` writes to stderr while a command runs stay text. `q`, `acct`, `log`, `x`, `do`, `cancel`, `get`, `put` and `run` without `--wait` write to stdout themselves (a program's text, or `scancel` and rsync), which cannot share it with a document, so `--json` is refused for them (exit 1) before anything starts. Text from the cluster in the JSON has terminal control characters replaced, as in text mode.
 
