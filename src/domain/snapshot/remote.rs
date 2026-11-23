@@ -115,6 +115,12 @@ pub fn upload_script(tree: &ClearedTree) -> Result<Script> {
         // cleared again so the published mode never depends on what the root's mode was
         lit("chmod g-s -- \"$tmp\""),
         lit("tar -x --no-same-owner --no-same-permissions -C \"$tmp\" -f - <&3"),
+        // GNU tar exits 0 on an archive cut between two members, so a link that died mid-transfer
+        // would publish a partial tree under the final name for good; the count is the proof
+        lit("found=$(find \"$tmp\" ! -type d | wc -l)"),
+        lit("if [ \"$found\" -ne ")
+            .word(number(i64::try_from(tree.files())?))
+            .lit(" ]; then echo \"rr: the archive arrived incomplete\" >&2; exit 1; fi"),
         lit(RESERVED_CHECK),
         lit("mkdir -- \"$tmp/.rr\""),
         lit("printf '%s\\n' ")
@@ -534,6 +540,34 @@ mod tests {
     }
 
     #[test]
+    fn an_archive_cut_short_is_never_published_even_when_tar_exits_zero() {
+        let full = archive();
+        let mut cuts_tested = 0;
+        for cut in (512..full.len()).step_by(512) {
+            let remote = Remote::new();
+            let run = remote.upload(&full[..cut]);
+            if run.stdout.contains(PUBLISHED) {
+                for name in ["src/pkg/mod.py", "run.sh", "loose.txt"] {
+                    assert!(remote.snap().join(name).is_file(), "cut {cut} lost {name}");
+                }
+            }
+            cuts_tested += 1;
+        }
+        assert!(cuts_tested > 3);
+    }
+
+    #[test]
+    fn a_file_count_that_differs_from_the_cleared_tree_is_refused() {
+        let remote = Remote::new();
+        let script = upload_script(&ClearedTree::fake(TREE, 4)).unwrap();
+        let run = remote.run(script, &archive());
+        assert_eq!(run.code, 1, "{}", run.stderr);
+        assert!(run.stderr.contains("incomplete"), "{}", run.stderr);
+        assert!(!remote.snap().exists());
+        assert!(remote.left().is_empty());
+    }
+
+    #[test]
     fn a_tree_that_holds_a_name_rr_keeps_is_refused() {
         for (name, kind) in [(".rr-used", "file"), (".rr", "dir"), (".rr-used", "link")] {
             let remote = Remote::new();
@@ -550,7 +584,10 @@ mod tests {
                     .into(),
             );
             let bytes = OsExec.capture_bytes(&tar).unwrap().stdout;
-            let run = remote.upload(&bytes);
+            // the count check comes first, so the tree's own file count must be right
+            let files = if kind == "dir" { 0 } else { 1 };
+            let script = upload_script(&ClearedTree::fake(TREE, files)).unwrap();
+            let run = remote.run(script, &bytes);
             assert_eq!(run.code, 1, "{name} {kind}: {}", run.stderr);
             assert!(run.stderr.contains("keeps for itself"), "{}", run.stderr);
             assert!(
