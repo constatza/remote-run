@@ -105,7 +105,8 @@ alias rsub='rr run -- uv run --frozen --no-sync python -m mypackage.cluster subm
 
 ## Notes
 
-- The remote login shell must quote like POSIX `sh` (bash, zsh and sh do; fish does not). Every command runs under `bash -c` with `set -euo pipefail`.
+- The remote login shell must quote like POSIX `sh` (bash, zsh and sh do; fish, csh and tcsh do not). Every command runs under `bash -c '<script>'`: ssh hands that line to the login shell, which must pass the quoted script to `bash` unchanged, and `bash` must be on the remote `PATH`. The script runs with `set -euo pipefail`.
+- `rr pull` needs `git` and GNU `realpath -m` on the remote. It reads the checkout in one ssh call and merges in a second; the second call checks again that `HEAD` and a clean tree are what the first call saw, and refuses (exit 3) if not.
 - `sacct` has no `--me`, so `rr acct` passes `-u "$USER"`. `sacct` reports the `--output` pattern unexpanded (`%x-%j.out`). `rr log` expands `%%`, `%A`, `%a`, `%J`, `%j`, `%u` and `%x`, and refuses any other placeholder.
 - `rsync` must exist on both machines. Windows has no native `rsync`.
 
