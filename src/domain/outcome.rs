@@ -232,13 +232,22 @@ mod tests {
 
     #[test]
     fn a_checkout_that_changed_mid_pull_is_a_refusal_with_its_reason() {
-        let changed = pulled(PullOutcome::Refused(Reason::StateChanged));
+        let stderr = "fatal: bad object\u{1b}[2J\n".to_string();
+        let changed = pulled(PullOutcome::Refused(Reason::StateChanged { stderr }));
         assert_eq!(changed.exit, Exit::Rr(RrCode::Refused));
         assert!(
             changed
                 .stderr
                 .starts_with("rr: refused: the remote checkout changed")
         );
+        assert!(
+            changed
+                .stderr
+                .contains("the remote said:\nfatal: bad object?[2J"),
+            "the remote's stderr is shown, sanitized: {:?}",
+            changed.stderr
+        );
+        assert!(!changed.stderr.contains('\u{1b}'));
     }
 
     #[test]

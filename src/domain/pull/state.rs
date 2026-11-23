@@ -121,7 +121,8 @@ pub fn state_script(target: &Target) -> Script {
     Script::lines([
         field("dir", lit(r#""$(pwd -P)""#)),
         field("head", lit(r#""$(git rev-parse HEAD)""#)),
-        lit("git fetch -q origin"),
+        // --prune: a branch deleted on origin must stop counting as "on origin"
+        lit("git fetch -q --prune origin"),
         resolved,
         field("target", lit(r#""$target""#)),
         origin_branches_script(),
@@ -142,6 +143,7 @@ pub fn parse_state(text: &str) -> Result<RemoteState> {
             .split_once('\t')
             .with_context(|| format!("remote state line without a value: {line:?}"))?;
         match key {
+            "dir" if value.is_empty() => bail!("the remote state has an empty dir"),
             "dir" => set_once(&mut dir, key, value.to_string())?,
             "head" => set_once(&mut head, key, Commit::parse(value)?)?,
             "target" => set_once(&mut target, key, parse_target(value)?)?,
@@ -269,6 +271,29 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_dir_is_an_error_like_an_empty_head() {
+        for (name, text) in [
+            (
+                "dir",
+                format!("rr-state\tdir\t\nrr-state\thead\t{A}\nrr-state\ttarget\t\n"),
+            ),
+            (
+                "head",
+                "rr-state\tdir\t/d\nrr-state\thead\t\nrr-state\ttarget\t\n".to_string(),
+            ),
+        ] {
+            assert!(
+                parse_state(&text).is_err(),
+                "an empty {name} must not parse"
+            );
+        }
+        let err = parse_state(&format!(
+            "rr-state\tdir\t\nrr-state\thead\t{A}\nrr-state\ttarget\t\n"
+        ));
+        assert!(err.unwrap_err().to_string().contains("empty dir"));
+    }
+
+    #[test]
     fn a_target_no_origin_branch_contains_is_not_on_origin() {
         let none = format!("rr-state\tdir\t/d\nrr-state\thead\t{A}\nrr-state\ttarget\t{B}\n");
         assert_eq!(parse_state(&none).unwrap().target, None);
@@ -378,6 +403,7 @@ mod tests {
     #[test]
     fn the_state_script_uses_printf_only_and_one_squeue() {
         let text = state_script(&Target::OriginHead).to_string();
+        assert!(text.contains("git fetch -q --prune origin"), "{text}");
         assert!(text.contains("squeue --me -h -o '%i %Z' | while"), "{text}");
         assert!(text.contains("realpath -m -- "), "{text}");
         assert!(
