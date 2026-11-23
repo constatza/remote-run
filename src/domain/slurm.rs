@@ -1,6 +1,7 @@
 //! What `rr` knows about Slurm: the `squeue`, `sacct` and `scancel` command text and the field
 //! layouts it reads back. Pure; every runtime value reaches the text through [`quote`].
 
+use crate::domain::exit::{Exit, RrCode};
 use crate::domain::shell::{Script, lit, number, quote};
 use anyhow::{Result, bail};
 
@@ -137,8 +138,9 @@ pub fn job_workdirs_command() -> Script {
 /// The `sacct` fields [`parse_states`](crate::domain::wait::parse_states) reads, in this order.
 pub const STATE_FIELDS: &str = "JobID,State";
 
-/// The `sacct -P` fields `rr status` reads: [`SACCT_FIELDS`] first, then the job's progress.
-pub const STATUS_FIELDS: &str = "JobIDRaw,JobID,JobName,User,WorkDir,StdOut,State,Elapsed,ExitCode";
+/// The `sacct -P` fields `rr status` reads: the job's progress, then [`SACCT_FIELDS`] last, so
+/// that the rest of the line after the three progress fields is a line `parse_sacct` reads.
+pub const STATUS_FIELDS: &str = "State,Elapsed,ExitCode,JobIDRaw,JobID,JobName,User,WorkDir,StdOut";
 
 /// `sbatch` prints this before the job id; `rr run --wait` looks for it in a command's output.
 pub const SUBMITTED_PREFIX: &str = "Submitted batch job ";
@@ -316,6 +318,19 @@ pub enum WaitOutcome {
     TimedOut(Vec<JobStatus>),
     /// `rr` could not learn how the jobs ended; `why` is remote or program text.
     Unknown { why: String },
+}
+
+impl WaitOutcome {
+    /// Success only when every job completed; each other ending has its own code, and none of
+    /// them is a remote command's.
+    pub fn exit(&self) -> Exit {
+        match self {
+            WaitOutcome::Completed(_) => Exit::Success,
+            WaitOutcome::Failed(_) => Exit::Rr(RrCode::JobFailed),
+            WaitOutcome::TimedOut(_) => Exit::Rr(RrCode::Timeout),
+            WaitOutcome::Unknown { .. } => Exit::Rr(RrCode::Unknown),
+        }
+    }
 }
 
 /// One `JobID,State` line per job (`-X`), for
@@ -514,7 +529,7 @@ mod tests {
 
     #[test]
     fn the_status_script_reads_the_record_fields_first() {
-        assert!(STATUS_FIELDS.starts_with(SACCT_FIELDS));
+        assert!(STATUS_FIELDS.ends_with(SACCT_FIELDS));
         assert_eq!(
             status_script(&id("9")).to_string(),
             format!(r#"sacct -n -X -P --delimiter=$'\x1f' -j '9' -o {STATUS_FIELDS}"#)

@@ -2,7 +2,6 @@
 //! often to ask. The loop that asks and sleeps is in `app::wait`.
 
 use crate::domain::argv::Captured;
-use crate::domain::sanitize::sanitize;
 use crate::domain::slurm::{
     Finished, JobId, JobSet, JobState, JobStatus, SACCT_SEPARATOR, SqueueId, WaitOutcome,
 };
@@ -96,7 +95,7 @@ pub struct Progress {
     /// Time since the wait began.
     pub elapsed: Duration,
     pub timeout: Duration,
-    /// Polls in a row, this one included, that could not tell the states.
+    /// Polls in a row, before the one being judged, that could not tell the states.
     pub unreadable_polls: u32,
 }
 
@@ -105,8 +104,9 @@ pub struct Progress {
 pub enum Action {
     /// Stop with this result.
     Done(WaitOutcome),
-    /// Sleep one interval and ask again.
-    Poll,
+    /// Sleep one interval and ask again; the number is the new count of polls in a row that could
+    /// not tell the states, for the next [`Progress`].
+    Poll { unreadable_polls: u32 },
 }
 
 /// Whether `row` is a state of `job`: the job itself, one of its array tasks (`123_4`) or a
@@ -147,7 +147,7 @@ pub fn next_action(reading: &Reading, jobs: &JobSet, progress: Progress) -> Acti
             let why = "sacct does not list every job yet";
             return unreadable(why, rows, progress);
         }
-        Reading::Unreadable(why) => return unreadable(&sanitize(why), &[], progress),
+        Reading::Unreadable(why) => return unreadable(why, &[], progress),
     };
     if rows.iter().any(ended_badly) {
         Action::Done(WaitOutcome::Failed(rows.clone()))
@@ -156,17 +156,22 @@ pub fn next_action(reading: &Reading, jobs: &JobSet, progress: Progress) -> Acti
     } else if timed_out {
         Action::Done(WaitOutcome::TimedOut(rows.clone()))
     } else {
-        Action::Poll
+        Action::Poll {
+            unreadable_polls: 0,
+        }
     }
 }
 
 fn unreadable(why: &str, seen: &[JobStatus], progress: Progress) -> Action {
-    if progress.unreadable_polls >= MAX_UNREADABLE_POLLS {
+    let polls = progress.unreadable_polls + 1;
+    if polls >= MAX_UNREADABLE_POLLS {
         Action::Done(WaitOutcome::Unknown { why: why.into() })
     } else if progress.elapsed >= progress.timeout {
         Action::Done(WaitOutcome::TimedOut(seen.to_vec()))
     } else {
-        Action::Poll
+        Action::Poll {
+            unreadable_polls: polls,
+        }
     }
 }
 
@@ -191,6 +196,11 @@ mod tests {
     fn seen(rows_: &[(&str, &str)]) -> Reading {
         Reading::Statuses(rows(rows_))
     }
+
+    /// Poll again, the states having been read.
+    const POLL: Action = Action::Poll {
+        unreadable_polls: 0,
+    };
 
     const HOUR: Duration = Duration::from_secs(3600);
 
@@ -218,7 +228,7 @@ mod tests {
     fn active_jobs_are_polled_again() {
         for state in ["PENDING", "RUNNING", "COMPLETING", "REQUEUED", "SUSPENDED"] {
             let action = next_action(&seen(&[("1", state)]), &jobs(&["1"]), early());
-            assert_eq!(action, Action::Poll, "{state}");
+            assert_eq!(action, POLL, "{state}");
         }
     }
 
@@ -266,11 +276,7 @@ mod tests {
         let first = next_action(&seen(&[("1", "REQUEUED")]), &jobs, early());
         let second = next_action(&seen(&[("1", "RUNNING")]), &jobs, early());
         let third = next_action(&seen(&[("1", "COMPLETED")]), &jobs, early());
-        assert_eq!(
-            (first, second),
-            (Action::Poll, Action::Poll),
-            "requeue is active"
-        );
+        assert_eq!((first, second), (POLL, POLL), "requeue is active");
         assert!(matches!(third, Action::Done(WaitOutcome::Completed(_))));
     }
 
@@ -287,7 +293,7 @@ mod tests {
     #[test]
     fn an_unknown_state_is_never_the_end_and_is_reported_at_the_timeout() {
         let reading = seen(&[("1", "BRAND_NEW")]);
-        assert_eq!(next_action(&reading, &jobs(&["1"]), early()), Action::Poll);
+        assert_eq!(next_action(&reading, &jobs(&["1"]), early()), POLL);
         let Action::Done(WaitOutcome::TimedOut(last)) =
             next_action(&reading, &jobs(&["1"]), at(HOUR, 0))
         else {
@@ -307,11 +313,15 @@ mod tests {
     fn a_poll_that_cannot_tell_is_retried_a_bounded_number_of_times_then_unknown() {
         let reading = Reading::Unreadable("ssh: no route".into());
         let jobs = jobs(&["1"]);
-        for polls in 1..MAX_UNREADABLE_POLLS {
-            let action = next_action(&reading, &jobs, at(early().elapsed, polls));
-            assert_eq!(action, Action::Poll, "{polls}");
+        for before in 0..MAX_UNREADABLE_POLLS - 1 {
+            let action = next_action(&reading, &jobs, at(early().elapsed, before));
+            let counted = Action::Poll {
+                unreadable_polls: before + 1,
+            };
+            assert_eq!(action, counted, "{before}");
         }
-        let action = next_action(&reading, &jobs, at(early().elapsed, MAX_UNREADABLE_POLLS));
+        let last = at(early().elapsed, MAX_UNREADABLE_POLLS - 1);
+        let action = next_action(&reading, &jobs, last);
         assert_eq!(
             action,
             Action::Done(WaitOutcome::Unknown {
@@ -327,29 +337,13 @@ mod tests {
         let empty = seen(&[]);
         let partial = seen(&[("1", "COMPLETED")]);
         for reading in [&empty, &partial] {
-            assert_eq!(
-                next_action(reading, &jobs, at(Duration::ZERO, 1)),
-                Action::Poll
-            );
-            let last = next_action(reading, &jobs, at(Duration::ZERO, MAX_UNREADABLE_POLLS));
+            let first = Action::Poll {
+                unreadable_polls: 1,
+            };
+            assert_eq!(next_action(reading, &jobs, at(Duration::ZERO, 0)), first);
+            let last = next_action(reading, &jobs, at(Duration::ZERO, MAX_UNREADABLE_POLLS - 1));
             assert!(matches!(last, Action::Done(WaitOutcome::Unknown { .. })));
         }
-    }
-
-    #[test]
-    fn remote_text_in_the_reason_is_sanitized() {
-        let reading = Reading::Unreadable("down\u{1b}[2J".into());
-        let action = next_action(
-            &reading,
-            &jobs(&["1"]),
-            at(Duration::ZERO, MAX_UNREADABLE_POLLS),
-        );
-        assert_eq!(
-            action,
-            Action::Done(WaitOutcome::Unknown {
-                why: "down?[2J".into()
-            })
-        );
     }
 
     #[test]
@@ -363,14 +357,16 @@ mod tests {
         assert!(matches!(action, Action::Done(WaitOutcome::Completed(_))));
         // `55` is not a task of `5`
         let other = seen(&[("55", "COMPLETED")]);
-        let action = next_action(&other, &jobs(&["5"]), at(Duration::ZERO, 1));
-        assert_eq!(action, Action::Poll);
+        let action = next_action(&other, &jobs(&["5"]), at(Duration::ZERO, 0));
+        assert_eq!(
+            action,
+            Action::Poll {
+                unreadable_polls: 1
+            }
+        );
         // a step on the requested id still finds the allocation
         let step = seen(&[("7", "RUNNING")]);
-        assert_eq!(
-            next_action(&step, &jobs(&["7.batch"]), early()),
-            Action::Poll
-        );
+        assert_eq!(next_action(&step, &jobs(&["7.batch"]), early()), POLL);
     }
 
     #[test]
