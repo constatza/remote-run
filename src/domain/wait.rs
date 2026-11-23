@@ -45,6 +45,13 @@ impl PollInterval {
     }
 }
 
+impl core::fmt::Display for PollInterval {
+    /// In seconds, the unit of `--poll`; clap prints the default with it.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0.as_secs())
+    }
+}
+
 impl Default for PollInterval {
     fn default() -> Self {
         Self(DEFAULT_POLL)
@@ -78,14 +85,15 @@ pub enum Reading {
 }
 
 impl Reading {
-    /// An ssh failure, a non-zero `sacct` and a line that does not parse are all "cannot ask",
-    /// never "the job failed".
-    pub fn from_capture(result: Result<Captured>) -> Self {
-        let stdout = result.and_then(|captured| captured.into_stdout("sacct"));
-        match stdout.and_then(|text| parse_states(&text)) {
+    /// A non-zero ssh or `sacct` and a line that does not parse are all "cannot ask", never "the
+    /// job failed". An `Err` is different: the call never reached the remote (ssh is not
+    /// installed, the process would not start), which no retry can cure, so it ends the wait.
+    pub fn from_capture(result: Result<Captured>) -> Result<Self> {
+        let stdout = result?.into_stdout("sacct");
+        Ok(match stdout.and_then(|text| parse_states(&text)) {
             Ok(rows) => Reading::Statuses(rows),
             Err(err) => Reading::Unreadable(format!("{err:#}")),
-        }
+        })
     }
 }
 
@@ -136,24 +144,24 @@ fn completed(row: &JobStatus) -> bool {
 }
 
 /// Decide what to do after a poll (pure). A job that ended in any state but COMPLETED ends the wait
-/// at once, because a job that depends on it may never start. A job missing from `sacct` (accounting
-/// lags a new submission) is not a failure, and a state the table does not know is not an end:
-/// both are retried, the first a bounded number of times, the second until the timeout.
+/// at once, because a job that depends on it may never start; it is judged on the rows that are
+/// there, even while another job is not listed yet. A job missing from `sacct` (accounting lags a
+/// new submission) is not a failure, and a state the table does not know is not an end: both are
+/// retried, the first a bounded number of times, the second until the timeout.
 pub fn next_action(reading: &Reading, jobs: &JobSet, progress: Progress) -> Action {
-    let timed_out = progress.elapsed >= progress.timeout;
     let rows = match reading {
-        Reading::Statuses(rows) if covers(rows, jobs) => rows,
-        Reading::Statuses(rows) => {
-            let why = "sacct does not list every job yet";
-            return unreadable(why, rows, progress);
-        }
+        Reading::Statuses(rows) => rows,
         Reading::Unreadable(why) => return unreadable(why, &[], progress),
     };
     if rows.iter().any(ended_badly) {
-        Action::Done(WaitOutcome::Failed(rows.clone()))
-    } else if rows.iter().all(completed) {
+        return Action::Done(WaitOutcome::Failed(rows.clone()));
+    }
+    if !covers(rows, jobs) {
+        return unreadable("sacct does not list every job yet", rows, progress);
+    }
+    if rows.iter().all(completed) {
         Action::Done(WaitOutcome::Completed(rows.clone()))
-    } else if timed_out {
+    } else if progress.elapsed >= progress.timeout {
         Action::Done(WaitOutcome::TimedOut(rows.clone()))
     } else {
         Action::Poll {
@@ -162,17 +170,22 @@ pub fn next_action(reading: &Reading, jobs: &JobSet, progress: Progress) -> Acti
     }
 }
 
+/// A poll that could not tell every job's state. At the timeout it is "timed out" only when `seen`
+/// holds a job that really read as not finished; with nothing read, "the jobs are still active" would
+/// be a guess, so it is "unknown".
 fn unreadable(why: &str, seen: &[JobStatus], progress: Progress) -> Action {
     let polls = progress.unreadable_polls + 1;
-    if polls >= MAX_UNREADABLE_POLLS {
-        Action::Done(WaitOutcome::Unknown { why: why.into() })
-    } else if progress.elapsed >= progress.timeout {
-        Action::Done(WaitOutcome::TimedOut(seen.to_vec()))
-    } else {
-        Action::Poll {
+    let timed_out = progress.elapsed >= progress.timeout;
+    let gave_up = polls >= MAX_UNREADABLE_POLLS;
+    if !gave_up && !timed_out {
+        return Action::Poll {
             unreadable_polls: polls,
-        }
+        };
     }
+    if !gave_up && !seen.iter().all(completed) {
+        return Action::Done(WaitOutcome::TimedOut(seen.to_vec()));
+    }
+    Action::Done(WaitOutcome::Unknown { why: why.into() })
 }
 
 #[cfg(test)]
@@ -330,6 +343,51 @@ mod tests {
         );
     }
 
+    /// Nothing was read, so "the jobs are still active" would be a guess: exit 6, never 4.
+    #[test]
+    fn an_unreadable_poll_at_the_timeout_is_unknown_not_a_timeout() {
+        let reading = Reading::Unreadable("ssh: no route".into());
+        let unknown = Action::Done(WaitOutcome::Unknown {
+            why: "ssh: no route".into(),
+        });
+        for before in [0, MAX_UNREADABLE_POLLS - 1] {
+            let action = next_action(&reading, &jobs(&["1"]), at(HOUR, before));
+            assert_eq!(action, unknown, "{before} earlier unreadable polls");
+        }
+    }
+
+    /// Only a job that read as not finished makes a timeout out of a partial answer.
+    #[test]
+    fn a_partial_answer_at_the_timeout_is_a_timeout_only_if_a_job_read_as_active() {
+        let jobs = jobs(&["1", "2"]);
+        let running = seen(&[("1", "RUNNING")]);
+        assert_eq!(
+            next_action(&running, &jobs, at(HOUR, 0)),
+            Action::Done(WaitOutcome::TimedOut(rows(&[("1", "RUNNING")])))
+        );
+        for nothing_active in [seen(&[]), seen(&[("1", "COMPLETED")])] {
+            let action = next_action(&nothing_active, &jobs, at(HOUR, 0));
+            assert!(
+                matches!(action, Action::Done(WaitOutcome::Unknown { .. })),
+                "{nothing_active:?}: {action:?}"
+            );
+        }
+        let last = at(HOUR, MAX_UNREADABLE_POLLS - 1);
+        let action = next_action(&running, &jobs, last);
+        assert!(matches!(action, Action::Done(WaitOutcome::Unknown { .. })));
+    }
+
+    /// `-j 7,8` with 8 not in `sacct` yet: the visible FAILED 7 is the answer (exit 5), not "unknown".
+    #[test]
+    fn a_visible_failure_wins_while_another_job_is_not_listed_yet() {
+        let reading = seen(&[("7", "FAILED")]);
+        let action = next_action(&reading, &jobs(&["7", "8"]), early());
+        assert_eq!(
+            action,
+            Action::Done(WaitOutcome::Failed(rows(&[("7", "FAILED")])))
+        );
+    }
+
     /// `sacct` lags a new submission: an empty answer, or one without all the jobs, is not a result.
     #[test]
     fn missing_jobs_are_retried_and_never_read_as_all_completed() {
@@ -393,21 +451,23 @@ mod tests {
                 stderr: stderr.into(),
             })
         };
+        let read = |code, stdout: &str, stderr: &str| {
+            Reading::from_capture(captured(code, stdout, stderr)).unwrap()
+        };
         assert!(matches!(
-            Reading::from_capture(captured(0, "1\u{1f}FAILED\n", "")),
+            read(0, "1\u{1f}FAILED\n", ""),
             Reading::Statuses(_)
         ));
-        let Reading::Unreadable(why) = Reading::from_capture(captured(255, "", "ssh: no route"))
-        else {
+        let Reading::Unreadable(why) = read(255, "", "ssh: no route") else {
             panic!("a failed ssh is unreadable");
         };
         assert!(
             why.contains("255") && why.contains("ssh: no route"),
             "{why}"
         );
-        let bad = Reading::from_capture(captured(0, "garbage\n", ""));
-        assert!(matches!(bad, Reading::Unreadable(_)));
+        assert!(matches!(read(0, "garbage\n", ""), Reading::Unreadable(_)));
+        // a call that never reached the remote is an error, not a poll to retry
         let wont_start = Reading::from_capture(Err(anyhow::anyhow!("could not start ssh")));
-        assert!(matches!(wont_start, Reading::Unreadable(_)));
+        assert!(wont_start.is_err());
     }
 }

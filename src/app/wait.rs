@@ -8,6 +8,7 @@ use crate::domain::outcome::Outcome;
 use crate::domain::place::script;
 use crate::domain::slurm::{JobSet, SUBMITTED_PREFIX, WaitOutcome, states_script, submitted_jobs};
 use crate::domain::wait::{Action, PollInterval, Progress, Reading, next_action};
+use crate::ports::Echo;
 use anyhow::Result;
 use std::time::Duration;
 
@@ -28,9 +29,10 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
     let start = ports.clock.now();
     let mut unreadable_polls = 0;
     loop {
-        let reading = Reading::from_capture(ports.remote.capture(&poll));
+        let reading = Reading::from_capture(ports.remote.capture(&poll))?;
+        let elapsed = ports.clock.now().since(start);
         let progress = Progress {
-            elapsed: ports.clock.now().since(start),
+            elapsed,
             timeout: args.limits.timeout,
             unreadable_polls,
         };
@@ -40,29 +42,34 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
                 unreadable_polls: n,
             } => {
                 unreadable_polls = n;
-                ports.clock.sleep(args.limits.poll.duration());
+                // the last sleep ends at the timeout, so `--timeout` is not overshot by a poll
+                let remaining = args.limits.timeout.saturating_sub(elapsed);
+                ports
+                    .clock
+                    .sleep(args.limits.poll.duration().min(remaining));
             }
         }
     }
 }
 
-/// Run the command with its output shown as it comes, then wait for the jobs it submitted. A
-/// command that failed is its own result. One that succeeded without a `Submitted batch job N`
-/// line is "unknown", never success: nothing says what to wait for.
+/// Run the command with its output shown as it comes (on `echo`), then wait for the jobs it
+/// submitted. A command that failed is its own result. One that succeeded without a `Submitted
+/// batch job N` line is "unknown", never success: nothing says what to wait for.
 pub fn run_then_wait(
     session: &Session,
     command: exec::Args,
     limits: Limits,
+    echo: Echo,
     ports: &Ports,
 ) -> Result<Outcome> {
-    let teed = exec::tee(session, command, SUBMITTED_PREFIX, ports)?;
+    let teed = exec::tee(session, command, SUBMITTED_PREFIX, echo, ports)?;
     if teed.code != 0 {
         return Ok(Outcome::Remote(RemoteExit::new(teed.code)));
     }
     match submitted_jobs(&teed.matched) {
-        Some(jobs) => run(session, Args { jobs, limits }, ports),
-        None => Ok(Outcome::Waited(WaitOutcome::Unknown {
-            why: format!("the command printed no {SUBMITTED_PREFIX:?}<id> line"),
+        Ok(jobs) => run(session, Args { jobs, limits }, ports),
+        Err(err) => Ok(Outcome::Waited(WaitOutcome::Unknown {
+            why: format!("{err:#}"),
         })),
     }
 }
@@ -75,8 +82,8 @@ mod tests {
     use crate::domain::outcome::{Format, render};
     use crate::domain::slurm::JobId;
     use crate::domain::wait::MAX_UNREADABLE_POLLS;
-    use crate::ports::Terminal;
     use crate::ports::fake::RemoteCall;
+    use crate::ports::{Echo, Terminal};
 
     const HOUR: Duration = Duration::from_secs(3600);
 
@@ -136,12 +143,18 @@ mod tests {
 
     #[test]
     fn a_job_that_ended_in_any_other_state_exits_5() {
-        for state in ["FAILED", "TIMEOUT", "CANCELLED by 9", "OUT_OF_MEMORY"] {
+        let cases = [
+            ("FAILED", "FAILED"),
+            ("TIMEOUT", "TIMEOUT"),
+            ("CANCELLED by 9", "CANCELLED"),
+            ("OUT_OF_MEMORY", "OUT_OF_MEMORY"),
+        ];
+        for (state, shown) in cases {
             let text = reply("7", state);
             let (exit, report, slept) = wait(&[(0, &text, "")]);
             assert_eq!(exit, Exit::Rr(RrCode::JobFailed), "{state}");
             assert_eq!(exit.code(), 5);
-            assert!(report.starts_with("rr: 7 "), "{report}");
+            assert_eq!(report, format!("rr: 7 {shown}\n"));
             assert!(slept.is_empty());
         }
     }
@@ -170,6 +183,19 @@ mod tests {
             3,
             "polls at 0, 30, 60, 90 s"
         );
+    }
+
+    #[test]
+    fn the_last_sleep_ends_at_the_timeout_instead_of_overshooting_it() {
+        let running = reply("7", "RUNNING");
+        let fakes = Fakes::new(vec![], vec![], vec![(0, running.as_str(), ""); 3], vec![]);
+        let outcome = run(&session(), args(Duration::from_secs(45)), &fakes.ports()).unwrap();
+        assert_eq!(
+            render(&outcome, Format::Text).exit,
+            Exit::Rr(RrCode::Timeout)
+        );
+        let polls = [Duration::from_secs(30), Duration::from_secs(15)];
+        assert_eq!(*fakes.clock.slept.borrow(), polls);
     }
 
     /// Exit 6 and never 5: the link was down, the job may be fine.
@@ -234,10 +260,20 @@ mod tests {
         fakes
             .remote
             .emit(b"Submitted batch job 7\nSubmitted batch job 8\n");
-        let outcome = run_then_wait(&session(), command(), limits(HOUR), &fakes.ports()).unwrap();
+        let outcome = run_then_wait(
+            &session(),
+            command(),
+            limits(HOUR),
+            Echo::Stdout,
+            &fakes.ports(),
+        )
+        .unwrap();
         assert_eq!(render(&outcome, Format::Text).exit, Exit::Success);
         let calls = fakes.remote.calls.borrow();
-        assert_eq!(calls[0].1, RemoteCall::StreamTee(Terminal::Plain));
+        assert_eq!(
+            calls[0].1,
+            RemoteCall::StreamTee(Terminal::Plain, Echo::Stdout)
+        );
         assert!(calls[1].0.contains("-j '7,8'"), "{}", calls[1].0);
         assert_eq!(
             fakes.remote.shown.borrow().as_slice(),
@@ -246,19 +282,76 @@ mod tests {
         );
     }
 
+    /// Under `--json` stdout is the one document, so the command's own output goes to stderr.
+    #[test]
+    fn the_command_output_goes_where_echo_says() {
+        let done = "7\u{1f}COMPLETED\n";
+        let fakes = Fakes::new(vec![], vec![], vec![(0, done, "")], vec![0]);
+        fakes.remote.emit(b"Submitted batch job 7\n");
+        let to_stderr = Echo::Stderr;
+        run_then_wait(
+            &session(),
+            command(),
+            limits(HOUR),
+            to_stderr,
+            &fakes.ports(),
+        )
+        .unwrap();
+        let calls = fakes.remote.calls.borrow();
+        assert_eq!(
+            calls[0].1,
+            RemoteCall::StreamTee(Terminal::Plain, Echo::Stderr)
+        );
+    }
+
+    /// A submit line that cannot be read must not shrink the wait to the jobs that can.
+    #[test]
+    fn a_malformed_submit_line_is_unknown_and_nothing_is_polled() {
+        let fakes = Fakes::remote_streaming(vec![0]);
+        fakes
+            .remote
+            .emit(b"Submitted batch job 7\nSubmitted batch job 1abc\n");
+        let outcome = run_then_wait(
+            &session(),
+            command(),
+            limits(HOUR),
+            Echo::Stdout,
+            &fakes.ports(),
+        )
+        .unwrap();
+        let rendered = render(&outcome, Format::Text);
+        assert_eq!(rendered.exit, Exit::Rr(RrCode::Unknown));
+        assert!(rendered.stderr.contains("1abc"), "{}", rendered.stderr);
+        assert_eq!(fakes.remote.calls.borrow().len(), 1);
+    }
+
     /// No match is unknown, never success; and a command's own failure is its own code.
     #[test]
     fn a_command_with_no_submit_line_is_unknown_and_a_failed_one_keeps_its_code() {
         let fakes = Fakes::remote_streaming(vec![0]);
         fakes.remote.emit(b"hello\n");
-        let outcome = run_then_wait(&session(), command(), limits(HOUR), &fakes.ports()).unwrap();
+        let outcome = run_then_wait(
+            &session(),
+            command(),
+            limits(HOUR),
+            Echo::Stdout,
+            &fakes.ports(),
+        )
+        .unwrap();
         let rendered = render(&outcome, Format::Text);
         assert_eq!(rendered.exit, Exit::Rr(RrCode::Unknown));
         assert_eq!(fakes.remote.calls.borrow().len(), 1, "nothing to poll");
 
         let fakes = Fakes::remote_streaming(vec![3]);
         fakes.remote.emit(b"Submitted batch job 7\n");
-        let outcome = run_then_wait(&session(), command(), limits(HOUR), &fakes.ports()).unwrap();
+        let outcome = run_then_wait(
+            &session(),
+            command(),
+            limits(HOUR),
+            Echo::Stdout,
+            &fakes.ports(),
+        )
+        .unwrap();
         let exit = render(&outcome, Format::Text).exit;
         assert_eq!(exit, Exit::remote(3));
         assert_ne!(exit, Exit::Rr(RrCode::Refused));

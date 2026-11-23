@@ -7,15 +7,15 @@
 
 mod cli;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
-use cli::{Cli, Cmd, FwdArgs, JobCmd, RemoteCmd};
+use cli::{Cli, Cmd, FwdArgs, JobCmd, RemoteCmd, StdoutUse};
 use remote_run::adapters::{OsExec, OsNet, Ssh, SystemClock};
 use remote_run::app::{self, Ports};
 use remote_run::config::{Environment, Session, Settings, load, resolve, utf8_var};
-use remote_run::domain::outcome::{Outcome, render, render_error};
+use remote_run::domain::outcome::{Format, Outcome, render, render_error};
 use remote_run::domain::slurm::JobSet;
-use remote_run::ports::Notes;
+use remote_run::ports::{Echo, Notes};
 use remote_run::trust;
 use std::process::ExitCode;
 
@@ -24,7 +24,7 @@ fn main() -> ExitCode {
     let format = cli.format;
     let rendered = match environment().and_then(|env| run(cli, &env)) {
         Ok(outcome) => render(&outcome, format),
-        Err(err) => render_error(&err),
+        Err(err) => render_error(&err, format),
     };
     print!("{}", rendered.stdout);
     eprint!("{}", rendered.stderr);
@@ -63,11 +63,25 @@ fn session(given: Settings, env: &Environment) -> Result<Session> {
     resolve(given.over(files))
 }
 
+/// `--json` promises one document on stdout; a command that shows a program's own text there
+/// cannot keep it, so it is refused before anything starts.
+fn refuse_json_for(command: &RemoteCmd, format: Format) -> Result<()> {
+    match (format, command.stdout_use()) {
+        (Format::Json, StdoutUse::ProgramOutput) => bail!(
+            "--json does not apply to a command that prints a program's own output (q, acct, log, \
+             x, fwd, run without --wait): its text would not be one JSON document"
+        ),
+        (Format::Json, StdoutUse::Result) | (Format::Text, _) => Ok(()),
+    }
+}
+
 fn run(cli: Cli, env: &Environment) -> Result<Outcome> {
+    let (format, echo) = (cli.format, cli.echo());
     let command = match cli.command {
         Cmd::Trust { action } => return app::trust::run(env, action),
         Cmd::Remote(command) => command,
     };
+    refuse_json_for(&command, format)?;
     let given = Settings {
         host: cli.host,
         dir: cli.dir,
@@ -84,7 +98,7 @@ fn run(cli: Cli, env: &Environment) -> Result<Outcome> {
         notes: &StderrNotes,
         clock: &clock,
     };
-    dispatch(command, &session, &ports, env)
+    dispatch(command, &session, &ports, env, echo)
 }
 
 fn dispatch_job(command: JobCmd, session: &Session, ports: &Ports) -> Result<Outcome> {
@@ -107,6 +121,7 @@ fn dispatch(
     session: &Session,
     ports: &Ports,
     env: &Environment,
+    echo: Echo,
 ) -> Result<Outcome> {
     match command {
         RemoteCmd::Job(command) => dispatch_job(command, session, ports),
@@ -126,7 +141,7 @@ fn dispatch(
             wait,
             cmd,
         } => {
-            let args = app::run::Args::new(policy, terminal, cmd, wait.after());
+            let args = app::run::Args::new(policy, terminal, cmd, wait.after(echo));
             app::run::run(session, args, ports)
         }
         RemoteCmd::Fwd(args) => fwd(session, args, ports, env),
