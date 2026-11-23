@@ -35,6 +35,43 @@ pub fn write_sanitized(reader: impl Read, writer: &mut impl Write) -> io::Result
     }
 }
 
+/// How a command that was shown raw and read at the same time ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Teed {
+    pub code: i32,
+    /// The output lines that began with the asked-for prefix, without their line ending. Only
+    /// these are kept, so a long-running command's output is not held in memory.
+    pub matched: Vec<String>,
+}
+
+/// Copy `reader` to `writer` unchanged, a line at a time (flushed, like [`write_sanitized`]), and
+/// return the lines that start with `prefix`. A line longer than [`MAX_LINE_BYTES`] is read in
+/// pieces, so its later pieces are not seen as line starts.
+pub fn tee_lines(
+    reader: impl Read,
+    writer: &mut impl Write,
+    prefix: &str,
+) -> io::Result<Vec<String>> {
+    let mut reader = io::BufReader::new(reader);
+    let (mut line, mut matched) = (Vec::new(), Vec::new());
+    loop {
+        line.clear();
+        if (&mut reader)
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut line)?
+            == 0
+        {
+            return Ok(matched);
+        }
+        writer.write_all(&line)?;
+        writer.flush()?;
+        if line.starts_with(prefix.as_bytes()) {
+            let text = String::from_utf8_lossy(&line);
+            matched.push(text.trim_end_matches(['\r', '\n']).to_string());
+        }
+    }
+}
+
 /// Runs local programs. A child killed by a signal has no exit code; implementations report it as
 /// a non-zero `code`, never as success.
 pub trait Exec {
@@ -46,6 +83,10 @@ pub trait Exec {
     /// [`write_sanitized`] to the user's stdout and stderr, so nothing it prints can carry a
     /// terminal control sequence. Stdin stays inherited.
     fn stream_filtered(&self, argv: &Argv) -> Result<i32>;
+    /// Like [`Exec::stream`] for the user's stdout, which shows the child's bytes unchanged while
+    /// they are also read: the lines that start with `prefix` come back in [`Teed`]. Stdin and
+    /// stderr stay inherited.
+    fn stream_tee(&self, argv: &Argv, prefix: &str) -> Result<Teed>;
 }
 
 /// Runs scripts on the remote host; a trait so tests can record what would be sent. It takes a
@@ -66,6 +107,8 @@ pub trait Remote {
     /// Like [`Remote::stream`], with the output filtered as in [`Exec::stream_filtered`]. For
     /// commands whose output is the remote's text rather than a program the user chose to run.
     fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32>;
+    /// Like [`Remote::stream`], with the output also read as in [`Exec::stream_tee`].
+    fn stream_tee(&self, script: &Script, terminal: Terminal, prefix: &str) -> Result<Teed>;
 }
 
 /// A point on a monotonic clock: the time since that clock started. Only a [`Clock`] hands one out,
@@ -119,6 +162,7 @@ pub mod fake {
         Capture(Stdin),
         Stream,
         StreamFiltered,
+        StreamTee,
     }
 
     /// A scripted answer to `capture`.
@@ -142,6 +186,7 @@ pub mod fake {
         Capture,
         Stream(Terminal),
         StreamFiltered(Terminal),
+        StreamTee(Terminal),
     }
 
     /// A scripted [`Remote`]: it records every script and answers from queues. A call with nothing
@@ -226,6 +271,21 @@ pub mod fake {
                 .borrow_mut()
                 .pop_front()
                 .expect("an unexpected remote stream"))
+        }
+
+        /// What the command prints is what [`FakeRemote::emit`] queued; `shown` gets it unchanged.
+        fn stream_tee(&self, script: &Script, terminal: Terminal, prefix: &str) -> Result<Teed> {
+            self.calls
+                .borrow_mut()
+                .push((script.to_string(), RemoteCall::StreamTee(terminal)));
+            let raw = self.emitted.borrow_mut().pop_front().unwrap_or_default();
+            let matched = tee_lines(raw.as_slice(), &mut *self.shown.borrow_mut(), prefix)?;
+            let code = self
+                .streams
+                .borrow_mut()
+                .pop_front()
+                .expect("an unexpected remote stream");
+            Ok(Teed { code, matched })
         }
     }
 
@@ -318,6 +378,19 @@ pub mod fake {
                 .pop_front()
                 .expect("an unexpected stream"))
         }
+
+        fn stream_tee(&self, argv: &Argv, _prefix: &str) -> Result<Teed> {
+            self.calls.borrow_mut().push((argv.clone(), How::StreamTee));
+            let code = self
+                .streams
+                .borrow_mut()
+                .pop_front()
+                .expect("an unexpected stream");
+            Ok(Teed {
+                code,
+                matched: vec![],
+            })
+        }
     }
 
     fn sanitized(raw: &[u8]) -> String {
@@ -406,6 +479,31 @@ pub mod fake {
             counting.writes
         );
         assert_eq!(counting.flushes, counting.writes.len());
+    }
+
+    #[test]
+    fn a_tee_shows_every_byte_unchanged_and_keeps_only_the_lines_with_the_prefix() {
+        let raw = b"\x1b[1mbold\x1b[0m\nSubmitted batch job 7\r\n not Submitted batch job 8\nSubmitted batch job 9";
+        let mut shown = Vec::new();
+        let matched = tee_lines(raw.as_slice(), &mut shown, "Submitted batch job ").unwrap();
+        assert_eq!(shown, raw, "the user sees the program's own bytes");
+        assert_eq!(
+            matched,
+            ["Submitted batch job 7", "Submitted batch job 9"],
+            "the line must start with the prefix"
+        );
+        assert!(tee_lines(&b""[..], &mut shown, "x").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_read_error_while_teeing_is_an_error() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("boom"))
+            }
+        }
+        assert!(tee_lines(Broken, &mut Vec::new(), "x").is_err());
     }
 
     #[test]

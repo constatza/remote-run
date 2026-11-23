@@ -3,8 +3,9 @@
 use super::{Output, Ports, stream};
 use crate::config::Session;
 use crate::domain::outcome::Outcome;
+use crate::domain::place::script;
 use crate::domain::shell::{Script, quote};
-use crate::ports::Terminal;
+use crate::ports::{Teed, Terminal};
 use anyhow::Result;
 
 pub struct Args {
@@ -12,9 +13,24 @@ pub struct Args {
     pub cmd: Vec<String>,
 }
 
+fn body(args: &Args) -> Script {
+    Script::new().words(args.cmd.iter().map(|word| quote(word)))
+}
+
 pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
-    let body = Script::new().words(args.cmd.iter().map(|word| quote(word)));
-    stream(ports, &session.place, body, args.terminal, Output::Raw)
+    stream(
+        ports,
+        &session.place,
+        body(&args),
+        args.terminal,
+        Output::Raw,
+    )
+}
+
+/// Like [`run`], with the output also read for the lines that start with `prefix`.
+pub fn tee(session: &Session, args: Args, prefix: &str, ports: &Ports) -> Result<Teed> {
+    let script = script(&session.place, body(&args));
+    ports.remote.stream_tee(&script, args.terminal, prefix)
 }
 
 #[cfg(test)]

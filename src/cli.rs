@@ -1,18 +1,23 @@
 //! The command line: what clap parses, and nothing else. Flags that take no value are read into
 //! the enum they stand for, so no boolean reaches the commands.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use remote_run::app::run::After;
+use remote_run::app::wait::Limits;
+use remote_run::domain::outcome::Format;
 use remote_run::domain::pull::JobPolicy;
 use remote_run::domain::slurm::{Follow, JobId};
 use remote_run::domain::transfer::parse_size;
+use remote_run::domain::wait::{DEFAULT_TIMEOUT, PollInterval};
 use remote_run::ports::Terminal;
 use remote_run::trust::TrustAction;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
     name = "rr",
     version,
-    about = "Run commands, update a checkout and copy files on a remote Slurm cluster over ssh."
+    about = "Run commands, update a checkout, wait for jobs and copy files on a remote Slurm cluster over ssh."
 )]
 pub struct Cli {
     /// ssh host or alias from ~/.ssh/config
@@ -24,6 +29,10 @@ pub struct Cli {
     /// remote shell file sourced before every command (PATH, uv, Slurm settings)
     #[arg(long = "env", env = "RR_ENV", global = true)]
     pub env_file: Option<String>,
+    /// write the result as one JSON object on stdout (for `wait`, `status`, `pull`, `get`, `put`,
+    /// `trust`; a command that streams a program's output prints the JSON after it)
+    #[arg(long = "json", num_args = 0, default_value = "text", default_missing_value = "json", value_parser = parse_format, global = true)]
+    pub format: Format,
     #[command(subcommand)]
     pub command: Cmd,
 }
@@ -41,9 +50,79 @@ pub enum Cmd {
     Remote(RemoteCmd),
 }
 
+/// How long `wait` waits and how often it asks.
+#[derive(Args, Clone, Copy)]
+pub struct WaitFlags {
+    /// give up after this many seconds (exit 4)
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT.as_secs())]
+    pub timeout: u64,
+    /// seconds between asking Slurm, at least 5
+    #[arg(long, default_value = "30", value_parser = parse_poll)]
+    pub poll: PollInterval,
+}
+
+impl WaitFlags {
+    pub fn limits(self) -> Limits {
+        Limits {
+            timeout: Duration::from_secs(self.timeout),
+            poll: self.poll,
+        }
+    }
+}
+
+/// What `rr run` does once its command has ended, and the limits that apply if it waits.
+#[derive(Args, Clone, Copy)]
+pub struct RunWait {
+    /// after the command, wait for the jobs it submitted (it must print `Submitted batch job N`)
+    #[arg(long = "wait", num_args = 0, default_value = "return", default_missing_value = "wait", value_parser = parse_completion)]
+    completion: Completion,
+    #[command(flatten)]
+    limits: WaitFlags,
+}
+
+impl RunWait {
+    pub fn after(self) -> After {
+        match self.completion {
+            Completion::Return => After::Return,
+            Completion::Wait => After::Wait(self.limits.limits()),
+        }
+    }
+}
+
+/// What `rr run` does once its command has ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Completion {
+    Return,
+    /// Wait for the jobs the command submitted.
+    Wait,
+}
+
+/// The commands about jobs that have been submitted.
+#[derive(Subcommand)]
+pub enum JobCmd {
+    /// Wait until jobs end: exit 0 when all completed, 5 when one did not, 4 on timeout, 6 when
+    /// their state cannot be read
+    Wait {
+        #[arg(required = true, value_parser = JobId::parse)]
+        jobs: Vec<JobId>,
+        #[command(flatten)]
+        limits: WaitFlags,
+    },
+    /// One job's state, elapsed time, exit code, directory and the end of its log
+    Status {
+        #[arg(value_parser = JobId::parse)]
+        job: JobId,
+        /// log lines to show
+        #[arg(short = 'n', long, default_value_t = 10)]
+        lines: u32,
+    },
+}
+
 /// The commands that act on the remote host.
 #[derive(Subcommand)]
 pub enum RemoteCmd {
+    #[command(flatten)]
+    Job(JobCmd),
     /// Your queued and running jobs (squeue --me)
     Q,
     /// Your recent jobs (sacct)
@@ -89,6 +168,8 @@ pub enum RemoteCmd {
         policy: JobPolicy,
         #[arg(short, long = "tty", num_args = 0, default_value = "plain", default_missing_value = "attached", value_parser = parse_terminal)]
         terminal: Terminal,
+        #[command(flatten)]
+        wait: RunWait,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
@@ -151,6 +232,34 @@ fn parse_follow(text: &str) -> Result<Follow, String> {
     )
 }
 
+/// `--wait` is `wait`; absent it is `return`.
+fn parse_completion(text: &str) -> Result<Completion, String> {
+    flag(
+        "--wait",
+        text,
+        ("return", Completion::Return),
+        ("wait", Completion::Wait),
+    )
+}
+
+/// `--json` is `json`; absent it is `text`.
+fn parse_format(text: &str) -> Result<Format, String> {
+    flag(
+        "--json",
+        text,
+        ("text", Format::Text),
+        ("json", Format::Json),
+    )
+}
+
+/// Seconds between polls, refused below [`PollInterval`]'s minimum.
+fn parse_poll(text: &str) -> Result<PollInterval, String> {
+    let secs: u64 = text
+        .parse()
+        .map_err(|_| format!("not a number: {text:?}"))?;
+    PollInterval::from_secs(secs).map_err(|err| err.to_string())
+}
+
 /// `--yes` is `record`; absent it is `show`.
 fn parse_trust(text: &str) -> Result<TrustAction, String> {
     flag(
@@ -165,13 +274,13 @@ fn parse_trust(text: &str) -> Result<TrustAction, String> {
 mod tests {
     use super::*;
 
-    /// The tagline names only what is built: `submit` and `watch` are not commands yet.
+    /// The tagline names only what is built: `rr` has no `submit` or `watch` command; it waits.
     #[test]
     fn the_tagline_promises_no_unbuilt_command() {
         use clap::CommandFactory;
         let about = Cli::command().get_about().map(|text| text.to_string());
         let about = about.unwrap_or_default().to_lowercase();
-        assert!(!about.is_empty());
+        assert!(about.contains("wait for jobs"), "{about}");
         assert!(
             !about.contains("submit") && !about.contains("watch"),
             "{about}"
@@ -259,6 +368,60 @@ mod tests {
             refused(&["x", "--tty=attached", "ls"]),
             "a flag takes no value"
         );
+    }
+
+    #[test]
+    fn wait_takes_job_ids_a_timeout_and_a_poll_of_at_least_five_seconds() {
+        let wait = |args: &[&str]| match command_of(args) {
+            Cmd::Remote(RemoteCmd::Job(JobCmd::Wait { jobs, limits })) => (jobs.len(), limits),
+            _ => panic!("not a wait"),
+        };
+        let (count, limits) = wait(&["wait", "1", "2_3"]);
+        assert_eq!(count, 2);
+        let defaults = limits.limits();
+        assert_eq!(defaults.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(defaults.poll, PollInterval::default());
+        let (_, limits) = wait(&["wait", "--timeout", "60", "--poll", "5", "1"]);
+        let limits = limits.limits();
+        assert_eq!(limits.timeout, Duration::from_secs(60));
+        assert_eq!(limits.poll.duration(), Duration::from_secs(5));
+        assert!(refused(&["wait"]), "a wait needs a job");
+        assert!(refused(&["wait", "--poll", "4", "1"]));
+        assert!(refused(&["wait", "--poll", "x", "1"]));
+        assert!(refused(&["wait", "-u"]));
+    }
+
+    #[test]
+    fn run_waits_only_when_asked_and_status_takes_one_job() {
+        let after = |args: &[&str]| match command_of(args) {
+            Cmd::Remote(RemoteCmd::Run { wait, .. }) => wait.after(),
+            _ => panic!("not a run"),
+        };
+        assert!(matches!(after(&["run", "--", "ls"]), After::Return));
+        assert!(matches!(
+            after(&["run", "--wait", "--", "ls"]),
+            After::Wait(_)
+        ));
+        let custom = after(&["run", "--wait", "--timeout", "9", "ls"]);
+        assert!(matches!(custom, After::Wait(l) if l.timeout == Duration::from_secs(9)));
+        // after the command a flag belongs to the command
+        assert!(matches!(after(&["run", "ls", "--wait"]), After::Return));
+        assert!(!refused(&["status", "12", "-n", "3"]));
+        assert!(refused(&["status", "1", "2"]));
+    }
+
+    #[test]
+    fn json_is_a_global_flag_that_takes_no_value() {
+        let format = |args: &[&str]| {
+            let argv = ["rr", "--host", "h"]
+                .into_iter()
+                .chain(args.iter().copied());
+            Cli::try_parse_from(argv).unwrap().format
+        };
+        assert_eq!(format(&["q"]), Format::Text);
+        assert_eq!(format(&["q", "--json"]), Format::Json);
+        assert_eq!(format(&["--json", "wait", "1"]), Format::Json);
+        assert!(refused(&["q", "--json=text"]));
     }
 
     #[test]

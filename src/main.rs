@@ -9,20 +9,22 @@ mod cli;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Cmd, RemoteCmd};
+use cli::{Cli, Cmd, JobCmd, RemoteCmd};
 use remote_run::adapters::OsExec;
-use remote_run::adapters::Ssh;
+use remote_run::adapters::{Ssh, SystemClock};
 use remote_run::app::{self, Ports};
 use remote_run::config::{Environment, Session, Settings, load, resolve, utf8_var};
-use remote_run::domain::outcome::{Format, Outcome, render, render_error};
+use remote_run::domain::outcome::{Outcome, render, render_error};
+use remote_run::domain::slurm::JobSet;
 use remote_run::ports::Notes;
 use remote_run::trust;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let format = cli.format;
     let rendered = match environment().and_then(|env| run(cli, &env)) {
-        Ok(outcome) => render(&outcome, Format::Text),
+        Ok(outcome) => render(&outcome, format),
         Err(err) => render_error(&err),
     };
     print!("{}", rendered.stdout);
@@ -74,16 +76,34 @@ fn run(cli: Cli, env: &Environment) -> Result<Outcome> {
     let session = session(given, env)?;
     let exec = OsExec;
     let ssh = Ssh::new(&session.host, &exec);
+    let clock = SystemClock::new();
     let ports = Ports {
         exec: &exec,
         remote: &ssh,
         notes: &StderrNotes,
+        clock: &clock,
     };
     dispatch(command, &session, &ports)
 }
 
+fn dispatch_job(command: JobCmd, session: &Session, ports: &Ports) -> Result<Outcome> {
+    match command {
+        JobCmd::Wait { jobs, limits } => {
+            let args = app::wait::Args {
+                jobs: JobSet::new(jobs)?,
+                limits: limits.limits(),
+            };
+            app::wait::run(session, args, ports)
+        }
+        JobCmd::Status { job, lines } => {
+            app::status::run(session, app::status::Args { job, lines }, ports)
+        }
+    }
+}
+
 fn dispatch(command: RemoteCmd, session: &Session, ports: &Ports) -> Result<Outcome> {
     match command {
+        RemoteCmd::Job(command) => dispatch_job(command, session, ports),
         RemoteCmd::Q => app::q::run(session, ports),
         RemoteCmd::Acct { since } => app::acct::run(session, app::acct::Args { since }, ports),
         RemoteCmd::Log { job, follow, lines } => {
@@ -97,13 +117,10 @@ fn dispatch(command: RemoteCmd, session: &Session, ports: &Ports) -> Result<Outc
         RemoteCmd::Run {
             policy,
             terminal,
+            wait,
             cmd,
         } => {
-            let args = app::run::Args {
-                policy,
-                terminal,
-                cmd,
-            };
+            let args = app::run::Args::new(policy, terminal, cmd, wait.after());
             app::run::run(session, args, ports)
         }
         RemoteCmd::Get {

@@ -1,5 +1,6 @@
 //! `rr run`: `pull`, then run a command in the remote project directory.
 
+use super::wait::{Limits, run_then_wait};
 use super::{Ports, exec, pull};
 use crate::config::Session;
 use crate::domain::outcome::{Outcome, pull_report};
@@ -7,10 +8,30 @@ use crate::domain::pull::{JobPolicy, Next, next};
 use crate::ports::Terminal;
 use anyhow::Result;
 
+/// What happens once the command has ended.
+#[derive(Clone, Copy, Debug)]
+pub enum After {
+    Return,
+    /// Wait for the jobs the command submitted.
+    Wait(Limits),
+}
+
 pub struct Args {
     pub policy: JobPolicy,
     pub terminal: Terminal,
     pub cmd: Vec<String>,
+    pub after: After,
+}
+
+impl Args {
+    pub fn new(policy: JobPolicy, terminal: Terminal, cmd: Vec<String>, after: After) -> Self {
+        Self {
+            policy,
+            terminal,
+            cmd,
+            after,
+        }
+    }
 }
 
 /// The command runs only when the pull reached the target: [`next`] is a closed match, so a
@@ -27,7 +48,10 @@ pub fn run(session: &Session, args: Args, ports: &Ports) -> Result<Outcome> {
                 terminal: args.terminal,
                 cmd: args.cmd,
             };
-            exec::run(session, command, ports)
+            match args.after {
+                After::Return => exec::run(session, command, ports),
+                After::Wait(limits) => run_then_wait(session, command, limits, ports),
+            }
         }
     }
 }
@@ -61,6 +85,7 @@ mod tests {
             policy: JobPolicy::Respect,
             terminal: Terminal::Plain,
             cmd: vec!["python".into(), "train.py".into()],
+            after: After::Return,
         }
     }
 

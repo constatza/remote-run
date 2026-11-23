@@ -1,6 +1,7 @@
 //! What `rr` knows about Slurm: the `squeue`, `sacct` and `scancel` command text and the field
 //! layouts it reads back. Pure; every runtime value reaches the text through [`quote`].
 
+use crate::domain::exit::{Exit, RrCode};
 use crate::domain::shell::{Script, lit, number, quote};
 use anyhow::{Result, bail};
 
@@ -134,6 +135,226 @@ pub fn job_workdirs_command() -> Script {
     lit("squeue --me -h -o ").word(quote(JOB_WORKDIR_FORMAT))
 }
 
+/// The `sacct` fields [`parse_states`](crate::domain::wait::parse_states) reads, in this order.
+pub const STATE_FIELDS: &str = "JobID,State";
+
+/// The `sacct -P` fields `rr status` reads: the job's progress, then [`SACCT_FIELDS`] last, so
+/// that the rest of the line after the three progress fields is a line `parse_sacct` reads.
+pub const STATUS_FIELDS: &str = "State,Elapsed,ExitCode,JobIDRaw,JobID,JobName,User,WorkDir,StdOut";
+
+/// `sbatch` prints this before the job id; `rr run --wait` looks for it in a command's output.
+pub const SUBMITTED_PREFIX: &str = "Submitted batch job ";
+
+/// A job that is waiting or running; it can still change state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Active {
+    Pending,
+    Running,
+    Completing,
+    Suspended,
+    Stopped,
+    Resizing,
+    Requeued,
+    SpecialExit,
+}
+
+impl Active {
+    const ALL: [Active; 8] = [
+        Active::Pending,
+        Active::Running,
+        Active::Completing,
+        Active::Suspended,
+        Active::Stopped,
+        Active::Resizing,
+        Active::Requeued,
+        Active::SpecialExit,
+    ];
+
+    /// The state as `sacct` spells it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Active::Pending => "PENDING",
+            Active::Running => "RUNNING",
+            Active::Completing => "COMPLETING",
+            Active::Suspended => "SUSPENDED",
+            Active::Stopped => "STOPPED",
+            Active::Resizing => "RESIZING",
+            Active::Requeued => "REQUEUED",
+            Active::SpecialExit => "SPECIAL_EXIT",
+        }
+    }
+}
+
+/// A job that will not change state again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Finished {
+    Completed,
+    Failed,
+    Cancelled,
+    Timeout,
+    Deadline,
+    OutOfMemory,
+    NodeFail,
+    BootFail,
+    Preempted,
+    Revoked,
+}
+
+impl Finished {
+    const ALL: [Finished; 10] = [
+        Finished::Completed,
+        Finished::Failed,
+        Finished::Cancelled,
+        Finished::Timeout,
+        Finished::Deadline,
+        Finished::OutOfMemory,
+        Finished::NodeFail,
+        Finished::BootFail,
+        Finished::Preempted,
+        Finished::Revoked,
+    ];
+
+    /// The state as `sacct` spells it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Finished::Completed => "COMPLETED",
+            Finished::Failed => "FAILED",
+            Finished::Cancelled => "CANCELLED",
+            Finished::Timeout => "TIMEOUT",
+            Finished::Deadline => "DEADLINE",
+            Finished::OutOfMemory => "OUT_OF_MEMORY",
+            Finished::NodeFail => "NODE_FAIL",
+            Finished::BootFail => "BOOT_FAIL",
+            Finished::Preempted => "PREEMPTED",
+            Finished::Revoked => "REVOKED",
+        }
+    }
+}
+
+/// What `sacct` says a job is doing. A state this table does not know is [`JobState::Unknown`]
+/// and is never taken as the end of a job: only a known [`Finished`] state stops a wait.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobState {
+    Active(Active),
+    Finished(Finished),
+    /// The text `sacct` printed, for the user to read.
+    Unknown(String),
+}
+
+impl JobState {
+    /// Read a `sacct` state. `CANCELLED by 123` is `CANCELLED`, and a trailing `+` (a name cut to
+    /// the column width) is dropped.
+    pub fn parse(text: &str) -> Self {
+        let word = text
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('+');
+        if let Some(state) = Active::ALL.into_iter().find(|s| s.name() == word) {
+            return JobState::Active(state);
+        }
+        match Finished::ALL.into_iter().find(|s| s.name() == word) {
+            Some(state) => JobState::Finished(state),
+            None => JobState::Unknown(text.trim().to_string()),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            JobState::Active(state) => state.name(),
+            JobState::Finished(state) => state.name(),
+            JobState::Unknown(raw) => raw,
+        }
+    }
+}
+
+/// A job and its state, as one `sacct` line gave them. The id is what `sacct` prints (`123`,
+/// `123_4`, `123_[5-9]`), so it is a [`SqueueId`], not a [`JobId`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobStatus {
+    pub id: SqueueId,
+    pub state: JobState,
+}
+
+/// At least one job id: waiting for no job would end at once as "all completed".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobSet(Vec<JobId>);
+
+impl JobSet {
+    pub fn new(jobs: Vec<JobId>) -> Result<Self> {
+        if jobs.is_empty() {
+            bail!("no job id given");
+        }
+        Ok(Self(jobs))
+    }
+
+    pub fn as_slice(&self) -> &[JobId] {
+        &self.0
+    }
+}
+
+/// The jobs `sbatch` reported in `lines` (the output lines that start with
+/// [`SUBMITTED_PREFIX`]); `None` when there are none. The text is a program's output, so only a
+/// token that is a valid [`JobId`] counts: `Submitted batch job 12 on cluster x` is job 12.
+pub fn submitted_jobs(lines: &[String]) -> Option<JobSet> {
+    let jobs = lines
+        .iter()
+        .filter_map(|line| {
+            let rest = line.strip_prefix(SUBMITTED_PREFIX)?;
+            JobId::parse(rest.split_whitespace().next()?).ok()
+        })
+        .collect();
+    JobSet::new(jobs).ok()
+}
+
+/// How a wait ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// Every job is COMPLETED.
+    Completed(Vec<JobStatus>),
+    /// A job ended in a state other than COMPLETED (the others may still be active).
+    Failed(Vec<JobStatus>),
+    /// `--timeout` passed with jobs still active; these are the states last read.
+    TimedOut(Vec<JobStatus>),
+    /// `rr` could not learn how the jobs ended; `why` is remote or program text.
+    Unknown { why: String },
+}
+
+impl WaitOutcome {
+    /// Success only when every job completed; each other ending has its own code, and none of
+    /// them is a remote command's.
+    pub fn exit(&self) -> Exit {
+        match self {
+            WaitOutcome::Completed(_) => Exit::Success,
+            WaitOutcome::Failed(_) => Exit::Rr(RrCode::JobFailed),
+            WaitOutcome::TimedOut(_) => Exit::Rr(RrCode::Timeout),
+            WaitOutcome::Unknown { .. } => Exit::Rr(RrCode::Unknown),
+        }
+    }
+}
+
+/// One `JobID,State` line per job (`-X`), for
+/// [`parse_states`](crate::domain::wait::parse_states). The comma-joined ids are one quoted word.
+pub fn states_script(jobs: &JobSet) -> Script {
+    let ids: Vec<&str> = jobs.as_slice().iter().map(JobId::as_str).collect();
+    lit("sacct -n -X ")
+        .lit(SACCT_PARSABLE)
+        .lit(" -j ")
+        .word(quote(&ids.join(",")))
+        .lit(" -o ")
+        .lit(STATE_FIELDS)
+}
+
+/// One job's record and progress, for `rr status`.
+pub fn status_script(job: &JobId) -> Script {
+    lit("sacct -n -X ")
+        .lit(SACCT_PARSABLE)
+        .lit(" -j ")
+        .word(quote(job.as_str()))
+        .lit(" -o ")
+        .lit(STATUS_FIELDS)
+}
+
 #[allow(clippy::disallowed_methods)] // tests build real files
 #[cfg(test)]
 mod tests {
@@ -250,6 +471,91 @@ mod tests {
             job_workdirs_command().to_string(),
             "squeue --me -h -o '%i %Z'"
         );
+    }
+
+    #[test]
+    fn every_sacct_state_is_known_and_an_unknown_one_keeps_its_text() {
+        let state = |text| JobState::parse(text);
+        for name in [
+            "PENDING",
+            "RUNNING",
+            "COMPLETING",
+            "SUSPENDED",
+            "STOPPED",
+            "RESIZING",
+            "REQUEUED",
+            "SPECIAL_EXIT",
+        ] {
+            assert!(matches!(state(name), JobState::Active(_)), "{name}");
+            assert_eq!(state(name).name(), name);
+        }
+        for name in [
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMEOUT",
+            "DEADLINE",
+            "OUT_OF_MEMORY",
+            "NODE_FAIL",
+            "BOOT_FAIL",
+            "PREEMPTED",
+            "REVOKED",
+        ] {
+            assert!(matches!(state(name), JobState::Finished(_)), "{name}");
+            assert_eq!(state(name).name(), name);
+        }
+        assert_eq!(
+            state("CANCELLED by 123"),
+            JobState::Finished(Finished::Cancelled)
+        );
+        assert_eq!(state("CANCELLED+"), JobState::Finished(Finished::Cancelled));
+        assert_eq!(
+            state(" RESV_DEL_HOLD \n"),
+            JobState::Unknown("RESV_DEL_HOLD".into())
+        );
+        assert_eq!(state(""), JobState::Unknown(String::new()));
+        assert_eq!(state("completed"), JobState::Unknown("completed".into()));
+    }
+
+    #[test]
+    fn the_states_script_asks_for_all_jobs_in_one_quoted_word() {
+        let jobs = JobSet::new(vec![id("1"), id("2_3")]).unwrap();
+        assert_eq!(
+            states_script(&jobs).to_string(),
+            r#"sacct -n -X -P --delimiter=$'\x1f' -j '1,2_3' -o JobID,State"#
+        );
+        assert!(JobSet::new(vec![]).is_err());
+    }
+
+    #[test]
+    fn the_status_script_reads_the_record_fields_first() {
+        assert!(STATUS_FIELDS.ends_with(SACCT_FIELDS));
+        assert_eq!(
+            status_script(&id("9")).to_string(),
+            format!(r#"sacct -n -X -P --delimiter=$'\x1f' -j '9' -o {STATUS_FIELDS}"#)
+        );
+    }
+
+    /// The text is a program's output: only a well-formed id after the exact prefix counts.
+    #[test]
+    fn submitted_jobs_come_only_from_well_formed_sbatch_lines() {
+        let lines = |text: &[&str]| text.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let found = submitted_jobs(&lines(&[
+            "Submitted batch job 12",
+            "Submitted batch job 13 on cluster x",
+        ]))
+        .unwrap();
+        assert_eq!(found.as_slice(), [id("12"), id("13")]);
+        for bad in [
+            &[][..],
+            &["submitted batch job 1"],
+            &["Submitted batch job"],
+            &["Submitted batch job -u"],
+            &["Submitted batch job $(id)"],
+            &[" Submitted batch job 1"],
+        ] {
+            assert_eq!(submitted_jobs(&lines(bad)), None, "{bad:?}");
+        }
     }
 
     /// Run `command` under bash with a stand-in for `program` that prints its arguments one per

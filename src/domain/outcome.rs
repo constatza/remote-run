@@ -3,8 +3,11 @@
 
 use crate::domain::exit::{Exit, RemoteExit, RrCode};
 use crate::domain::ids::Digest;
+use crate::domain::json;
 use crate::domain::pull::{Next, PullOutcome, next};
 use crate::domain::sanitize::{error_line, sanitize};
+use crate::domain::slurm::{JobStatus, WaitOutcome};
+use crate::domain::status::{LogTail, StatusReport};
 use crate::domain::transfer::Transfer;
 use std::path::PathBuf;
 
@@ -19,6 +22,10 @@ pub enum Outcome {
     Transferred(Transfer),
     /// The project file `rr trust` showed or recorded.
     Trust(TrustReport),
+    /// A wait ended so: `rr wait`, or `rr run --wait` after its command.
+    Waited(WaitOutcome),
+    /// One job's status, from `rr status`.
+    Status(StatusReport),
 }
 
 /// What `rr trust` did with a project file.
@@ -40,11 +47,13 @@ pub struct TrustReport {
     pub state: TrustState,
 }
 
-/// How the result is written. One variant for now, so the match in [`render`] is exhaustive and a
-/// new format must be handled there.
+/// How the result is written. [`render`] matches it exhaustively, so a new format must be handled
+/// there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Text,
+    /// One JSON object on stdout; the exit code is the same as in text.
+    Json,
 }
 
 /// What `main` writes and exits with.
@@ -71,6 +80,14 @@ impl Rendered {
 pub fn render(outcome: &Outcome, format: Format) -> Rendered {
     match format {
         Format::Text => render_text(outcome),
+        Format::Json => {
+            let exit = render_text(outcome).exit;
+            Rendered {
+                exit,
+                stdout: format!("{}\n", json::document(outcome, exit)),
+                stderr: String::new(),
+            }
+        }
     }
 }
 
@@ -94,6 +111,60 @@ fn render_text(outcome: &Outcome) -> Rendered {
             },
         },
         Outcome::Trust(report) => render_trust(report),
+        Outcome::Waited(waited) => Rendered {
+            exit: waited.exit(),
+            stdout: String::new(),
+            stderr: lines(&wait_report(waited)),
+        },
+        Outcome::Status(report) => Rendered {
+            exit: Exit::Success,
+            stdout: lines(&status_report(report)),
+            stderr: String::new(),
+        },
+    }
+}
+
+/// What `rr status` prints: the job's progress, then the end of its log. All remote text.
+pub fn status_report(report: &StatusReport) -> Vec<String> {
+    let (status, record) = (&report.status, &report.status.record);
+    let mut out = vec![
+        format!("job {} ({})", sanitize(&record.id), sanitize(&record.name)),
+        format!("state {}", sanitize(status.state.name())),
+        format!("elapsed {}", sanitize(&status.elapsed)),
+        format!("exit {}", sanitize(&status.exit_code)),
+        format!("dir {}", sanitize(&record.workdir)),
+    ];
+    match &report.log {
+        LogTail::Lines { path, lines } => {
+            out.push(format!("log {}", sanitize(path)));
+            out.extend(lines.iter().map(|line| sanitize(line)));
+        }
+        LogTail::Unavailable { why } => out.push(format!("log unavailable: {}", sanitize(why))),
+    }
+    out
+}
+
+/// One line per job (`rr: 123 RUNNING`), then why the wait stopped when that is not plain from the
+/// states. Job ids and states are remote text.
+pub fn wait_report(outcome: &WaitOutcome) -> Vec<String> {
+    let states = |rows: &[JobStatus]| -> Vec<String> {
+        let line = |row: &JobStatus| {
+            let state = row.state.name();
+            format!("rr: {} {}", sanitize(row.id.as_str()), sanitize(state))
+        };
+        rows.iter().map(line).collect()
+    };
+    match outcome {
+        WaitOutcome::Completed(rows) | WaitOutcome::Failed(rows) => states(rows),
+        WaitOutcome::TimedOut(rows) => {
+            let mut report = states(rows);
+            report.push("rr: timed out; the jobs are still active".to_string());
+            report
+        }
+        WaitOutcome::Unknown { why } => vec![format!(
+            "rr: could not tell how the jobs ended: {}",
+            sanitize(why)
+        )],
     }
 }
 
@@ -306,6 +377,40 @@ mod tests {
         assert_eq!(rendered.exit, Exit::Rr(RrCode::Failure));
         assert_eq!(rendered.stderr, "rr: sacct failed: remote said ?[2J\n");
         assert_eq!(rendered.stdout, "");
+    }
+
+    #[test]
+    fn a_wait_prints_one_line_per_job_and_exits_with_its_own_code() {
+        use crate::domain::slurm::{JobState, SqueueId};
+        let row = |id: &str, state: &str| JobStatus {
+            id: SqueueId::parse(id).unwrap(),
+            state: JobState::parse(state),
+        };
+        let rows = vec![row("7", "COMPLETED"), row("8", "FAILED\u{1b}[2J")];
+        let waited = |outcome| text(&Outcome::Waited(outcome));
+        let done = waited(WaitOutcome::Completed(rows.clone()));
+        assert_eq!(done.exit, Exit::Success);
+        let failed = waited(WaitOutcome::Failed(rows.clone()));
+        assert_eq!(failed.exit, Exit::Rr(RrCode::JobFailed));
+        assert_eq!(
+            failed.stderr,
+            "rr: 7 COMPLETED\nrr: 8 ?[2J\n".replace("?[2J", "FAILED?[2J")
+        );
+        let late = waited(WaitOutcome::TimedOut(rows));
+        assert_eq!(late.exit, Exit::Rr(RrCode::Timeout));
+        assert!(
+            late.stderr
+                .ends_with("rr: timed out; the jobs are still active\n")
+        );
+        let unknown = waited(WaitOutcome::Unknown {
+            why: "no\u{1b}[2J".into(),
+        });
+        assert_eq!(unknown.exit, Exit::Rr(RrCode::Unknown));
+        assert_eq!(
+            unknown.stderr,
+            "rr: could not tell how the jobs ended: no?[2J\n"
+        );
+        assert_eq!(unknown.stdout, "");
     }
 
     #[test]

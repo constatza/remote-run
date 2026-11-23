@@ -12,6 +12,13 @@ pub enum RrCode {
     Failure,
     /// A guard said no (or the remote environment is stale): nothing was done.
     Refused,
+    /// `rr wait` gave up: the jobs were still running when `--timeout` ended.
+    Timeout,
+    /// A job ended in a state other than COMPLETED.
+    JobFailed,
+    /// `rr` could not learn how a job ended (ssh or sacct unreachable, no job found). Never read
+    /// as a failure of the job.
+    Unknown,
 }
 
 impl RrCode {
@@ -19,6 +26,9 @@ impl RrCode {
         match self {
             RrCode::Failure => 1,
             RrCode::Refused => 3,
+            RrCode::Timeout => 4,
+            RrCode::JobFailed => 5,
+            RrCode::Unknown => 6,
         }
     }
 }
@@ -89,6 +99,13 @@ mod tests {
         assert_ne!(Exit::remote(3), Exit::Rr(RrCode::Refused));
         assert_ne!(Exit::remote(1), Exit::Rr(RrCode::Failure));
         assert_eq!((RrCode::Failure.code(), RrCode::Refused.code()), (1, 3));
+    }
+
+    /// 2 is clap's usage error; 126, 127, 128+n and 255 belong to shells and ssh.
+    #[test]
+    fn the_wait_codes_avoid_every_other_meaning() {
+        let codes = [RrCode::Timeout, RrCode::JobFailed, RrCode::Unknown].map(RrCode::code);
+        assert_eq!(codes, [4, 5, 6]);
     }
 
     #[test]

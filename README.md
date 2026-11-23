@@ -1,6 +1,6 @@
 # remote-run (`rr`)
 
-Work on a remote Slurm cluster from your own machine: run commands in a remote project, look at the queue and job logs, fast-forward the remote checkout, and copy small files. Everything goes through your system `ssh`, so `~/.ssh/config` (aliases, `User`, `IdentityFile`, `ProxyJump`), ssh-agent and `known_hosts` apply as they do for `ssh <host>`.
+Work on a remote Slurm cluster from your own machine: run commands in a remote project, look at the queue and job logs, wait for jobs to end, fast-forward the remote checkout, and copy small files. Everything goes through your system `ssh`, so `~/.ssh/config` (aliases, `User`, `IdentityFile`, `ProxyJump`), ssh-agent and `known_hosts` apply as they do for `ssh <host>`.
 
 `rr` adds three checks that a plain alias leaves out:
 
@@ -64,9 +64,11 @@ rr q                          # your queued and running jobs (squeue --me)
 rr acct [--since now-3days]   # your recent jobs (sacct)
 rr log <job> [-f] [-n 100]    # a job's log; -f follows it, Ctrl-C stops
 rr cancel <job>...            # scancel
+rr status <job> [-n 10]       # state, elapsed time, exit code, directory and the end of the log
+rr wait <job>... [--timeout S] [--poll S]   # wait until the jobs end
 rr x [-t] -- <cmd>...         # run a command in the remote project (-t: allocate a terminal)
 rr pull [--force]             # fast-forward the remote checkout to your local HEAD
-rr run [-t] [--force] -- <cmd>...   # pull, then run
+rr run [-t] [--force] [--wait] -- <cmd>...   # pull, then run; --wait then waits for the jobs it submitted
 rr get <remote> [local]       # rsync from the remote; relative paths are inside the project
 rr put <local> [remote]       # rsync to the remote (default: the project directory); never deletes
 ```
@@ -79,6 +81,26 @@ What reaches your terminal:
 Remote paths are absolute or relative to the project directory. Only a leading `~/` is read, as the remote home; no other `~` is expanded (rsync is run with `-s`, so the remote shell never sees the path). A local path with a `:` before its first `/` is copied as a file name, not as a remote host. `rr log` and `rr cancel` accept only job ids such as `123`, `123_4` or `123.batch`.
 
 `get` and `put` measure first (`rsync --dry-run --stats`) and refuse anything above `--limit`, 1G by default. They are meant for logs, configs and figures, not datasets.
+
+### `rr wait`, `rr run --wait` and exit codes
+
+`rr wait` asks `sacct` every `--poll` seconds (default 30, at least 5) until every job has ended or `--timeout` seconds (default 86400, 24 hours) have passed. It stops at the first job that ended in any state other than `COMPLETED`, because a job that depends on it may never start. `REQUEUED` and the other active states keep it waiting; a state `rr` does not know never ends the wait, so the timeout is what stops it.
+
+`rr run --wait` runs the command with its output shown as it comes, then waits for every job that printed `Submitted batch job <id>`. If the command exits non-zero, that is its code and nothing is waited for. If it exits 0 without such a line, `rr` exits 6, because nothing says what to wait for. `--timeout` and `--poll` are read before the command only: after it, a flag belongs to the command.
+
+| Exit | Meaning |
+|---|---|
+| 0 | done (for a wait: every job `COMPLETED`) |
+| 1 | an `rr` error |
+| 2 | wrong usage |
+| 3 | refused by a guard (pull, a copy over its limit) |
+| 4 | `rr wait` timed out with jobs still active |
+| 5 | a job ended in a state other than `COMPLETED` |
+| 6 | `rr` could not tell how the jobs ended: ssh or `sacct` failed or did not list a job yet, five polls in a row, or `run --wait` found no job id |
+
+A failed ssh or an empty `sacct` answer (accounting can lag a new submission) is retried five times and then ends as 6, never as 5: the job may be fine. `rr x` and `rr run` return the remote command's own code, which can be any number, so 1 to 6 can also be a command's code. `--json` says which: `"source": "rr"` or `"source": "remote"`.
+
+`--json` (before or after the command) prints one JSON object on stdout for `status`, `wait`, `pull`, `get`, `put`, `trust` and `run --wait`, with `source`, `exit` and a `kind`. A refused pull names a `reason`: `not_on_origin`, `remote_dirty`, `jobs_from_checkout` or `state_changed`. The lines `rr` writes to stderr while a command runs stay text. `q`, `acct`, `log` and `x` print the program's own text and have no JSON form of their own; with `--json` they print `{"source":"remote","exit":N,"kind":"command"}` after that text. Text from the cluster in the JSON has terminal control characters replaced, as in text mode.
 
 ### `rr pull`
 
