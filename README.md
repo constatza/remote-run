@@ -73,7 +73,7 @@ rr put <local> [remote]       # rsync to the remote (default: the project direct
 
 What reaches your terminal:
 
-- `rr q`, `rr acct` and `rr log` print text a job or the cluster wrote, so `rr` reads it line by line and replaces terminal control characters (escape sequences such as title changes and clipboard writes, bidirectional overrides, invisible format characters) with `?`. A carriage return that ends a line is dropped; any other one becomes `?`. Invalid UTF-8 shows as U+FFFD, and a line longer than 64 KiB is printed in pieces.
+- `rr q`, `rr acct` and `rr log` print text a job or the cluster wrote, so `rr` reads it line by line and replaces terminal control characters (escape sequences such as title changes and clipboard writes, bidirectional overrides, invisible format characters, tag characters) with `?`. A carriage return that ends a line (`\r\n`) is kept, because `rr log -f` runs `ssh -t` and a raw-mode terminal needs it to return to column 0; any other one becomes `?`, so a progress bar that rewrites its line is not drawn. Invalid UTF-8 shows as U+FFFD, and a line longer than 64 KiB is printed in pieces.
 - `rr x` and `rr run` are raw by design: you chose that program, and `-t` sessions need its exact bytes. For the unfiltered bytes of a file, use `rr x -- cat <file>`.
 
 Remote paths are absolute or relative to the project directory. Only a leading `~/` is read, as the remote home; no other `~` is expanded (rsync is run with `-s`, so the remote shell never sees the path). A local path with a `:` before its first `/` is copied as a file name, not as a remote host. `rr log` and `rr cancel` accept only job ids such as `123`, `123_4` or `123.batch`.

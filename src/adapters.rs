@@ -210,9 +210,9 @@ mod tests {
     }
 
     #[test]
-    fn bad_utf8_and_terminal_newlines_are_cleaned_and_a_huge_line_does_not_stall() {
+    fn bad_utf8_is_cleaned_a_terminal_newline_is_kept_and_a_huge_line_does_not_stall() {
         let (_, out, _) = filtered(r"printf 'caf\351\r\n'");
-        assert_eq!(out, "caf\u{FFFD}\n");
+        assert_eq!(out, "caf\u{FFFD}\r\n");
         let (code, out, _) = filtered("head -c 300000 /dev/zero | tr '\\000' a");
         assert_eq!((code, out.len()), (0, 300_000));
     }
