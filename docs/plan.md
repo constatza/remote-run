@@ -17,7 +17,7 @@ Why R0 comes before R: the refactor is about ten commits, and the safety review 
 
 ## Progress
 
-Commits `91c06e7` to `8a09db1`. The final tree passes `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` (159 tests). The refactor landed as one entangled change, so only the last commit builds on its own.
+Commits `91c06e7` to `8a09db1`, then the A6 commits. The tree passes `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`. The refactor landed as one entangled change, so only the last commit builds on its own.
 
 | Phase | State | Remaining |
 |---|---|---|
@@ -28,7 +28,7 @@ Commits `91c06e7` to `8a09db1`. The final tree passes `cargo fmt --check`, `carg
 | A3 terminal text | partly | `sanitize` and `error_line` cover every message `main` prints. `q`, `acct` and `log` still inherit stdio, so remote bytes bypass `rr`: add a line-wise `stream_filtered` |
 | A4 job ids | done | `--wait` stdout parsing comes with Phase B |
 | A5 README and `about` wording | not done | `cli.rs` and `lib.rs` still say "submit, watch" |
-| A6 pull guards | partly | done: fail-closed state parsing, `realpath -m` workdirs, an unresolvable workdir blocks, uv missing is exit 127 and a mismatch is 75. Not done: re-assert `HEAD` and a clean tree inside the merge script, `git branch -r --contains <sha>`, the POSIX-login-shell note |
+| A6 pull guards | partly | done: fail-closed state parsing, `realpath -m` workdirs, an unresolvable workdir blocks, uv missing is exit 127 and a mismatch is 75; the merge script re-asserts `HEAD == from` and a clean tree and exits 76 (`Reason::StateChanged`, a refusal); `git branch -r --contains` must be non-empty or the target is `NotOnOrigin`; the POSIX-login-shell note is in the README (the script still goes as `bash -c '<script>'`, not on stdin). Not done: confirming on a real host that the stand-in-tested `git branch -r --contains <sha> --list 'origin/*'` and `realpath -m` behave the same on the cluster's git and coreutils |
 | B `wait`, `--json`, `status` | not started | all |
 | C `fwd` | not started | all |
 | D snapshots | not started | step 0 probe on the real host first |
@@ -184,10 +184,10 @@ A1 and the stopgap form of A2 ship in R0 in the current code. Phase A is what re
 - `SqueueId` (lenient, any non-empty token without whitespace) is for the pull guard. `parse_state` turns any line it cannot read into a refusal, never a skip.
 
 **A6. Harden the existing pull guards (not in the draft; found by the safety review).**
-- `state_script` proves the target with `git rev-parse -q --verify <sha>^{commit}` (`pull.rs:153-158`). That shows the object exists in the remote store, not that it is reachable from an origin ref (an old fetch, a force-pushed branch). Add `git branch -r --contains <sha>` and require a non-empty answer before `NotOnOrigin` is cleared.
-- There are two ssh calls (read state, apply) with a window between them. `apply_script` must re-assert `HEAD == from` and an empty `git status --porcelain` before `git merge --ff-only`, and exit with a distinct "state changed" code that maps to a refusal.
-- `inside(workdir, dir)` (`pull.rs:121`) compares strings. Slurm's `%Z` and `pwd -P` can differ through a symlinked home. Compare after `readlink -f` on both sides, and treat any path that cannot be resolved as "in use". Implemented with `realpath -m` on the remote, in the same script. Known gap: `squeue %Z` is the submit directory, so a job submitted from another directory with `sbatch proj/run.sh` is not detected; `%o` is not used.
-- The remote shell is assumed to be POSIX at login: `ssh_argv` sends `bash -c '<multi-line>'`, which breaks under csh and changes meaning under fish. Document the requirement, or send the script on stdin to `bash -s`.
+- Target on origin: `state_script` resolves the target with `git rev-parse -q --verify <sha>^{commit}` (the object exists), then runs `git branch -r --contains <sha> --list 'origin/*'`. `parse_state` keeps the target only when at least one `onorigin` line is present; a line that is not an `origin/` branch, or branches for a target that did not resolve, are errors, and a failing `git branch` fails the script. Done.
+- Two ssh calls (read state, apply) leave a window. `apply_script` re-asserts `HEAD == from` and an empty `git status --porcelain` on the remote before `git merge --ff-only`; any mismatch, or a `git` that fails inside the check, exits `STATE_CHANGED_EXIT` (76), which `app::pull` maps to `PullOutcome::Refused(Reason::StateChanged)`. Done.
+- `inside(workdir, dir)` compares after `realpath -m` on the remote, in the same script; a path that cannot be resolved counts as in use. Done. Known gap: `squeue %Z` is the submit directory, so a job submitted from another directory with `sbatch proj/run.sh` is not detected; `%o` is not used.
+- The remote shell is assumed to be POSIX at login: `ssh_argv` sends `bash -c '<multi-line>'`, which breaks under csh and changes meaning under fish. Documented in the README; the script is not sent on stdin to `bash -s`, because that changes `ssh_argv` and `Remote`, which other work owns.
 
 **A5. README drift.** Reword the tagline now ("submit, watch" do not exist yet) and again when item 2 lands.
 

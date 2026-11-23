@@ -7,8 +7,8 @@ use crate::config::Session;
 use crate::domain::outcome::Outcome;
 use crate::domain::place::{Place, script};
 use crate::domain::pull::{
-    JobPolicy, PullDecision, PullOutcome, STALE_EXIT, Target, UV_MISSING_EXIT, apply_script,
-    decide, parse_state, state_script, verify_script,
+    JobPolicy, PullDecision, PullOutcome, Reason, STALE_EXIT, STATE_CHANGED_EXIT, Target,
+    UV_MISSING_EXIT, apply_script, decide, parse_state, state_script, verify_script,
 };
 use crate::ports::Remote;
 use anyhow::{Result, bail};
@@ -53,6 +53,7 @@ fn sync(
     let stderr = applied.stderr.trim().to_string();
     match (applied.code, permit) {
         (STALE_EXIT, _) => Ok(PullOutcome::Stale { stderr }),
+        (STATE_CHANGED_EXIT, Some(_)) => Ok(PullOutcome::Refused(Reason::StateChanged)),
         (UV_MISSING_EXIT, _) => bail!(
             "cannot check the remote environment: uv is not on the remote PATH (set `env` to a \
              file that puts it there):\n{stderr}"
@@ -72,7 +73,7 @@ mod tests {
     use super::*;
     use crate::domain::exit::RrCode;
     use crate::domain::ids::Commit;
-    use crate::domain::pull::{Next, Reason, next};
+    use crate::domain::pull::{Next, next};
     use crate::ports::fake::{Reply, output};
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -83,7 +84,10 @@ mod tests {
     }
 
     fn report(head: &str, target: &str, extra: &str) -> String {
-        format!("rr-state\tdir\t/d\nrr-state\thead\t{head}\nrr-state\ttarget\t{target}\n{extra}")
+        format!(
+            "rr-state\tdir\t/d\nrr-state\thead\t{head}\nrr-state\ttarget\t{target}\n\
+             rr-state\tonorigin\t  origin/main\n{extra}"
+        )
     }
 
     /// A remote that answers `capture` from a queue and never streams: the commands that follow a
@@ -136,6 +140,9 @@ mod tests {
         let merge = format!("git merge -q --ff-only '{B}'\n");
         assert!(sent[1].contains(&merge), "{}", sent[1]);
         assert!(sent[1].contains("uv sync --frozen --check"));
+        // the re-assertion comes before the merge, so a changed checkout is never merged
+        let guard = sent[1].find(&format!("\"$head\" = '{A}'")).unwrap();
+        assert!(guard < sent[1].find("git merge").unwrap(), "{}", sent[1]);
     }
 
     #[test]
@@ -173,6 +180,50 @@ mod tests {
         let second = stub.sent()[1].clone();
         assert!(!second.contains("merge"));
         assert!(second.contains("uv sync --frozen --check"));
+    }
+
+    /// The commit exists in the remote store but no `origin/*` branch contains it: refused, and
+    /// nothing but the state read is sent.
+    #[test]
+    fn a_target_no_origin_branch_contains_is_refused_before_any_merge() {
+        let unpushed = "rr-state\tdir\t/d\nrr-state\thead\t".to_string()
+            + A
+            + "\nrr-state\ttarget\t"
+            + B
+            + "\n";
+        let stub = Stub::new(vec![(0, &unpushed, "")]);
+        let outcome = stub.pull(JobPolicy::Override).unwrap();
+        let reason = Reason::NotOnOrigin(Target::Local(commit(B)));
+        assert_eq!(outcome, PullOutcome::Refused(reason));
+        assert_eq!(stub.sent().len(), 1);
+    }
+
+    /// The merge script found `HEAD` or the tree changed since the read: a refusal, not an error
+    /// and not an advance, and the command that follows does not run.
+    #[test]
+    fn a_checkout_that_changed_between_read_and_merge_is_refused() {
+        let stub = Stub::new(vec![
+            (0, &report(A, B, ""), ""),
+            (
+                STATE_CHANGED_EXIT,
+                "",
+                "the remote checkout changed since it was read\n",
+            ),
+        ]);
+        let outcome = stub.pull(JobPolicy::Respect).unwrap();
+        assert_eq!(outcome, PullOutcome::Refused(Reason::StateChanged));
+        assert_eq!(next(&outcome), Next::Stop(RrCode::Refused));
+    }
+
+    /// The state-changed code is only meaningful from the merge script. From the environment
+    /// check of an up-to-date checkout it is an unexpected failure, so it is an error.
+    #[test]
+    fn the_state_changed_code_without_a_merge_is_an_error() {
+        let stub = Stub::new(vec![
+            (0, &report(B, B, ""), ""),
+            (STATE_CHANGED_EXIT, "", ""),
+        ]);
+        assert!(stub.pull(JobPolicy::Respect).is_err());
     }
 
     #[test]
