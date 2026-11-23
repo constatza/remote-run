@@ -12,8 +12,8 @@ mod state;
 
 pub use decide::{JobPolicy, Permit, PullDecision, Reason, decide, merge_refusal};
 pub(crate) use state::job_loop;
-use state::read_blocking_jobs_script;
 pub use state::{Job, RemoteState, Workdir, parse_state, state_script};
+use state::{read_blocking_jobs_script, status_command};
 
 use crate::domain::exit::RrCode;
 use crate::domain::ids::Commit;
@@ -91,10 +91,11 @@ pub(crate) fn verify_script() -> Script {
 /// let _ = remote_run::domain::pull::apply_script;
 /// ```
 pub(crate) fn apply_script(permit: &Permit) -> Script {
-    let checks =
-        lit(r#"head=$(git rev-parse HEAD) && dirty=$(git status --porcelain) && [ "$head" = "#)
-            .word(quote(permit.from().as_str()))
-            .lit(r#" ] && [ -z "$dirty" ]"#);
+    let checks = lit("head=$(git rev-parse HEAD) && dirty=$(")
+        .then(status_command())
+        .lit(r#") && [ "$head" = "#)
+        .word(quote(permit.from().as_str()))
+        .lit(r#" ] && [ -z "$dirty" ]"#);
     let checks = checks.then(refuse_unless(CHANGED_NOTE));
     let checks = match permit.policy() {
         JobPolicy::Respect => checks
@@ -456,6 +457,15 @@ mod tests {
 
     /// The merge-time check and the state read build the query and the path normalisation from
     /// the same loop, so the squeue format and `realpath -m` cannot differ between them.
+    /// The merge-time check must not call a checkout dirty that the state read called clean.
+    #[test]
+    fn the_merge_script_reads_the_tree_the_way_the_state_script_does() {
+        let permit = Permit::between(commit(A), commit(B), JobPolicy::Override);
+        let status = state::status_command().to_string();
+        assert!(status.contains("rr-snapshots"), "{status}");
+        assert!(apply_script(&permit).to_string().contains(&status));
+    }
+
     #[test]
     fn the_merge_script_asks_the_same_job_question_as_the_state_script() {
         let permit = Permit::between(commit(A), commit(B), JobPolicy::Respect);

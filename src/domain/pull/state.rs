@@ -8,6 +8,7 @@ use super::Target;
 use crate::domain::ids::Commit;
 use crate::domain::shell::{Script, lit, quote};
 use crate::domain::slurm::{SqueueId, job_workdirs_command};
+use crate::domain::snapshot::ROOT as SNAPSHOT_ROOT;
 use anyhow::{Context, Result, bail};
 
 /// Starts every line of the state report; a tab separates the fields after it.
@@ -131,6 +132,14 @@ pub(super) fn read_blocking_jobs_script() -> Script {
         .lit(")")
 }
 
+/// `git status --porcelain` for the checkout, without the directory `rr run --mode snapshot` keeps
+/// in it: it is untracked and would make every checkout look dirty after the first snapshot run.
+/// An exclude pathspec avoids writing a rule into the remote's `.git`. The state read and the
+/// merge-time check both use it, so they cannot disagree on what "clean" means.
+pub(super) fn status_command() -> Script {
+    lit("git status --porcelain -- . ").word(quote(&format!(":(exclude){SNAPSHOT_ROOT}")))
+}
+
 /// The `origin/*` branches that contain the resolved `$target`, one `onorigin` field each; prints
 /// nothing when there is no target. A `git` that fails here fails the script (`pipefail`), so an
 /// unreadable answer is an error and never an empty one.
@@ -155,7 +164,7 @@ pub fn state_script(target: &Target) -> Script {
         resolved,
         field("target", lit(r#""$target""#)),
         origin_branches_script(),
-        each_line(lit("git status --porcelain"), "dirty"),
+        each_line(status_command(), "dirty"),
         jobs_script(),
     ])
 }
@@ -725,6 +734,56 @@ esac
             assert_eq!(out.code, 0, "{}", out.stderr);
             parse_state(&out.stdout).unwrap().target
         }
+    }
+
+    /// The dirty lines the state script reports for `work`, using the real `git`.
+    fn dirty_lines(repos: &Repos) -> Vec<String> {
+        let stubs = tempfile::tempdir().unwrap();
+        install(stubs.path(), "squeue", "#!/bin/sh\necho '5 /else'\n");
+        let body = format!(
+            "cd {} && {}",
+            quote(&repos.work()),
+            state_script(&Target::OriginHead)
+        );
+        let args = vec![
+            format!("PATH={}:/usr/bin:/bin", stubs.path().display()),
+            format!("HOME={}", repos.root.display()),
+            "GIT_CONFIG_GLOBAL=/dev/null".into(),
+            "GIT_CONFIG_SYSTEM=/dev/null".into(),
+            "bash".into(),
+            "-c".into(),
+            format!("set -euo pipefail\n{body}"),
+        ];
+        let out = OsExec
+            .capture(&Argv::new("env", args), Stdin::Null)
+            .unwrap();
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        parse_state(&out.stdout).unwrap().dirty
+    }
+
+    /// `rr run --mode snapshot` keeps its directory inside the checkout. It must not make the
+    /// checkout dirty, and any other untracked file must still do so.
+    #[test]
+    fn with_real_git_the_snapshot_directory_alone_is_clean_and_other_files_are_dirty() {
+        let Some(repos) = Repos::new() else { return };
+        let snapshots = repos.work_path().join(SNAPSHOT_ROOT);
+        std::fs::create_dir_all(snapshots.join(".tmp-x")).unwrap();
+        std::fs::write(snapshots.join(".tmp-x/a.py"), "x").unwrap();
+        assert_eq!(dirty_lines(&repos), Vec::<String>::new());
+        std::fs::write(repos.work_path().join("stray.txt"), "x").unwrap();
+        assert_eq!(dirty_lines(&repos), ["?? stray.txt"]);
+        std::fs::remove_file(repos.work_path().join("stray.txt")).unwrap();
+        std::fs::create_dir(repos.work_path().join(format!("{SNAPSHOT_ROOT}-other"))).unwrap();
+        std::fs::write(
+            repos.work_path().join(format!("{SNAPSHOT_ROOT}-other/f")),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(
+            dirty_lines(&repos).len(),
+            1,
+            "a sibling name is not the root"
+        );
     }
 
     #[test]
