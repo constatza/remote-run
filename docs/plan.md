@@ -15,9 +15,39 @@ Work order therefore changes from the document's "1, 2, 3, 4" to: **R0 stopgap f
 
 Why R0 comes before R: the refactor is about ten commits, and the safety review found that the two exploitable holes (A1 option injection, A2 untrusted project file) would otherwise stay open the whole time. R0 closes them in the current code with the smallest change, and pins the existing guards with tests so the refactor cannot weaken them.
 
+## Progress
+
+Commits `91c06e7` to `8a09db1`. The final tree passes `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` (159 tests). The refactor landed as one entangled change, so only the last commit builds on its own.
+
+| Phase | State | Remaining |
+|---|---|---|
+| R0 stopgap fixes and tests | done | none |
+| R architecture refactor (R1-R10) | done | none; `Clock` exists but nothing uses it yet |
+| A1 option injection | done | none |
+| A2 untrusted project file | done | owner and mode checks were dropped on purpose (the digest pin covers them); stopping the `.rr.toml` search at `$HOME` is optional |
+| A3 terminal text | partly | `sanitize` and `error_line` cover every message `main` prints. `q`, `acct` and `log` still inherit stdio, so remote bytes bypass `rr`: add a line-wise `stream_filtered` |
+| A4 job ids | done | `--wait` stdout parsing comes with Phase B |
+| A5 README and `about` wording | not done | `cli.rs` and `lib.rs` still say "submit, watch" |
+| A6 pull guards | partly | done: fail-closed state parsing, `realpath -m` workdirs, an unresolvable workdir blocks, uv missing is exit 127 and a mismatch is 75. Not done: re-assert `HEAD` and a clean tree inside the merge script, `git branch -r --contains <sha>`, the POSIX-login-shell note |
+| B `wait`, `--json`, `status` | not started | all |
+| C `fwd` | not started | all |
+| D snapshots | not started | step 0 probe on the real host first |
+| E recipes and smaller items | not started | all |
+
+Decisions made while implementing, which override the text below where they differ:
+
+- `Exit` is `Success | Rr(RrCode) | Remote(NonZeroU8)`; `RrCode` is `Failure` (1) or `Refused` (3). A remote command's own code is always `Remote`.
+- Commands that stream a child's output (`run`, `log`) print their preface lines through the `Notes` port. Everything else is an `Outcome` rendered once by `render`.
+- `uv sync --frozen --check` runs without `-q`, so a mismatch can show uv's stderr. A missing `uv` is an error (exit 1), not a refusal.
+- `rev-parse HEAD` failing for any reason other than "not a git repository" is an error; only that case falls back to `origin/HEAD`, with a warning.
+- A remote `~` is not expanded (`rsync -s`); a leading `~/` in `dir` or a remote path becomes home-relative.
+- Known gap: the job guard compares each job's working directory (`squeue %Z`) with the checkout. A job submitted as `sbatch proj/run.sh` from another directory is not detected. Matching on the job's command (`%o`) is not done.
+- The guard needs GNU `realpath -m` on the cluster. Without it every job counts as inside the checkout and `rr pull` refuses (`--force` overrides). Not yet confirmed for the real cluster.
+- No crate beyond `sha2` was added. `thiserror` and serde `try_from` were judged not worth it while no caller matches on an error type and `Settings` stays the all-optional file layer.
+
 ## Phase R0: stopgap fixes and characterisation tests (first, in the current code)
 
-Status: implemented (`host.rs`, `trust.rs`, `sanitize.rs`, `--`/`-s` in `remote.rs` and `transfer.rs`, unit-separator sacct output, pull characterisation tests). Not yet pinned because they need the `Exec` port (R3): the `local_target` fallback test (it now warns on stderr) and the `transfer` probe/limit tests.
+Status: done. `Host` (`domain/host.rs`), the trust store (`trust.rs`), `sanitize`, `--` and `-s` in the ssh and rsync argv, the unit-separator sacct output, and the pull characterisation tests are in. The `local_target` fallback and the transfer probe and limit tests were pinned after the `Exec` port (R3) through `FakeExec` (`app/git.rs`, `app/copy.rs`).
 
 Independent small commits, no restructuring:
 
@@ -163,6 +193,8 @@ A1 and the stopgap form of A2 ship in R0 in the current code. Phase A is what re
 
 ## Phase B: item 2, `wait`, `--json`, `status`
 
+Status: not started.
+
 Design points that differ from the document, with reasons:
 
 - **Do not split exit code 3 into 10-13. Keep 3 and add the reason to `--json`.** `rr x` and `rr run` return the remote command's own exit code unchanged (`main.rs:161,165`). A job that exits 3 or 10 is already indistinguishable from a refusal, and new codes make the collision wider. A script that treats a refusal as a job failure (or the reverse) fails open. The reason belongs in structured output.
@@ -181,6 +213,8 @@ Tests: a fake `Remote` returning scripted sacct output (PENDING, RUNNING, COMPLE
 
 ## Phase C: item 3, `rr fwd`
 
+Status: not started.
+
 Keep the size estimate (about 150 lines), with these changes:
 
 - **Forgotten tunnels are the stated problem, so the first version needs a bound.** The document defers the idle timeout, which leaves the motivating risk open. Add `--ttl` (default 8 h, wall-clock; kill ssh at the deadline). True idle detection needs a proxy and is not needed. Remove the "shortcut: no timeout" line from the document.
@@ -194,6 +228,8 @@ Keep the size estimate (about 150 lines), with these changes:
 Tests as in the document, plus: target and name validation tables, URL parsing (userinfo, other schemes, other ports rejected), ttl kills the fake ssh, killing `rr` kills the fake ssh (Linux), port already taken fails, ssh exiting right after the port opens does not print a URL.
 
 ## Phase D: item 1, snapshot mode
+
+Status: not started. Blocked on step 0 (the probe on the real host).
 
 **Gate first: step 0 stays as written** (import precedence, `uv sync --frozen --check` from another directory, no hidden sync). Record results with dates in a notes file in the repo. No snapshot code before this passes on the real host. If it fails, keep `--mode checkout` as the only mode for shared-environment runs.
 
@@ -219,6 +255,8 @@ Type design (per the project's domain-modelling rules): `TreeId` (validated 40 h
 Tests: tree id stable for equal content; untracked files are not shipped without `--include-untracked` and are reported as skipped; with it, the secret-name guard refuses `.env`; symlink guard (absolute and `..` targets); second run of the same tree transfers nothing; a pre-existing directory with the wrong owner, mode or a symlink is refused; a killed upload leaves no published directory (staging only, swept later); `mv -T` onto an existing tree does not nest; `gc` refuses a snapshot whose path is equal to, or a parent of, a fake `squeue` workdir, an unresolvable workdir, a name outside the 40-hex pattern, a symlinked snapdir, and anything younger than the floor; size limit hit before transfer.
 
 ## Phase E: item 4, smaller items
+
+Status: not started.
 
 - **Recipes: argv, not a shell string.** `run = ["python", "-m", "train", "{config}"]`, each element quoted by `join`. A `run = "..."` shell string makes `rr do name -- arg` an injection point and invites quoting bugs. Placeholders are typed (`{name}` replaced once, no re-expansion of substituted text; an unknown placeholder is a parse error). `pull = "snapshot|checkout|none"` is a closed enum. Recipes live in `.rr.toml` or the user file, so the A2 trust rule covers them. The tracked `rr.toml` the document proposes is deferred until a second user needs sharing: a committed file that defines commands run on the cluster is remote code execution for anyone who can merge to the repository, and would need the trust prompt to show the command text on change.
 - **`rr x -s <script>`.** Fine, but `--interp "python -"` must be split with a shell-words parser into argv (no shell), accepted from flags and trusted settings only. Keep the working directory outside the project as proposed.
