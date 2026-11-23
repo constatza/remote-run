@@ -3,10 +3,37 @@
 
 // the vocabulary the ports speak is the core's
 pub use crate::domain::argv::{Argv, Captured, Stdin};
+use crate::domain::sanitize::sanitize_bytes;
 use crate::domain::shell::Script;
 pub use crate::domain::ssh::Terminal;
 use anyhow::Result;
+use std::io::{self, BufRead, Read, Write};
 use std::time::Duration;
+
+/// The most bytes of one line handled at once. A child that never prints a newline would otherwise
+/// grow the buffer without bound; its text is then passed on in pieces of this size.
+pub const MAX_LINE_BYTES: u64 = 64 * 1024;
+
+/// Copy `reader` to `writer` one line at a time, each through
+/// [`sanitize_bytes`], and flush after every piece so a followed log appears as it grows. A line
+/// longer than [`MAX_LINE_BYTES`] is passed on in pieces; a cut can split a multi-byte character,
+/// which then shows as U+FFFD.
+pub fn write_sanitized(reader: impl Read, writer: &mut impl Write) -> io::Result<()> {
+    let mut reader = io::BufReader::new(reader);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if (&mut reader)
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut line)?
+            == 0
+        {
+            return Ok(());
+        }
+        writer.write_all(sanitize_bytes(&line).as_bytes())?;
+        writer.flush()?;
+    }
+}
 
 /// Runs local programs. A child killed by a signal has no exit code; implementations report it as
 /// a non-zero `code`, never as success.
@@ -15,6 +42,10 @@ pub trait Exec {
     fn capture(&self, argv: &Argv, stdin: Stdin) -> Result<Captured>;
     /// Run `argv` with the terminal attached (stdin, stdout and stderr inherited).
     fn stream(&self, argv: &Argv) -> Result<i32>;
+    /// Like [`Exec::stream`], but the child's stdout and stderr come back through
+    /// [`write_sanitized`] to the user's stdout and stderr, so nothing it prints can carry a
+    /// terminal control sequence. Stdin stays inherited.
+    fn stream_filtered(&self, argv: &Argv) -> Result<i32>;
 }
 
 /// Runs scripts on the remote host; a trait so tests can record what would be sent. It takes a
@@ -32,6 +63,9 @@ pub trait Remote {
     /// Run `script` with the local terminal attached; `terminal` says whether the remote side gets
     /// one too.
     fn stream(&self, script: &Script, terminal: Terminal) -> Result<i32>;
+    /// Like [`Remote::stream`], with the output filtered as in [`Exec::stream_filtered`]. For
+    /// commands whose output is the remote's text rather than a program the user chose to run.
+    fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32>;
 }
 
 /// A point on a monotonic clock: the time since that clock started. Only a [`Clock`] hands one out,
@@ -84,6 +118,7 @@ pub mod fake {
     pub enum How {
         Capture(Stdin),
         Stream,
+        StreamFiltered,
     }
 
     /// A scripted answer to `capture`.
@@ -106,6 +141,7 @@ pub mod fake {
     pub enum RemoteCall {
         Capture,
         Stream(Terminal),
+        StreamFiltered(Terminal),
     }
 
     /// A scripted [`Remote`]: it records every script and answers from queues. A call with nothing
@@ -114,6 +150,9 @@ pub mod fake {
     pub struct FakeRemote {
         captures: RefCell<VecDeque<Captured>>,
         streams: RefCell<VecDeque<i32>>,
+        emitted: RefCell<VecDeque<Vec<u8>>>,
+        /// What the user would have seen from the filtered streams, after the filter.
+        pub shown: RefCell<Vec<u8>>,
         pub calls: RefCell<Vec<(String, RemoteCall)>>,
     }
 
@@ -131,8 +170,16 @@ pub mod fake {
             Self {
                 captures: RefCell::new(captures),
                 streams: RefCell::new(streams.into()),
+                emitted: RefCell::default(),
+                shown: RefCell::default(),
                 calls: RefCell::default(),
             }
+        }
+
+        /// The raw bytes the next filtered stream's child prints; a call without one prints
+        /// nothing.
+        pub fn emit(&self, raw: &[u8]) {
+            self.emitted.borrow_mut().push_back(raw.to_vec());
         }
 
         /// The script of every call, in order.
@@ -161,6 +208,19 @@ pub mod fake {
             self.calls
                 .borrow_mut()
                 .push((script.to_string(), RemoteCall::Stream(terminal)));
+            Ok(self
+                .streams
+                .borrow_mut()
+                .pop_front()
+                .expect("an unexpected remote stream"))
+        }
+
+        fn stream_filtered(&self, script: &Script, terminal: Terminal) -> Result<i32> {
+            self.calls
+                .borrow_mut()
+                .push((script.to_string(), RemoteCall::StreamFiltered(terminal)));
+            let raw = self.emitted.borrow_mut().pop_front().unwrap_or_default();
+            write_sanitized(raw.as_slice(), &mut *self.shown.borrow_mut())?;
             Ok(self
                 .streams
                 .borrow_mut()
@@ -247,6 +307,59 @@ pub mod fake {
                 .pop_front()
                 .expect("an unexpected stream"))
         }
+
+        fn stream_filtered(&self, argv: &Argv) -> Result<i32> {
+            self.calls
+                .borrow_mut()
+                .push((argv.clone(), How::StreamFiltered));
+            Ok(self
+                .streams
+                .borrow_mut()
+                .pop_front()
+                .expect("an unexpected stream"))
+        }
+    }
+
+    fn sanitized(raw: &[u8]) -> String {
+        let mut shown = Vec::new();
+        write_sanitized(raw, &mut shown).unwrap();
+        String::from_utf8(shown).unwrap()
+    }
+
+    #[test]
+    fn escape_sequences_clipboard_writes_and_bidi_controls_never_get_through() {
+        let title = "\u{1b}]0;owned\u{7}";
+        let clipboard = "\u{1b}]52;c;ZXZpbA==\u{1b}\\";
+        let reorder = "fi\u{202E}gnp.exe\u{2066}";
+        let raw = format!("{title}one\n{clipboard}two\n{reorder}\n");
+        let shown = sanitized(raw.as_bytes());
+        assert_eq!(shown.lines().count(), 3, "the lines stay lines");
+        for c in ['\u{1b}', '\u{7}', '\u{202E}', '\u{2066}'] {
+            assert!(!shown.contains(c), "{c:?} in {shown:?}");
+        }
+        assert!(shown.contains("one") && shown.contains("two"));
+    }
+
+    #[test]
+    fn bad_utf8_and_a_missing_final_newline_are_handled() {
+        assert_eq!(
+            sanitized(b"caf\xe9\nna\xc3\xafve ok\ntail"),
+            "caf\u{FFFD}\nna\u{ef}ve ok\ntail"
+        );
+        assert_eq!(sanitized(b""), "");
+    }
+
+    #[test]
+    fn a_long_line_is_passed_on_in_bounded_pieces_and_a_read_error_is_an_error() {
+        let long = vec![b'a'; 3 * MAX_LINE_BYTES as usize + 5];
+        assert_eq!(sanitized(&long).len(), long.len());
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("boom"))
+            }
+        }
+        assert!(write_sanitized(Broken, &mut Vec::new()).is_err());
     }
 
     #[test]

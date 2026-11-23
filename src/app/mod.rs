@@ -36,6 +36,21 @@ fn stream(ports: &Ports, place: &Place, body: Script, terminal: Terminal) -> Res
     Ok(Outcome::Remote(RemoteExit::new(code)))
 }
 
+/// Like [`stream`], but the output is the remote's own text (`q`, `acct`, `log`), so it comes back
+/// line by line through `sanitize` and cannot carry a terminal control sequence. `x` and `run`
+/// stay on [`stream`]: the user chose that program, and a terminal session needs its raw bytes.
+fn stream_filtered(
+    ports: &Ports,
+    place: &Place,
+    body: Script,
+    terminal: Terminal,
+) -> Result<Outcome> {
+    let code = ports
+        .remote
+        .stream_filtered(&script(place, body), terminal)?;
+    Ok(Outcome::Remote(RemoteExit::new(code)))
+}
+
 /// Fakes for the command tests: a scripted exec, remote and notes, and a session to run them as.
 #[cfg(test)]
 mod testing {
@@ -89,6 +104,14 @@ mod testing {
             },
         }
     }
+
+    /// What a hostile job or file name prints: a title change, an OSC 52 clipboard write, a bidi
+    /// override, a screen clear.
+    pub const HOSTILE: &[u8] =
+        "\u{1b}]0;t\u{7}ok\n\u{1b}]52;c;ZXZpbA==\u{7}x\nfi\u{202E}gnp\n\u{1b}[2J\n".as_bytes();
+
+    /// What the user sees of [`HOSTILE`]: the text stays, every control character is a `?`.
+    pub const HOSTILE_SHOWN: &str = "?]0;t?ok\n?]52;c;ZXZpbA==?x\nfi?gnp\n?[2J\n";
 
     /// The text sent for `body` run in the project directory of [`session`], spelled out so the
     /// tests check the wrapper too.

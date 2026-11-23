@@ -54,6 +54,31 @@ mod tests {
         assert_eq!(calls[1].1, RemoteCall::Stream(Terminal::Plain));
     }
 
+    /// `x` shows the program's own bytes: its output never goes through the filter, whatever the
+    /// terminal setting, so a tty session and `rr x -- cat file` keep working.
+    #[test]
+    fn the_output_of_x_is_raw() {
+        let fakes = Fakes::remote_streaming(vec![0, 0]);
+        fakes.remote.emit(b"\x1b[1mbold\x1b[0m\n");
+        for terminal in [Terminal::Plain, Terminal::Attached] {
+            let args = Args {
+                terminal,
+                cmd: words(&["cat", "log"]),
+            };
+            run(&session(), args, &fakes.ports()).unwrap();
+        }
+        let calls = fakes.remote.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .all(|(_, how)| matches!(how, RemoteCall::Stream(_)))
+        );
+        assert!(
+            fakes.remote.shown.borrow().is_empty(),
+            "nothing was filtered"
+        );
+    }
+
     /// The command's own exit code is passed through; it is never an `rr` code, even at 3.
     #[test]
     fn the_remote_exit_code_is_the_commands_not_rrs() {

@@ -24,6 +24,18 @@ fn is_unsafe(c: char) -> bool {
     }
 }
 
+/// One piece of a child's output, as raw bytes: invalid UTF-8 becomes U+FFFD, a line that ends in
+/// `\r\n` (a remote terminal's newline) ends in `\n`, and the rest goes through [`sanitize`]. Only
+/// that final `\r` is kept out of the `?` replacement; any other `\r` is still dropped, since a
+/// bare one rewrites the line already on screen.
+pub fn sanitize_bytes(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    match text.strip_suffix("\r\n") {
+        Some(line) => sanitize(line) + "\n",
+        None => sanitize(&text),
+    }
+}
+
 /// The line `main` prints for a failed run: every message may embed remote or file text, so it
 /// passes through [`sanitize`] whole.
 pub fn error_line(err: &anyhow::Error) -> String {
@@ -57,6 +69,15 @@ mod tests {
             sanitize("\u{2013}\u{0301}\u{FFFD}"),
             "\u{2013}\u{0301}\u{FFFD}"
         );
+    }
+
+    #[test]
+    fn raw_bytes_are_decoded_lossily_and_a_terminal_newline_is_kept_as_one() {
+        assert_eq!(sanitize_bytes(b"ok\xff\n"), "ok\u{FFFD}\n");
+        assert_eq!(sanitize_bytes(b"line\r\n"), "line\n");
+        assert_eq!(sanitize_bytes(b"over\rwrite\n"), "over?write\n");
+        assert_eq!(sanitize_bytes(b"a\x1b]52;c;ZQ==\x07\n"), "a?]52;c;ZQ==?\n");
+        assert_eq!(sanitize_bytes(b"tail\r"), "tail?");
     }
 
     #[test]
