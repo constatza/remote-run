@@ -78,13 +78,12 @@ fn each_line(command: Script, key: &'static str) -> Script {
         .lit("; done")
 }
 
-/// Every active job as a `job` field `<id> <normalised directory>`; a directory `realpath -m`
-/// cannot normalise becomes `jobunresolved`, which blocks. A line with no directory is passed
-/// through as it is so the parser refuses it.
-fn jobs_script() -> Script {
-    let resolved = field("job", lit(r#""$id $resolved""#));
-    let unresolved = field("jobunresolved", lit(r#""$id""#));
-    let malformed = field("job", lit(r#""$line""#));
+/// The loop over the active jobs, `<id> <submit directory>` lines of [`job_workdirs_command`].
+/// `resolved` runs with `$id` and the `realpath -m` result `$resolved` set, `unresolved` when
+/// `realpath -m` cannot normalise the directory, and `malformed` for a line with no directory
+/// (`$line`). The state read and the merge-time check both build on this loop, so the query and
+/// the normalisation cannot differ between them.
+fn job_loop(resolved: Script, unresolved: Script, malformed: Script) -> Script {
     job_workdirs_command()
         .lit(
             r#" | while IFS= read -r line || [ -n "$line" ]; do
@@ -100,6 +99,34 @@ fn jobs_script() -> Script {
         .lit("\n      fi ;;\n    *) ")
         .then(malformed)
         .lit(" ;;\n  esac\ndone")
+}
+
+/// Every active job as a `job` field `<id> <normalised directory>`; a directory `realpath -m`
+/// cannot normalise becomes `jobunresolved`, which blocks. A line with no directory is passed
+/// through as it is so the parser refuses it.
+fn jobs_script() -> Script {
+    job_loop(
+        field("job", lit(r#""$id $resolved""#)),
+        field("jobunresolved", lit(r#""$id""#)),
+        field("job", lit(r#""$line""#)),
+    )
+}
+
+/// Shell that succeeds only when no active job was submitted from the current checkout: the
+/// [`job_loop`] prints a line for every job inside `$checkout` (the same test as [`inside`]), one
+/// that cannot be placed, and every line it cannot read, and the check passes on no output. Each
+/// printed line starts with `job`, so an empty id or line cannot print nothing. A failing
+/// `squeue` or `pwd` fails the chain, which is a refusal and never "no jobs".
+pub(super) fn no_job_inside_script() -> Script {
+    let inside =
+        lit(r#"case "$resolved" in "$checkout"|"${checkout%/}"/*) echo "job $id" ;; esac"#);
+    lit("checkout=$(pwd -P) && blocked=$(")
+        .then(job_loop(
+            inside,
+            lit(r#"echo "job $id""#),
+            lit("echo 'job line with no directory'"),
+        ))
+        .lit(r#") && [ -z "$blocked" ]"#)
 }
 
 /// The `origin/*` branches that contain the resolved `$target`, one `onorigin` field each; prints

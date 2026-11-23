@@ -143,6 +143,21 @@ mod tests {
         // the re-assertion comes before the merge, so a changed checkout is never merged
         let guard = sent[1].find(&format!("\"$head\" = '{A}'")).unwrap();
         assert!(guard < sent[1].find("git merge").unwrap(), "{}", sent[1]);
+        let jobs = sent[1]
+            .find("squeue")
+            .expect("the merge re-reads the queue");
+        assert!(jobs < sent[1].find("git merge").unwrap(), "{}", sent[1]);
+    }
+
+    /// `--force` lifts the jobs guard in the merge script too, and still takes exactly two calls.
+    #[test]
+    fn an_overridden_merge_does_not_re_read_the_queue() {
+        let stub = Stub::new(vec![(0, &report(A, B, ""), ""), (0, "", "")]);
+        stub.pull(JobPolicy::Override).unwrap();
+        let sent = stub.sent();
+        assert_eq!(sent.len(), 2);
+        assert!(!sent[1].contains("squeue"), "{}", sent[1]);
+        assert!(sent[1].contains("git merge"), "{}", sent[1]);
     }
 
     #[test]

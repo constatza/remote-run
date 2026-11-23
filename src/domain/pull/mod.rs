@@ -11,6 +11,7 @@ mod decide;
 mod state;
 
 pub use decide::{JobPolicy, Permit, PullDecision, Reason, decide};
+use state::no_job_inside_script;
 pub use state::{Job, RemoteState, Workdir, parse_state, state_script};
 
 use crate::domain::exit::RrCode;
@@ -52,7 +53,7 @@ pub const STALE_EXIT: i32 = 75;
 pub const UV_MISSING_EXIT: i32 = 127;
 
 /// Exit code of [`apply_script`] when the checkout is no longer what [`state_script`] read: `HEAD`
-/// moved or the tree is dirty. Distinct from [`STALE_EXIT`], from the shell's 127 and from the
+/// moved, the tree is dirty or a job was submitted from it. Distinct from [`STALE_EXIT`], from the shell's 127 and from the
 /// codes `git` itself exits with (1, 128), so a failed merge cannot be read as this refusal.
 pub const STATE_CHANGED_EXIT: i32 = 76;
 
@@ -69,16 +70,26 @@ pub(crate) fn verify_script() -> Script {
 /// is `app::pull`, after [`decide`], and a [`Permit`] is the proof of that.
 ///
 /// The state was read by an earlier ssh call, so the script first re-asserts, on the remote, that
-/// `HEAD` is still `from` and the tree is still clean, and exits [`STATE_CHANGED_EXIT`] if not. A
-/// `git` that fails inside the check fails the check: the merge only runs on a positive answer.
+/// `HEAD` is still `from`, the tree is still clean and, unless the permit's policy is
+/// [`JobPolicy::Override`], that no job was submitted from the checkout since (the same query and
+/// path test as [`state_script`]). Any mismatch exits [`STATE_CHANGED_EXIT`]. A `git`, `squeue` or
+/// `realpath` that fails inside the check fails the check: the merge only runs on a positive
+/// answer. What remains is the time between this check and `git merge`, inside one script.
 ///
 /// ```compile_fail,E0603
 /// let _ = remote_run::domain::pull::apply_script;
 /// ```
 pub(crate) fn apply_script(permit: &Permit) -> Script {
-    lit(r#"head=$(git rev-parse HEAD) && dirty=$(git status --porcelain) && [ "$head" = "#)
-        .word(quote(permit.from().as_str()))
-        .lit(r#" ] && [ -z "$dirty" ] || { echo 'the remote checkout changed since it was read' >&2; exit "#)
+    let checks =
+        lit(r#"head=$(git rev-parse HEAD) && dirty=$(git status --porcelain) && [ "$head" = "#)
+            .word(quote(permit.from().as_str()))
+            .lit(r#" ] && [ -z "$dirty" ]"#);
+    let checks = match permit.policy() {
+        JobPolicy::Respect => checks.lit(" && ").then(no_job_inside_script()),
+        JobPolicy::Override => checks,
+    };
+    checks
+        .lit(" || { echo 'the remote checkout or its jobs changed since it was read' >&2; exit ")
         .word(number(STATE_CHANGED_EXIT))
         .lit("; }\ngit merge -q --ff-only ")
         .word(quote(permit.to().as_str()))
@@ -174,31 +185,72 @@ mod tests {
         assert!(stderr.contains("lock out of date"), "{stderr}");
     }
 
+    /// What a merge-time run of the script saw: its exit code, stderr and whether `git merge` ran.
+    #[cfg(unix)]
+    struct Merge {
+        code: i32,
+        stderr: String,
+        merged: bool,
+    }
+
+    /// The job part of a merge-time run: what the stand-in `squeue` does (`$DIR` in it is the
+    /// checkout), an optional stand-in `realpath` (the real one otherwise), and the permit's
+    /// policy.
+    #[cfg(unix)]
+    struct Queue<'a> {
+        squeue: &'a str,
+        realpath: Option<&'a str>,
+        policy: JobPolicy,
+    }
+
+    #[cfg(unix)]
+    impl<'a> Queue<'a> {
+        fn printing(squeue: &'a str) -> Self {
+            Self {
+                squeue,
+                realpath: None,
+                policy: JobPolicy::Respect,
+            }
+        }
+    }
+
     /// The merge script run by bash, as `place::script` wraps it, against a stand-in `git` whose
     /// `rev-parse` and `status` run the shell snippets `head` and `status`, and which records
-    /// merges. `HOME` is the temporary directory, so no real git configuration is read.
+    /// merges, and the stand-in `squeue` of `queue`. `HOME` is the temporary directory, so no
+    /// real git configuration is read.
     #[cfg(unix)]
-    fn run_merge(head: &str, status: &str) -> (i32, bool) {
+    fn run_merge_with(head: &str, status: &str, queue: &Queue) -> Merge {
         use crate::adapters::OsExec;
         use crate::domain::place::{Place, script};
         use crate::ports::{Argv, Exec, Stdin};
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("merged");
-        let git = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  rev-parse) {head} ;;\n  status) {status} ;;\n  merge) echo \"$@\" > {} ;;\nesac\n",
-            quote(&log.display().to_string())
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let log = dir.join("merged");
+        let install = |name: &str, body: String| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        install(
+            "git",
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  rev-parse) {head} ;;\n  status) {status} ;;\n  merge) echo \"$@\" > {} ;;\nesac\n",
+                quote(&log.display().to_string())
+            ),
         );
-        let path = dir.path().join("git");
-        std::fs::write(&path, git).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let permit = Permit::between(commit(A), commit(B));
+        let squeue = queue.squeue.replace("$DIR", &dir.display().to_string());
+        install("squeue", format!("#!/bin/sh\n{squeue}\n"));
+        if let Some(body) = queue.realpath {
+            install("realpath", format!("#!/bin/sh\n{body}\n"));
+        }
+        let permit = Permit::between(commit(A), commit(B), queue.policy);
         let body = script(&Place::default(), apply_script(&permit)).to_string();
-        // only the stand-in on PATH: no uv.lock here, so the environment check is skipped
-        let cwd = format!("cd {} && {body}", quote(&dir.path().display().to_string()));
+        // the stand-ins first on PATH: no uv.lock here, so the environment check is skipped
+        let cwd = format!("cd {} && {body}", quote(&dir.display().to_string()));
         let args = vec![
-            format!("PATH={}:/usr/bin:/bin", dir.path().display()),
-            format!("HOME={}", dir.path().display()),
+            format!("PATH={}:/usr/bin:/bin", dir.display()),
+            format!("HOME={}", dir.display()),
             "bash".into(),
             "-c".into(),
             cwd,
@@ -206,7 +258,18 @@ mod tests {
         let out = OsExec
             .capture(&Argv::new("env", args), Stdin::Null)
             .unwrap();
-        (out.code, log.exists())
+        Merge {
+            code: out.code,
+            stderr: out.stderr,
+            merged: log.exists(),
+        }
+    }
+
+    /// An empty queue: the head and status checks alone decide.
+    #[cfg(unix)]
+    fn run_merge(head: &str, status: &str) -> (i32, bool) {
+        let merge = run_merge_with(head, status, &Queue::printing("true"));
+        (merge.code, merge.merged)
     }
 
     /// The merge runs only when `HEAD` is still the commit that was read and the tree is clean.
@@ -237,6 +300,110 @@ mod tests {
             assert_eq!(code, STATE_CHANGED_EXIT, "{name}");
             assert!(!merged, "{name}: a changed checkout must not be merged");
         }
+    }
+
+    /// A merge of an unchanged checkout under the stand-in queue `queue`.
+    #[cfg(unix)]
+    fn merge_with_queue(queue: &Queue) -> Merge {
+        run_merge_with(&format!("echo {A}"), "true", queue)
+    }
+
+    /// A job that appeared after the state was read, from inside the checkout, stops the merge.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_that_appears_at_merge_time_inside_the_checkout_blocks_the_merge() {
+        for (name, squeue) in [
+            ("the checkout itself", "echo '7 $DIR'"),
+            ("below it", "echo '7 $DIR/sub/../sub'"),
+            ("a trailing slash", "echo '7 $DIR/'"),
+            ("a path with a space", "echo '7 $DIR/my dir'"),
+            ("among others", "echo '6 /elsewhere'; echo '7 $DIR/x'"),
+        ] {
+            let merge = merge_with_queue(&Queue::printing(squeue));
+            assert_eq!(merge.code, STATE_CHANGED_EXIT, "{name}: {}", merge.stderr);
+            assert!(!merge.merged, "{name}: merged under a job");
+            assert!(merge.stderr.contains("job"), "{name}: {}", merge.stderr);
+        }
+    }
+
+    /// `--force` lifts the jobs guard and nothing else: the merge runs, a moved head still stops.
+    #[cfg(unix)]
+    #[test]
+    fn an_overridden_permit_merges_under_a_job_but_still_checks_head_and_tree() {
+        let force = Queue {
+            policy: JobPolicy::Override,
+            ..Queue::printing("echo '7 $DIR'; exit 5")
+        };
+        let merge = merge_with_queue(&force);
+        assert_eq!((merge.code, merge.merged), (0, true), "{}", merge.stderr);
+        let moved = run_merge_with(&format!("echo {B}"), "true", &force);
+        assert_eq!((moved.code, moved.merged), (STATE_CHANGED_EXIT, false));
+    }
+
+    /// A job from a sibling directory whose name starts with the checkout's, or no job, is no
+    /// reason to refuse.
+    #[cfg(unix)]
+    #[test]
+    fn jobs_outside_the_checkout_and_an_empty_queue_let_the_merge_run() {
+        for (name, squeue) in [
+            ("empty queue", "true"),
+            ("a name that only starts alike", "echo \"7 $DIR-runs\""),
+            ("another directory", "echo '7 /elsewhere/proj'"),
+            ("the parent", "echo \"7 $(dirname \"$DIR\")\""),
+        ] {
+            let merge = merge_with_queue(&Queue::printing(squeue));
+            assert_eq!(
+                (merge.code, merge.merged),
+                (0, true),
+                "{name}: {}",
+                merge.stderr
+            );
+        }
+    }
+
+    /// An unreadable job answer is never "no jobs": a failing `squeue`, a line with no directory
+    /// and a directory `realpath` cannot normalise all stop the merge.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_job_answer_fails_closed() {
+        let no_realpath = Queue {
+            realpath: Some("exit 1"),
+            ..Queue::printing("echo '7 /elsewhere'")
+        };
+        for (name, queue) in [
+            (
+                "squeue fails",
+                Queue::printing("echo 'squeue: down' >&2; exit 1"),
+            ),
+            (
+                "squeue fails after output",
+                Queue::printing("echo '6 /elsewhere'; exit 1"),
+            ),
+            (
+                "a line without a directory",
+                Queue::printing("echo no-workdir"),
+            ),
+            ("realpath fails", no_realpath),
+        ] {
+            let merge = merge_with_queue(&queue);
+            assert_eq!(merge.code, STATE_CHANGED_EXIT, "{name}: {}", merge.stderr);
+            assert!(!merge.merged, "{name}: merged on an unreadable answer");
+        }
+    }
+
+    /// The merge-time check and the state read build the query and the path test from the same
+    /// pieces, so the squeue format and `realpath -m` cannot differ between them.
+    #[test]
+    fn the_merge_script_asks_the_same_job_question_as_the_state_script() {
+        let permit = Permit::between(commit(A), commit(B), JobPolicy::Respect);
+        let merge = apply_script(&permit).to_string();
+        let state = state_script(&Target::OriginHead).to_string();
+        for piece in ["squeue --me -h -o '%i %Z' | while", "realpath -m -- "] {
+            assert!(merge.contains(piece), "{merge}");
+            assert!(state.contains(piece), "{state}");
+        }
+        let forced = Permit::between(commit(A), commit(B), JobPolicy::Override);
+        assert!(!apply_script(&forced).to_string().contains("squeue"));
     }
 
     #[test]
