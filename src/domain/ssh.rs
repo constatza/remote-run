@@ -8,6 +8,20 @@ use crate::domain::shell::{lit, quote};
 /// ssh options every call uses: never prompt (a prompt nobody sees would hang), no banner.
 pub const SSH_OPTIONS: [&str; 4] = ["-o", "BatchMode=yes", "-o", "LogLevel=ERROR"];
 
+/// Bounds on a link that has gone silent, for the calls `rr` makes itself (not the forwards, which
+/// set their own keepalive). Without them one black-holed poll blocks `rr wait` for ever, so neither
+/// `--timeout` nor the bounded retry of unreadable polls ever fires: a connect gives up after
+/// `ConnectTimeout` seconds, and an established link that answers no keepalive for
+/// `ServerAliveInterval * ServerAliveCountMax` (60) seconds is closed.
+pub const SSH_LIVENESS_OPTIONS: [&str; 6] = [
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
+];
+
 /// Whether a streamed command gets a terminal on the remote side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Terminal {
@@ -19,7 +33,8 @@ pub enum Terminal {
 
 /// The `ssh` argv that runs `script` under bash on `host` (pure).
 pub fn ssh_argv(host: &Host, script: &str, terminal: Terminal) -> Argv {
-    let mut args: Vec<String> = SSH_OPTIONS.iter().map(|s| s.to_string()).collect();
+    let options = SSH_OPTIONS.iter().chain(&SSH_LIVENESS_OPTIONS);
+    let mut args: Vec<String> = options.map(|s| s.to_string()).collect();
     match terminal {
         Terminal::Attached => args.push("-t".into()),
         Terminal::Plain => {}
@@ -44,7 +59,19 @@ mod tests {
         Host::parse("cluster").unwrap()
     }
 
-    const OPTIONS: [&str; 4] = ["-o", "BatchMode=yes", "-o", "LogLevel=ERROR"];
+    /// Spelled out, so a change to either option list shows up here.
+    const OPTIONS: [&str; 10] = [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=4",
+    ];
 
     /// The whole ssh command line, spelled out: options, then `--`, then the host, then one word
     /// that starts with `bash -c `.
@@ -71,7 +98,7 @@ mod tests {
             let argv = ssh_argv(&host(), script, Terminal::Plain);
             let last = argv.args().last().unwrap();
             assert!(last.starts_with("bash -c '"), "{last}");
-            assert_eq!(argv.args().len(), 7);
+            assert_eq!(argv.args().len(), OPTIONS.len() + 3);
         }
     }
 

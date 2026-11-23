@@ -716,9 +716,9 @@ mod tests {
         assert_eq!(attached.unwrap(), 9);
         let calls = exec.calls.borrow();
         assert_eq!(calls[0].1, How::StreamFiltered);
-        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(calls[0].0.args()[10..], ["--", "cluster", "bash -c 'true'"]);
         assert_eq!(
-            calls[1].0.args()[4..],
+            calls[1].0.args()[10..],
             ["-t", "--", "cluster", "bash -c 'true'"]
         );
     }
@@ -731,7 +731,7 @@ mod tests {
         let calls = exec.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0.program(), "ssh");
-        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(calls[0].0.args()[10..], ["--", "cluster", "bash -c 'true'"]);
         assert_eq!(calls[0].1, How::Capture(Stdin::Null));
     }
 
@@ -744,10 +744,10 @@ mod tests {
         assert_eq!(ssh.stream(&lit("true"), Terminal::Attached).unwrap(), 9);
         let calls = exec.calls.borrow();
         assert_eq!(calls[0].1, How::Stream);
-        assert_eq!(calls[0].0.args()[4..], ["--", "cluster", "bash -c 'true'"]);
+        assert_eq!(calls[0].0.args()[10..], ["--", "cluster", "bash -c 'true'"]);
         assert_eq!(calls[1].1, How::Stream);
         assert_eq!(
-            calls[1].0.args()[4..],
+            calls[1].0.args()[10..],
             ["-t", "--", "cluster", "bash -c 'true'"]
         );
     }
