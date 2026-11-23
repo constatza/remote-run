@@ -2,6 +2,7 @@
 name = "remote-run"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.100"
 description = "Run commands, a guarded git fast-forward and rsync copies on a remote Slurm cluster over ssh"
 repository = "https://github.com/constatza/remote-run"
 

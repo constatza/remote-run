@@ -35,7 +35,7 @@ Everything goes through your system `ssh`. Your `~/.ssh/config` (aliases, `User`
 
 ## Install
 
-You need a Rust toolchain.
+You need Rust 1.100 or newer.
 
 - From a clone: `cargo install --path .`
 - From GitHub: `cargo install --git https://github.com/constatza/remote-run`
