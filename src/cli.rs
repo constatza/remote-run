@@ -38,8 +38,8 @@ pub struct Cli {
     /// remote shell file sourced before every command (PATH, uv, Slurm settings)
     #[arg(long = "env", env = "RR_ENV", global = true)]
     pub env_file: Option<String>,
-    /// write the result as one JSON object on stdout (for `wait`, `status`, `pull`, `trust`, `fwd`
-    /// and `run --wait`, which then shows the command's output on stderr); refused for `q`, `acct`,
+    /// write the result as one JSON object on stdout (for `wait`, `status`, `pull`, `trust`, `fwd`,
+    /// `gc` and `run --wait`, which then shows the command's output on stderr); refused for `q`, `acct`,
     /// `log`, `x`, `do`, `cancel`, `get`, `put` and `run` without `--wait`, which write to stdout
     /// themselves
     #[arg(long = "json", num_args = 0, default_value = "text", default_missing_value = "json", value_parser = parse_format, global = true)]
