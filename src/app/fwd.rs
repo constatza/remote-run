@@ -60,7 +60,7 @@ pub fn run(session: &Session, args: Args, ports: &Ports, machine: &Machine) -> R
 enum SshAfter {
     /// Ended and reaped, however `serve` ended (the handle also ends it when dropped).
     Gone,
-    /// Stopping it failed.
+    /// ssh is not known to be gone (no `SshEnded` in the error).
     MayRun,
 }
 
@@ -93,7 +93,7 @@ fn serve(
 
 /// What the forward's end means for the exit code. ssh ending by itself with 0 is a lost forward,
 /// not a success: nothing asked it to stop. A forward `rr` closed is `rr`'s own outcome; only a
-/// code ssh ended with is a remote one.
+/// code ssh ended with is a remote one, reported as a forward that ssh ended.
 fn closed(end: End, ports: &Ports) -> Result<Outcome> {
     match end {
         End::Expired => {
@@ -111,7 +111,7 @@ fn closed(end: End, ports: &Ports) -> Result<Outcome> {
             ports
                 .notes
                 .note(&format!("rr: ssh ended ({code}), forward closed"));
-            Ok(Outcome::Remote(RemoteExit::new(code)))
+            Ok(Outcome::Forwarded(Closed::SshEnded(RemoteExit::new(code))))
         }
     }
 }
@@ -296,6 +296,10 @@ mod tests {
         let w = world(vec![None, None, None, Some(255)], vec![true]);
         let outcome = go(&w, &session(), args("n:1"), None).unwrap();
         assert_eq!(exit(&outcome), Exit::remote(255));
+        assert!(
+            matches!(outcome, Outcome::Forwarded(Closed::SshEnded(_))),
+            "a lost forward, not a remote command"
+        );
         assert_eq!(w.killed.get(), 0);
         let last = notes(&w).pop().unwrap();
         assert_eq!(last, "rr: ssh ended (255), forward closed");

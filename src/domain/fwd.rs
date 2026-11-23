@@ -3,6 +3,7 @@
 //! only ever listen on the loopback interface.
 
 use crate::domain::argv::Argv;
+use crate::domain::exit::RemoteExit;
 use crate::domain::host::Host;
 use crate::domain::ssh::SSH_OPTIONS;
 use anyhow::{Context, Result, bail};
@@ -262,14 +263,17 @@ pub enum Browser {
     Open,
 }
 
-/// A forward that `rr` itself closed, as opposed to one whose ssh ended by itself (that is a
-/// remote exit code). Both are decisions of `rr`, so neither is reported as a remote result.
+/// How a forward ended. The first two are decisions of `rr`, so they are not remote results; the
+/// third is ssh's own code, which a script must be able to tell from a remote command's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Closed {
     /// Its time to live ran out: the planned end, exit 0.
     Expired,
     /// `rr` was interrupted: exit 130.
     Interrupted,
+    /// ssh ended by itself after the forward listened, with a non-zero code (the forward is lost):
+    /// that code is the exit code.
+    SshEnded(RemoteExit),
 }
 
 /// How long a forward may live, 1 s up to [`MAX_TTL`].

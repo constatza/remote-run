@@ -55,6 +55,8 @@ enum Body {
 enum ForwardBody {
     Expired,
     Interrupted,
+    /// ssh ended by itself: `exit` is ssh's code.
+    SshEnded,
 }
 
 #[derive(Serialize)]
@@ -233,13 +235,11 @@ fn parts(outcome: &Outcome) -> (Source, Body) {
         ),
         Outcome::Waited(outcome) => (Source::Rr, Body::Wait(wait(outcome))),
         Outcome::Status(report) => (Source::Rr, Body::Status(status(report))),
-        Outcome::Forwarded(closed) => (
-            Source::Rr,
-            Body::Forward(match closed {
-                Closed::Expired => ForwardBody::Expired,
-                Closed::Interrupted => ForwardBody::Interrupted,
-            }),
-        ),
+        Outcome::Forwarded(closed) => match closed {
+            Closed::Expired => (Source::Rr, Body::Forward(ForwardBody::Expired)),
+            Closed::Interrupted => (Source::Rr, Body::Forward(ForwardBody::Interrupted)),
+            Closed::SshEnded(_) => (Source::Remote, Body::Forward(ForwardBody::SshEnded)),
+        },
     }
 }
 
@@ -436,8 +436,12 @@ mod tests {
             json!({"source": "rr", "exit": 130, "kind": "forward", "result": "interrupted"})
         );
         assert_eq!(exit, Exit::Rr(RrCode::Interrupted));
-        let (ended, _) = json_of(&Outcome::Remote(RemoteExit::new(255)));
-        assert_eq!(ended["source"], "remote");
+        let (lost, exit) = json_of(&Outcome::Forwarded(Closed::SshEnded(RemoteExit::new(255))));
+        assert_eq!(
+            lost,
+            json!({"source": "remote", "exit": 255, "kind": "forward", "result": "ssh_ended"})
+        );
+        assert_eq!(exit, Exit::remote(255));
     }
 
     #[test]
