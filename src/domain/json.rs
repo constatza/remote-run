@@ -7,6 +7,7 @@
 //! what the command it ran returned.
 
 use crate::domain::exit::Exit;
+use crate::domain::fwd::Closed;
 use crate::domain::outcome::{Outcome, TrustState};
 use crate::domain::pull::{PullOutcome, Reason};
 use crate::domain::sanitize::sanitize;
@@ -45,6 +46,15 @@ enum Body {
     },
     Wait(WaitBody),
     Status(StatusBody),
+    Forward(ForwardBody),
+}
+
+/// How a forward that `rr` closed ended.
+#[derive(Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+enum ForwardBody {
+    Expired,
+    Interrupted,
 }
 
 #[derive(Serialize)]
@@ -210,6 +220,13 @@ fn parts(outcome: &Outcome) -> (Source, Body) {
         ),
         Outcome::Waited(outcome) => (Source::Rr, Body::Wait(wait(outcome))),
         Outcome::Status(report) => (Source::Rr, Body::Status(status(report))),
+        Outcome::Forwarded(closed) => (
+            Source::Rr,
+            Body::Forward(match closed {
+                Closed::Expired => ForwardBody::Expired,
+                Closed::Interrupted => ForwardBody::Interrupted,
+            }),
+        ),
     }
 }
 
@@ -379,6 +396,24 @@ mod tests {
         assert_eq!(trust["state"], "recorded");
         assert_eq!(trust["sha256"], digest(b"x").to_string());
         assert_eq!(trust["text"], "host = \"h\"\n");
+    }
+
+    #[test]
+    fn a_forward_that_rr_closed_says_rr_decided_and_ssh_ending_says_remote() {
+        let (expired, exit) = json_of(&Outcome::Forwarded(Closed::Expired));
+        assert_eq!(
+            expired,
+            json!({"source": "rr", "exit": 0, "kind": "forward", "result": "expired"})
+        );
+        assert_eq!(exit, Exit::Success);
+        let (cut, exit) = json_of(&Outcome::Forwarded(Closed::Interrupted));
+        assert_eq!(
+            cut,
+            json!({"source": "rr", "exit": 130, "kind": "forward", "result": "interrupted"})
+        );
+        assert_eq!(exit, Exit::Rr(RrCode::Interrupted));
+        let (ended, _) = json_of(&Outcome::Remote(RemoteExit::new(255)));
+        assert_eq!(ended["source"], "remote");
     }
 
     #[test]

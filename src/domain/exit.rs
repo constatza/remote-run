@@ -19,6 +19,9 @@ pub enum RrCode {
     /// `rr` could not learn how a job ended (ssh or sacct unreachable, no job found). Never read
     /// as a failure of the job.
     Unknown,
+    /// `rr` was interrupted (Ctrl-C, SIGTERM, SIGHUP) and ended what it had started. 128 plus
+    /// SIGINT, the code a shell reports for Ctrl-C.
+    Interrupted,
 }
 
 impl RrCode {
@@ -29,6 +32,7 @@ impl RrCode {
             RrCode::Timeout => 4,
             RrCode::JobFailed => 5,
             RrCode::Unknown => 6,
+            RrCode::Interrupted => 130,
         }
     }
 }
@@ -106,6 +110,12 @@ mod tests {
     fn the_wait_codes_avoid_every_other_meaning() {
         let codes = [RrCode::Timeout, RrCode::JobFailed, RrCode::Unknown].map(RrCode::code);
         assert_eq!(codes, [4, 5, 6]);
+    }
+
+    #[test]
+    fn an_interrupt_is_an_rr_code_that_shares_the_number_with_a_remote_130() {
+        assert_eq!(Exit::Rr(RrCode::Interrupted).code(), 130);
+        assert_ne!(Exit::Rr(RrCode::Interrupted), Exit::remote(130));
     }
 
     #[test]

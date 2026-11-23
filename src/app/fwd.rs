@@ -6,7 +6,9 @@ use super::Ports;
 use super::tunnel::{End, ListeningForward, Started, StartingForward};
 use crate::config::Session;
 use crate::domain::exit::RemoteExit;
-use crate::domain::fwd::{Browser, Endpoint, Listener, LoopbackPort, OpenUrl, Plan, SocketPath};
+use crate::domain::fwd::{
+    Browser, Closed, Endpoint, Listener, LoopbackPort, OpenUrl, Plan, SocketPath,
+};
 use crate::domain::fwd::{Transport, Ttl, Wanted};
 use crate::domain::outcome::Outcome;
 use crate::ports::{Deadline, Net};
@@ -26,10 +28,6 @@ pub struct Machine<'a> {
     pub net: &'a dyn Net,
     pub runtime_dir: Option<&'a str>,
 }
-
-/// The code of a forward that `rr` closed on an interrupt: 128 plus SIGINT, as a shell reports
-/// Ctrl-C.
-const INTERRUPTED_EXIT: i32 = 130;
 
 pub fn run(session: &Session, args: Args, ports: &Ports, machine: &Machine) -> Result<Outcome> {
     let plan = session
@@ -68,26 +66,26 @@ fn serve(
 }
 
 /// What the forward's end means for the exit code. ssh ending by itself with 0 is a lost forward,
-/// not a success: nothing asked it to stop.
+/// not a success: nothing asked it to stop. A forward `rr` closed is `rr`'s own outcome; only a
+/// code ssh ended with is a remote one.
 fn closed(end: End, ports: &Ports) -> Result<Outcome> {
-    let code = match end {
+    match end {
         End::Expired => {
             ports.notes.note("rr: time to live reached, forward closed");
-            0
+            Ok(Outcome::Forwarded(Closed::Expired))
         }
         End::Interrupted => {
             ports.notes.note("rr: interrupted, forward closed");
-            INTERRUPTED_EXIT
+            Ok(Outcome::Forwarded(Closed::Interrupted))
         }
         End::Exited(0) => bail!("ssh ended by itself before the time to live: the forward is gone"),
         End::Exited(code) => {
             ports
                 .notes
                 .note(&format!("rr: ssh ended ({code}), forward closed"));
-            code
+            Ok(Outcome::Remote(RemoteExit::new(code)))
         }
-    };
-    Ok(Outcome::Remote(RemoteExit::new(code)))
+    }
 }
 
 /// The local end to listen on, checked free before ssh is started.
@@ -136,7 +134,7 @@ fn announce(listening: &ListeningForward, plan: &Plan, ttl: Ttl, ports: &Ports) 
 mod tests {
     use super::super::testing::{Fakes, session};
     use super::*;
-    use crate::domain::exit::Exit;
+    use crate::domain::exit::{Exit, RrCode};
     use crate::domain::fwd::{ForwardName, ForwardSpec, ForwardTarget};
     use crate::domain::outcome::{Format, render};
     use crate::ports::Ended;
@@ -250,6 +248,7 @@ mod tests {
         let ttl = Duration::from_secs(30 * 60);
         assert!(slept(&w) >= ttl && slept(&w) < ttl + Duration::from_secs(2));
         assert_eq!(exit(&outcome), Exit::Success);
+        assert!(matches!(outcome, Outcome::Forwarded(Closed::Expired)));
     }
 
     #[test]
@@ -286,13 +285,14 @@ mod tests {
         let (child, killed) = FakeChild::scripted(vec![None, None, None, Some(Ended::Interrupted)]);
         let w = world_of(child, killed, vec![true]);
         let outcome = go(&w, &session(), args("n:1"), None).unwrap();
-        assert_eq!(exit(&outcome), Exit::remote(130));
+        assert_eq!(exit(&outcome), Exit::Rr(RrCode::Interrupted));
+        assert!(matches!(outcome, Outcome::Forwarded(Closed::Interrupted)));
         assert_eq!(notes(&w).pop().unwrap(), "rr: interrupted, forward closed");
         // an interrupt before the forward listens is an interrupt too, and prints no URL
         let (child, killed) = FakeChild::scripted(vec![Some(Ended::Interrupted)]);
         let w = world_of(child, killed, vec![false]);
         let outcome = go(&w, &session(), args("n:1"), None).unwrap();
-        assert_eq!(exit(&outcome), Exit::remote(130));
+        assert_eq!(exit(&outcome), Exit::Rr(RrCode::Interrupted));
         assert_eq!(notes(&w), ["rr: interrupted, forward closed"]);
     }
 

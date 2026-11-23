@@ -2,6 +2,7 @@
 //! code. Commands never print and never pick an exit code; `main` prints what [`render`] returns.
 
 use crate::domain::exit::{Exit, RemoteExit, RrCode};
+use crate::domain::fwd::Closed;
 use crate::domain::ids::Digest;
 use crate::domain::json;
 use crate::domain::pull::{Next, PullOutcome, next};
@@ -26,6 +27,8 @@ pub enum Outcome {
     Waited(WaitOutcome),
     /// One job's status, from `rr status`.
     Status(StatusReport),
+    /// A forward that `rr` closed (`rr fwd`): its time to live ran out, or `rr` was interrupted.
+    Forwarded(Closed),
 }
 
 /// What `rr trust` did with a project file.
@@ -124,6 +127,8 @@ fn render_text(outcome: &Outcome) -> Rendered {
             stdout: lines(&status_report(report)),
             stderr: String::new(),
         },
+        Outcome::Forwarded(Closed::Expired) => Rendered::exiting(Exit::Success),
+        Outcome::Forwarded(Closed::Interrupted) => Rendered::exiting(Exit::Rr(RrCode::Interrupted)),
     }
 }
 
@@ -444,6 +449,21 @@ mod tests {
             "rr: could not tell how the jobs ended: no?[2J\n"
         );
         assert_eq!(unknown.stdout, "");
+    }
+
+    #[test]
+    fn a_forward_that_rr_closed_is_an_rr_exit_not_a_remote_one() {
+        let expired = text(&Outcome::Forwarded(Closed::Expired));
+        assert_eq!(expired.exit, Exit::Success);
+        let interrupted = text(&Outcome::Forwarded(Closed::Interrupted));
+        assert_eq!(interrupted.exit, Exit::Rr(RrCode::Interrupted));
+        assert_ne!(interrupted.exit, Exit::remote(130));
+        assert_eq!(interrupted.exit.code(), 130);
+        // the notes port already said why; nothing is written twice
+        assert_eq!(
+            (interrupted.stdout, interrupted.stderr),
+            (String::new(), String::new())
+        );
     }
 
     #[test]
